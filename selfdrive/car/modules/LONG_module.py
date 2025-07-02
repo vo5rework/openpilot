@@ -47,8 +47,8 @@ class LongController:
   MIN_CRUISE_SPEED_MS = 17.1 * CV.MPH_TO_MS
   _LP_FRESH_NS = 1_500_000_000
   _PLAN_SLOWDOWN_WINDOW = 6
-  _PLAN_SLOWDOWN_MARGIN_MS = 0.6
-  _PLAN_SLOWDOWN_EGO_MARGIN_MS = 0.35
+  _PLAN_SLOWDOWN_MARGIN_MS = 1.0
+  _PLAN_SLOWDOWN_EGO_MARGIN_MS = 0.75
 
   def __init__(self) -> None:
     self.acc = ACCController()
@@ -91,7 +91,8 @@ class LongController:
 
     if len(window) == 0:
       return None
-    return float(statistics.median(window))
+    sorted_window = sorted(window)
+    return float(sorted_window[len(sorted_window) // 2])
 
   def _poll_plan_and_lead(self, *, now_ns: int) -> None:
     try:
@@ -202,7 +203,7 @@ class LongController:
         not startup_warmup
         or self._lead_present
         or (
-          int(self._stable_plan_samples) >= 2
+          int(self._stable_plan_samples) >= 3
           and float(planner_slow_ms) > 0.1
         )
       )
