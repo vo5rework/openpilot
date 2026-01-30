@@ -14,6 +14,7 @@ from openpilot.selfdrive.controls.lib.longitudinal_mpc_lib.long_mpc import T_IDX
 from openpilot.selfdrive.controls.lib.drive_helpers import CONTROL_N, get_accel_from_plan
 from openpilot.selfdrive.car.cruise import V_CRUISE_MAX, V_CRUISE_UNSET
 from openpilot.common.swaglog import cloudlog
+from openpilot.common.params import Params
 
 LON_MPC_STEP = 0.2  # first step is 0.2s
 A_CRUISE_MAX_VALS = [1.6, 1.2, 0.8, 0.6]
@@ -57,6 +58,12 @@ class LongitudinalPlanner:
     self.fcw = False
     self.dt = dt
     self.allow_throttle = True
+
+
+
+    self._tinkla_params = Params()
+    self._t_follow_override: float | None = None
+
 
     self.a_desired = init_a
     self.v_desired_filter = FirstOrderFilter(init_v, 2.0, self.dt)
@@ -138,10 +145,21 @@ class LongitudinalPlanner:
 
     if force_slow_decel:
       v_cruise = 0.0
+    if self.CP.brand == "tesla" and sm.frame % 50 == 0:
+      val = self._tinkla_params.get("TinklaFollowDistance", return_default=True)
+      try:
+        if isinstance(val, (bytes, bytearray)):
+          val = val.decode()
+        self._t_follow_override = float(val) if val is not None else None
+      except (TypeError, ValueError):
+        self._t_follow_override = None
+      if self._t_follow_override is not None:
+        self._t_follow_override = float(max(0.5, min(3.0, self._t_follow_override)))
+
 
     self.mpc.set_weights(prev_accel_constraint, personality=sm['selfdriveState'].personality)
     self.mpc.set_cur_state(self.v_desired_filter.x, self.a_desired)
-    self.mpc.update(sm['radarState'], v_cruise, x, v, a, j, personality=sm['selfdriveState'].personality)
+    self.mpc.update(sm['radarState'], v_cruise, x, v, a, j, personality=sm['selfdriveState'].personality, t_follow_override=self._t_follow_override)
 
     self.v_desired_trajectory = np.interp(CONTROL_N_T_IDX, T_IDXS_MPC, self.mpc.v_solution)
     self.a_desired_trajectory = np.interp(CONTROL_N_T_IDX, T_IDXS_MPC, self.mpc.a_solution)
