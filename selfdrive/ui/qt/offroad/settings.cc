@@ -215,8 +215,8 @@ static float getFloatParamOrDefault(Params &params, const std::string &key, floa
 }
 
 static void putFloatParam(Params &params, const std::string &key, float val, int precision) {
-  const std::string fmt = string_format("%%.%df", precision);
-  params.put(key, string_format(fmt, val));
+  const std::string fmt = util::string_format("%%.%df", precision);
+  params.put(key, util::string_format(fmt, val));
 }
 
 TeslaPanel::TeslaPanel(SettingsWindow *parent) : ListWidget(parent) {
