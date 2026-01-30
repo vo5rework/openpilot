@@ -1,4 +1,5 @@
 #include <cassert>
+#include <algorithm>
 #include <cmath>
 #include <string>
 #include <tuple>
@@ -118,7 +119,120 @@ TogglesPanel::TogglesPanel(SettingsWindow *parent) : ListWidget(parent) {
 
   // Toggles with confirmation dialogs
   toggles["ExperimentalMode"]->setActiveIcon("../assets/icons/experimental.svg");
-  toggles["ExperimentalMode"]->setConfirmation(true, true);
+  toggles["ExperimentalMode"]->setConfir
+
+
+// **************** Tesla panel ****************
+
+static float getFloatParamOrDefault(Params &params, const std::string &key, float default_val) {
+  const std::string v = params.get(key);
+  if (v.empty()) return default_val;
+  try {
+    return std::stof(v);
+  } catch (...) {
+    return default_val;
+  }
+}
+
+static void putFloatParam(Params &params, const std::string &key, float val, int precision) {
+  const QString s = QString::number(val, 'f', precision);
+  params.put(key, s.toStdString());
+}
+
+TeslaPanel::TeslaPanel(SettingsWindow *parent) : ListWidget(parent) {
+  // Float selections
+  follow_distance_btn = new ButtonControl(tr("Follow Distance"), "", tr("Overrides the time gap (seconds) used by longitudinal control."), this);
+  connect(follow_distance_btn, &ButtonControl::clicked, [this]() {
+    static const std::vector<float> opts{0.90f, 1.10f, 1.30f, 1.45f, 1.60f, 1.80f, 2.00f};
+    QStringList items;
+    items.reserve((int)opts.size());
+    for (const float v : opts) items << (QString::number(v, 'f', 2) + "s");
+
+    const float cur = getFloatParamOrDefault(params, "TinklaFollowDistance", 1.45f);
+    const QString cur_str = QString::number(cur, 'f', 2) + "s";
+
+    const QString selection = MultiOptionDialog::getSelection(tr("Select Follow Distance"), items, cur_str, this);
+    if (!selection.isEmpty()) {
+      const QString num = selection;
+      putFloatParam(params, "TinklaFollowDistance", num.left(num.size() - 1).toFloat(), 2);
+      refreshTexts();
+    }
+  });
+  addItem(follow_distance_btn);
+
+  hands_on_level_btn = new ButtonControl(tr("Hands On Threshold"), "", tr("Sets the hands-on level threshold (higher is stricter)."), this);
+  connect(hands_on_level_btn, &ButtonControl::clicked, [this]() {
+    static const std::vector<int> opts{1, 2, 3};
+    QStringList items;
+    items.reserve((int)opts.size());
+    for (const int v : opts) items << (QString::number(v) + " lvl");
+
+    const float cur = getFloatParamOrDefault(params, "TinklaHandsOnLevel", 2.0f);
+    const int cur_i = std::clamp((int)std::lround(cur), 1, 3);
+    const QString cur_str = QString::number(cur_i) + " lvl";
+
+    const QString selection = MultiOptionDialog::getSelection(tr("Select Hands On Threshold"), items, cur_str, this);
+    if (!selection.isEmpty()) {
+      const QString num = selection.left(selection.size() - 4);  // " X lvl"
+      putFloatParam(params, "TinklaHandsOnLevel", num.toFloat(), 0);
+      refreshTexts();
+    }
+  });
+  addItem(hands_on_level_btn);
+
+  radar_offset_btn = new ButtonControl(tr("Radar Offset"), "", tr("Applies lateral offset to radar tracks (meters)."), this);
+  connect(radar_offset_btn, &ButtonControl::clicked, [this]() {
+    QStringList items;
+    for (int i = -10; i <= 10; ++i) {
+      const float v = (float)i / 10.0f;
+      items << (QString::number(v, 'f', 1) + "m");
+    }
+
+    const float cur = getFloatParamOrDefault(params, "TinklaRadarOffset", 0.0f);
+    const QString cur_str = QString::number(cur, 'f', 1) + "m";
+
+    const QString selection = MultiOptionDialog::getSelection(tr("Select Radar Offset"), items, cur_str, this);
+    if (!selection.isEmpty()) {
+      const QString num = selection.left(selection.size() - 1);
+      putFloatParam(params, "TinklaRadarOffset", num.toFloat(), 1);
+      refreshTexts();
+    }
+  });
+  addItem(radar_offset_btn);
+
+  // Toggles (persist automatically)
+  addItem(new ParamControl("TinklaUseTeslaRadarUpsideDown", tr("Radar Upside Down"), tr("Inverts radar lateral axis."), "", this));
+  addItem(new ParamControl("TinklaTeslaRadarIgnoreSGUError", tr("Ignore Radar SGU Error"), tr("Ignores SGU hardware error from radar when enabled."), "", this));
+  addItem(new ParamControl("TinklaIgnoreStockAeb", tr("Ignore Stock AEB"), tr("Prevents stock AEB events from forcing disengagement."), "", this));
+  addItem(new ParamControl("TinklaDisableStartStopSounds", tr("Disable Engage/Disengage Sounds"), tr("Mutes start/stop sounds."), "", this));
+  addItem(new ParamControl("TinklaDisablePromptSounds", tr("Disable Prompt Sounds"), tr("Mutes prompt/chime sounds."), "", this));
+  addItem(new ParamControl("TinklaAutopilotDisabled", tr("Autopilot Disabled"), tr("Allows openpilot to be available even if the vehicle's Autopilot is disabled."), "", this));
+
+  refreshTexts();
+}
+
+void TeslaPanel::refreshTexts() {
+  if (follow_distance_btn != nullptr) {
+    const float v = getFloatParamOrDefault(params, "TinklaFollowDistance", 1.45f);
+    follow_distance_btn->setText(QString::number(v, 'f', 2) + "s");
+  }
+  if (hands_on_level_btn != nullptr) {
+    const float v = getFloatParamOrDefault(params, "TinklaHandsOnLevel", 2.0f);
+    const int i = std::clamp((int)std::lround(v), 1, 3);
+    hands_on_level_btn->setText(QString::number(i) + " lvl");
+  }
+  if (radar_offset_btn != nullptr) {
+    const float v = getFloatParamOrDefault(params, "TinklaRadarOffset", 0.0f);
+    radar_offset_btn->setText(QString::number(v, 'f', 1) + "m");
+  }
+}
+
+void TeslaPanel::showEvent(QShowEvent *event) {
+  refreshTexts();
+  ListWidget::showEvent(event);
+}
+
+mation(true, true);
 }
 
 void TogglesPanel::updateState(const UIState &s) {
@@ -472,6 +586,7 @@ SettingsWindow::SettingsWindow(QWidget *parent) : QFrame(parent) {
     {tr("Device"), device},
     {tr("Network"), networking},
     {tr("Toggles"), toggles},
+    {tr("Tesla"), new TeslaPanel(this)},
     {tr("Software"), new SoftwarePanel(this)},
     {tr("Firehose"), new FirehosePanel(this)},
     {tr("Developer"), new DeveloperPanel(this)},
