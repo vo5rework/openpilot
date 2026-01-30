@@ -80,27 +80,6 @@ private:
   void updateToggles();
 };
 
-
-class TeslaPanel : public ListWidget {
-  Q_OBJECT
-
-public:
-  explicit TeslaPanel(SettingsWindow *parent);
-
-protected:
-  void showEvent(QShowEvent *event) override;
-
-private:
-  void refreshTexts();
-
-  Params params;
-
-  ButtonControl *follow_distance_btn = nullptr;
-  ButtonControl *hands_on_level_btn = nullptr;
-  ButtonControl *radar_offset_btn = nullptr;
-};
-
-
 class SoftwarePanel : public ListWidget {
   Q_OBJECT
 public:
@@ -121,6 +100,23 @@ private:
 
   Params params;
   ParamWatcher *fs_watch;
+};
+
+class TeslaPanel : public ListWidget {
+  Q_OBJECT
+public:
+  explicit TeslaPanel(SettingsWindow *parent);
+
+protected:
+  void showEvent(QShowEvent *event) override;
+
+private:
+  void updateLabels();
+
+  Params params;
+  ButtonControl *follow_distance_btn = nullptr;
+  ButtonControl *hands_on_level_btn = nullptr;
+  ButtonControl *radar_offset_btn = nullptr;
 };
 
 // Forward declaration
