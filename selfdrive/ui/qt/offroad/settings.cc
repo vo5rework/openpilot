@@ -1,4 +1,5 @@
 #include <cassert>
+#include <algorithm>
 #include <cmath>
 #include <string>
 #include <tuple>
@@ -13,7 +14,6 @@
 #include "selfdrive/ui/qt/qt_window.h"
 #include "selfdrive/ui/qt/widgets/prime.h"
 #include "selfdrive/ui/qt/widgets/scrollview.h"
-#include "selfdrive/ui/qt/widgets/input.h"
 #include "selfdrive/ui/qt/offroad/developer_panel.h"
 #include "selfdrive/ui/qt/offroad/firehose.h"
 
@@ -203,116 +203,6 @@ void TogglesPanel::updateToggles() {
     experimental_mode_toggle->setDescription(e2e_description);
   }
 }
-
-// ===== Tesla (Tinkla) settings panel =====
-
-static float getFloatParamOrDefault(Params &params, const std::string &key, float default_val) {
-  const std::string v = params.get(key);
-  if (v.empty()) return default_val;
-  char *end = nullptr;
-  const float f = strtof(v.c_str(), &end);
-  return (end == v.c_str()) ? default_val : f;
-}
-
-static void putFloatParam(Params &params, const std::string &key, float val, int precision) {
-  const std::string fmt = util::string_format("%%.%df", precision);
-  params.put(key, util::string_format(fmt, val));
-}
-
-TeslaPanel::TeslaPanel(SettingsWindow *parent) : ListWidget(parent) {
-  // Follow distance
-  follow_distance_btn = new ButtonControl(tr("Follow Distance"), tr("CHANGE"),
-                                         tr("Overrides longitudinal time-gap for Tesla (seconds)."));
-  QObject::connect(follow_distance_btn, &ButtonControl::clicked, [=]() {
-    const std::vector<float> opts = {0.90f, 1.20f, 1.45f, 1.80f, 2.10f, 2.40f, 2.70f};
-    QStringList choices;
-    for (float f : opts) choices << QString("%1s").arg(f, 0, 'f', 2);
-
-    const float cur = std::clamp(getFloatParamOrDefault(params, "TinklaFollowDistance", 1.45f), 0.50f, 3.00f);
-    const QString cur_str = QString("%1s").arg(cur, 0, 'f', 2);
-
-    const QString sel = MultiOptionDialog::getSelection(tr("Select follow distance"), choices, cur_str, this);
-    if (!sel.isEmpty()) {
-      const float v = sel.left(sel.size() - 1).toFloat();
-      putFloatParam(params, "TinklaFollowDistance", std::clamp(v, 0.50f, 3.00f), 2);
-      updateLabels();
-    }
-  });
-  addItem(follow_distance_btn);
-
-  // Hands-on threshold
-  hands_on_level_btn = new ButtonControl(tr("Hands-on Threshold"), tr("CHANGE"),
-                                        tr("Minimum hands-on level required before openpilot considers hands detected."));
-  QObject::connect(hands_on_level_btn, &ButtonControl::clicked, [=]() {
-    QStringList choices;
-    for (int i = 1; i <= 4; i++) choices << QString("%1 lvl").arg(i);
-
-    const int cur = std::clamp((int)lroundf(getFloatParamOrDefault(params, "TinklaHandsOnLevel", 3.0f)), 1, 4);
-    const QString cur_str = QString("%1 lvl").arg(cur);
-
-    const QString sel = MultiOptionDialog::getSelection(tr("Select hands-on threshold"), choices, cur_str, this);
-    if (!sel.isEmpty()) {
-      const int v = sel.split(" ").first().toInt();
-      params.put("TinklaHandsOnLevel", std::to_string(std::clamp(v, 1, 4)));
-      updateLabels();
-    }
-  });
-  addItem(hands_on_level_btn);
-
-  // Radar offset
-  radar_offset_btn = new ButtonControl(tr("Radar Offset"), tr("CHANGE"),
-                                      tr("Applies a lateral offset to radar tracks (meters)."));
-  QObject::connect(radar_offset_btn, &ButtonControl::clicked, [=]() {
-    QStringList choices;
-    for (int i = -10; i <= 10; i++) {
-      const float v = i / 10.0f;
-      choices << QString("%1m").arg(v, 0, 'f', 1);
-    }
-
-    const float cur = std::clamp(getFloatParamOrDefault(params, "TinklaRadarOffset", 0.0f), -1.0f, 1.0f);
-    const QString cur_str = QString("%1m").arg(cur, 0, 'f', 1);
-
-    const QString sel = MultiOptionDialog::getSelection(tr("Select radar offset"), choices, cur_str, this);
-    if (!sel.isEmpty()) {
-      const float v = sel.left(sel.size() - 1).toFloat();
-      putFloatParam(params, "TinklaRadarOffset", std::clamp(v, -1.0f, 1.0f), 1);
-      updateLabels();
-    }
-  });
-  addItem(radar_offset_btn);
-
-  // Toggles (persist immediately via ParamControl)
-  addItem(new ParamControl("TinklaUseTeslaRadarUpsideDown", tr("Radar Upside Down"),
-                           tr("Invert radar orientation (yRel/yvRel)."), "../assets/icons/info.png"));
-  addItem(new ParamControl("TinklaTeslaRadarIgnoreSGUError", tr("Ignore Radar SGU Error"),
-                           tr("Ignore SGU hardware fail on Tesla radar."), "../assets/icons/info.png"));
-  addItem(new ParamControl("TinklaIgnoreStockAeb", tr("Ignore Stock AEB"),
-                           tr("Ignore stock AEB events for disengagement logic."), "../assets/icons/info.png"));
-  addItem(new ParamControl("TinklaAutopilotDisabled", tr("Autopilot Disabled"),
-                           tr("Minimal-safe: force cruise availability even when stock AP is disabled."), "../assets/icons/info.png"));
-  addItem(new ParamControl("TinklaDisableStartStopSounds", tr("Mute Engage/Disengage Sounds"),
-                           tr("Disable start/stop alert sounds."), "../assets/icons/info.png"));
-  addItem(new ParamControl("TinklaDisablePromptSounds", tr("Mute Prompt Sounds"),
-                           tr("Disable prompt alert sounds."), "../assets/icons/info.png"));
-}
-
-void TeslaPanel::updateLabels() {
-  const float follow = std::clamp(getFloatParamOrDefault(params, "TinklaFollowDistance", 1.45f), 0.50f, 3.00f);
-  follow_distance_btn->setValue(QString("%1s").arg(follow, 0, 'f', 2));
-
-  const int hands = std::clamp((int)lroundf(getFloatParamOrDefault(params, "TinklaHandsOnLevel", 3.0f)), 1, 4);
-  hands_on_level_btn->setValue(QString("%1 lvl").arg(hands));
-
-  const float ro = std::clamp(getFloatParamOrDefault(params, "TinklaRadarOffset", 0.0f), -1.0f, 1.0f);
-  radar_offset_btn->setValue(QString("%1m").arg(ro, 0, 'f', 1));
-}
-
-void TeslaPanel::showEvent(QShowEvent *event) {
-  updateLabels();
-  ListWidget::showEvent(event);
-}
-
-
 
 DevicePanel::DevicePanel(SettingsWindow *parent) : ListWidget(parent) {
   setSpacing(50);
@@ -647,3 +537,119 @@ SettingsWindow::SettingsWindow(QWidget *parent) : QFrame(parent) {
     }
   )");
 }
+
+static float getFloatParamOrDefault(Params &params, const std::string &key, float default_val) {
+  const auto s = params.get(key);
+  if (!s.empty()) {
+    try {
+      return std::stof(s);
+    } catch (...) {
+      return default_val;
+    }
+  }
+  return default_val;
+}
+
+static void putFloatParam(Params &params, const std::string &key, float val, int precision) {
+  const std::string fmt = util::string_format("%%.%df", precision);
+  params.put(key, util::string_format(fmt, val));
+}
+
+// ===== Tesla (Tinkla) settings panel =====
+TeslaPanel::TeslaPanel(SettingsWindow *parent) : ListWidget(parent) {
+  // Follow distance (seconds)
+  follow_distance_btn = new ButtonControl(tr("Follow Distance"), tr("CHANGE"),
+                                         tr("Overrides longitudinal time-gap for Tesla (seconds)."));
+  QObject::connect(follow_distance_btn, &ButtonControl::clicked, [this]() {
+    const float cur = std::clamp(getFloatParamOrDefault(params, "TinklaFollowDistance", 1.45f), 0.50f, 3.00f);
+    float v = cur + 0.05f;
+    if (v > 3.00f) v = 0.50f;
+    putFloatParam(params, "TinklaFollowDistance", std::clamp(v, 0.50f, 3.00f), 2);
+    updateLabels();
+  });
+  addItem(follow_distance_btn);
+
+  // Hands-on threshold
+  hands_on_level_btn = new ButtonControl(tr("Hands-on Threshold"), tr("CHANGE"),
+                                        tr("Changes steering wheel touch sensitivity (1-4)."));
+  QObject::connect(hands_on_level_btn, &ButtonControl::clicked, [this]() {
+    const int cur = std::clamp((int)lroundf(getFloatParamOrDefault(params, "TinklaHandsOnLevel", 3.0f)), 1, 4);
+    int v = cur + 1;
+    if (v > 4) v = 1;
+    params.put("TinklaHandsOnLevel", std::to_string(v));
+    updateLabels();
+  });
+  addItem(hands_on_level_btn);
+
+  // Radar offset
+  radar_offset_btn = new ButtonControl(tr("Radar Offset"), tr("CHANGE"),
+                                       tr("Adjusts Tesla radar longitudinal offset (meters)."));
+  QObject::connect(radar_offset_btn, &ButtonControl::clicked, [this]() {
+    const float cur = std::clamp(getFloatParamOrDefault(params, "TinklaRadarOffset", 0.0f), -1.0f, 1.0f);
+    float v = cur + 0.1f;
+    if (v > 1.0f) v = -1.0f;
+    putFloatParam(params, "TinklaRadarOffset", std::clamp(v, -1.0f, 1.0f), 1);
+    updateLabels();
+  });
+  addItem(radar_offset_btn);
+
+  // Speed limit matching
+  addItem(new ParamControl("TinklaAdjustAccWithSpeedLimit", tr("Match Speed to Speed Limit"),
+                           tr("Automatically sets cruise speed to the detected speed limit with an offset."), "../assets/icons/info.png"));
+  addItem(new ParamControl("TinklaSpeedLimitUseRelative", tr("Offset is Percentage"),
+                           tr("If enabled, offset is a percentage of the speed limit. Otherwise it is an absolute mph/kph offset."), "../assets/icons/info.png"));
+
+  speed_limit_offset_btn = new ButtonControl(tr("Speed Limit Offset"), tr("CHANGE"),
+                                             tr("Offset applied when matching speed limits."));
+  QObject::connect(speed_limit_offset_btn, &ButtonControl::clicked, [this]() {
+    // Use UI units preference for display; behavior is based on car-reported units in carstate.
+    const bool is_metric = params.getBool("IsMetric");
+    const float step = 1.0f;
+    const float min_v = is_metric ? -30.0f : -20.0f;
+    const float max_v = is_metric ?  30.0f :  20.0f;
+    const float cur = std::clamp(getFloatParamOrDefault(params, "TinklaSpeedLimitOffset", 0.0f), min_v, max_v);
+    float v = cur + step;
+    if (v > max_v) v = min_v;
+    putFloatParam(params, "TinklaSpeedLimitOffset", v, 1);
+    updateLabels();
+  });
+  addItem(speed_limit_offset_btn);
+
+  // Existing toggles
+  addItem(new ParamControl("TinklaUseTeslaRadarUpsideDown", tr("Radar Upside Down"),
+                           tr("Use if your Tesla radar is mounted upside down."), "../assets/icons/info.png"));
+  addItem(new ParamControl("TinklaTeslaRadarIgnoreSGUError", tr("Ignore Radar SGU Error"),
+                           tr("Ignore SGU hardware fail on Tesla radar."), "../assets/icons/info.png"));
+  addItem(new ParamControl("TinklaIgnoreStockAeb", tr("Ignore Stock AEB"),
+                           tr("Ignore Tesla stock Automatic Emergency Braking events."), "../assets/icons/info.png"));
+  addItem(new ParamControl("TinklaAutopilotDisabled", tr("Autopilot Disabled"),
+                           tr("Emulates cruise for cars where Autopilot is disabled. Engage with stalk pull."), "../assets/icons/info.png"));
+  addItem(new ParamControl("TinklaDisableStartStopSounds", tr("Mute Engage/Disengage Sounds"),
+                           tr("Disables the start/stop sounds."), "../assets/icons/info.png"));
+  addItem(new ParamControl("TinklaDisablePromptSounds", tr("Mute Prompt Sounds"),
+                           tr("Disables prompt sounds."), "../assets/icons/info.png"));
+
+  updateLabels();
+}
+
+void TeslaPanel::updateLabels() {
+  const float follow = std::clamp(getFloatParamOrDefault(params, "TinklaFollowDistance", 1.45f), 0.50f, 3.00f);
+  follow_distance_btn->setValue(QString::number(follow, 'f', 2) + " s");
+
+  const int hands = std::clamp((int)lroundf(getFloatParamOrDefault(params, "TinklaHandsOnLevel", 3.0f)), 1, 4);
+  hands_on_level_btn->setValue(QString::number(hands));
+
+  const float ro = std::clamp(getFloatParamOrDefault(params, "TinklaRadarOffset", 0.0f), -1.0f, 1.0f);
+  radar_offset_btn->setValue(QString::number(ro, 'f', 1) + " m");
+
+  const float slo = getFloatParamOrDefault(params, "TinklaSpeedLimitOffset", 0.0f);
+  const bool is_metric = params.getBool("IsMetric");
+  speed_limit_offset_btn->setValue(QString::number(slo, 'f', 1) + (is_metric ? " kph" : " mph"));
+}
+
+void TeslaPanel::showEvent(QShowEvent *event) {
+  updateLabels();
+  ListWidget::showEvent(event);
+}
+
+

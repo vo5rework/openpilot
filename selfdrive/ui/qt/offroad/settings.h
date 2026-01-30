@@ -14,7 +14,6 @@
 #include "selfdrive/ui/qt/util.h"
 #include "selfdrive/ui/qt/widgets/controls.h"
 
-
 // ********** settings window + top-level panels **********
 class SettingsWindow : public QFrame {
   Q_OBJECT
@@ -103,12 +102,13 @@ private:
   ParamWatcher *fs_watch;
 };
 
+
+
 class TeslaPanel : public ListWidget {
   Q_OBJECT
+
 public:
   explicit TeslaPanel(SettingsWindow *parent);
-
-protected:
   void showEvent(QShowEvent *event) override;
 
 private:
@@ -118,6 +118,7 @@ private:
   ButtonControl *follow_distance_btn = nullptr;
   ButtonControl *hands_on_level_btn = nullptr;
   ButtonControl *radar_offset_btn = nullptr;
+  ButtonControl *speed_limit_offset_btn = nullptr;
 };
 
 // Forward declaration
