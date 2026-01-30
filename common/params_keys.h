@@ -129,4 +129,14 @@ inline static std::unordered_map<std::string, ParamKeyAttributes> keys = {
     {"UptimeOffroad", {PERSISTENT, FLOAT, "0.0"}},
     {"UptimeOnroad", {PERSISTENT, FLOAT, "0.0"}},
     {"Version", {PERSISTENT, STRING}},
+
+    {"TinklaFollowDistance", {PERSISTENT, FLOAT, "1.45"}},
+    {"TinklaHandsOnLevel", {PERSISTENT, FLOAT, "2.0"}},
+    {"TinklaRadarOffset", {PERSISTENT, FLOAT, "0.0"}},
+    {"TinklaUseTeslaRadarUpsideDown", {PERSISTENT, BOOL}},
+    {"TinklaTeslaRadarIgnoreSGUError", {PERSISTENT, BOOL}},
+    {"TinklaIgnoreStockAeb", {PERSISTENT, BOOL}},
+    {"TinklaDisableStartStopSounds", {PERSISTENT, BOOL}},
+    {"TinklaDisablePromptSounds", {PERSISTENT, BOOL}},
+    {"TinklaAutopilotDisabled", {PERSISTENT, BOOL}},
 };

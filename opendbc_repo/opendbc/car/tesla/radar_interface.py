@@ -8,6 +8,9 @@ class RadarInterface(RadarInterfaceBase):
   def __init__(self, CP):
     super().__init__(CP)
     self.CP = CP
+    self.radar_offset = 0.0
+    self.radar_upside_down = False
+    self.ignore_radar_sgu_error = False
 
     self.continental_radar = CP.carFingerprint in (CAR.TESLA_MODEL_S_HW3, )
     self.bosch_radar = CP.carFingerprint in (CAR.TESLA_MODEL_S_HW1, CAR.TESLA_MODEL_X_HW1, CAR.TESLA_MODEL_S_HW2, )
@@ -70,7 +73,7 @@ class RadarInterface(RadarInterfaceBase):
         ret.errors.radarFault = True
     elif self.bosch_radar:
       radar_status = self.rcp.vl['TeslaRadarSguInfo']
-      if radar_status['RADC_HWFail']:
+      if radar_status['RADC_HWFail'] and (not self.ignore_radar_sgu_error):
         ret.errors.radarFault = True
 
     # Radar tracks
@@ -106,6 +109,11 @@ class RadarInterface(RadarInterfaceBase):
       self.pts[i].vRel = msg_a['LongSpeed']
       self.pts[i].aRel = msg_a['LongAccel']
       self.pts[i].yvRel = msg_b['LatSpeed']
+      # Tinkla runtime radar overrides
+      self.pts[i].yRel -= float(self.radar_offset)
+      if self.radar_upside_down:
+        self.pts[i].yRel *= -1
+        self.pts[i].yvRel *= -1
       self.pts[i].measured = bool(msg_a['Meas'])
 
     ret.points = list(self.pts.values())

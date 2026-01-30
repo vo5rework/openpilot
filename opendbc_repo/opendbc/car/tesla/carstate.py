@@ -11,6 +11,8 @@ ButtonType = structs.CarState.ButtonEvent.Type
 class CarState(CarStateBase):
   def __init__(self, CP):
     super().__init__(CP)
+    self.ignore_stock_aeb = False
+    self.autopilot_disabled = False
     self.can_define = CANDefine(DBC[CP.carFingerprint][Bus.party])
 
     if self.CP.carFingerprint in LEGACY_CARS:
@@ -101,7 +103,7 @@ class CarState(CarStateBase):
       ret.cruiseState.speed = max(cp_party.vl["DI_state"]["DI_digitalSpeed"] * CV.KPH_TO_MS, 1e-3)
     elif speed_units == "MPH":
       ret.cruiseState.speed = max(cp_party.vl["DI_state"]["DI_digitalSpeed"] * CV.MPH_TO_MS, 1e-3)
-    ret.cruiseState.available = cruise_state == "STANDBY" or ret.cruiseState.enabled
+    ret.cruiseState.available = (cruise_state == "STANDBY" or ret.cruiseState.enabled) or self.autopilot_disabled
     ret.cruiseState.standstill = False  # This needs to be false, since we can resume from stop without sending anything special
     ret.standstill = cruise_state == "STANDSTILL"
     ret.accFaulted = cruise_state == "FAULT"
@@ -124,7 +126,7 @@ class CarState(CarStateBase):
     ret.rightBlindspot = cp_ap_party.vl["DAS_status"]["DAS_blindSpotRearRight"] != 0
 
     # AEB
-    ret.stockAeb = cp_ap_party.vl["DAS_control"]["DAS_aebEvent"] == 1
+    ret.stockAeb = (cp_ap_party.vl["DAS_control"]["DAS_aebEvent"] == 1) and (not self.ignore_stock_aeb)
 
     # LKAS
     ret.stockLkas = cp_ap_party.vl["DAS_steeringControl"]["DAS_steeringControlType"] == 2  # LANE_KEEP_ASSIST
@@ -194,7 +196,7 @@ class CarState(CarStateBase):
       ret.cruiseState.speed = max(cp_chassis.vl["DI_state"]["DI_digitalSpeed"] * CV.KPH_TO_MS, 1e-3)
     elif speed_units == "MPH":
       ret.cruiseState.speed = max(cp_chassis.vl["DI_state"]["DI_digitalSpeed"] * CV.MPH_TO_MS, 1e-3)
-    ret.cruiseState.available = cruise_state == "STANDBY" or ret.cruiseState.enabled
+    ret.cruiseState.available = (cruise_state == "STANDBY" or ret.cruiseState.enabled) or self.autopilot_disabled
     ret.cruiseState.standstill = False  # This needs to be false, since we can resume from stop without sending anything special
     ret.standstill = cruise_state == "STANDSTILL"
     ret.accFaulted = cruise_state == "FAULT"
