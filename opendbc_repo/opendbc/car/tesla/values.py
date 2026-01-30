@@ -146,6 +146,55 @@ class CANBUS:
   autopilot_powertrain = 6
 
 
+
+class CruiseButtons:
+  # From Tesla DBC: VAL_ SpdCtrlLvr_Stat 32 "DN_1ST" 16 "UP_1ST" 8 "DN_2ND" 4 "UP_2ND" 2 "RWD" 1 "FWD" 0 "IDLE" ;
+  RES_ACCEL = 16
+  RES_ACCEL_2ND = 4
+  DECEL_SET = 32
+  DECEL_2ND = 8
+  CANCEL = 1
+  MAIN = 2
+  IDLE = 0
+
+  @classmethod
+  def is_accel(cls, btn: int) -> bool:
+    return btn in (cls.RES_ACCEL, cls.RES_ACCEL_2ND)
+
+  @classmethod
+  def is_decel(cls, btn: int) -> bool:
+    return btn in (cls.DECEL_SET, cls.DECEL_2ND)
+
+  @classmethod
+  def should_be_throttled(cls, btn: int) -> bool:
+    # Some buttons should not be spammed or they may overwhelm the SCCM.
+    return btn not in (cls.MAIN, cls.IDLE)
+
+
+class CruiseState:
+  # DI_cruiseState from the DBC
+  OFF = 0
+  STANDBY = 1
+  ENABLED = 2
+  STANDSTILL = 3
+  OVERRIDE = 4
+  FAULT = 5
+  PRE_FAULT = 6
+  PRE_CANCEL = 7
+
+  @classmethod
+  def is_enabled_or_standby(cls, state: int) -> bool:
+    return state in (cls.ENABLED, cls.STANDBY)
+
+  @classmethod
+  def is_faulted(cls, state: int) -> bool:
+    return state in (cls.PRE_FAULT, cls.FAULT)
+
+  @classmethod
+  def is_off(cls, state: int) -> bool:
+    return state == cls.OFF
+
+
 GEAR_MAP = {
   "DI_GEAR_INVALID": CarState.GearShifter.unknown,
   "DI_GEAR_P": CarState.GearShifter.park,

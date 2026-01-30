@@ -1,3 +1,5 @@
+import copy
+
 from opendbc.car.common.conversions import Conversions as CV
 from opendbc.car.tesla.values import CANBUS, CarControllerParams
 
@@ -5,6 +7,31 @@ from opendbc.car.tesla.values import CANBUS, CarControllerParams
 class TeslaCAN:
   def __init__(self, packer):
     self.packer = packer
+  @staticmethod
+  def _crc_stw_actn_req(data: bytes) -> int:
+    """CRC-8 as implemented by Tesla SCCM for STW_ACTN_RQ."""
+    crc = 0
+    for byte in data:
+      crc ^= byte
+      for _ in range(8):
+        if crc & 0x80:
+          crc = ((crc << 1) ^ 0x11D) & 0xFF
+        else:
+          crc = (crc << 1) & 0xFF
+    return crc ^ 0xFF
+
+  def create_action_request(self, base_msg: dict, button: int, counter: int) -> tuple[int, int, bytes]:
+    """Create a STW_ACTN_RQ cruise stalk virtual button request."""
+    values = copy.copy(base_msg) if base_msg is not None else {}
+    values["SpdCtrlLvr_Stat"] = int(button)
+    values["MC_STW_ACTN_RQ"] = int(counter) & 0xF
+
+    # Pack once to compute CRC over first 7 bytes, then repack with CRC_STW_ACTN_RQ.
+    msg = self.packer.make_can_msg("STW_ACTN_RQ", CANBUS.party, values)
+    crc = self._crc_stw_actn_req(msg[2][:7])
+    values["CRC_STW_ACTN_RQ"] = crc
+    return self.packer.make_can_msg("STW_ACTN_RQ", CANBUS.party, values)
+
 
   def create_steering_control(self, angle, enabled):
     values = {

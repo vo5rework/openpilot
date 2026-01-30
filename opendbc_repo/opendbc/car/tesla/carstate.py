@@ -256,29 +256,48 @@ class CarState(CarStateBase):
     # Speed limit signals (optional)
     self._update_speed_limit(cp_party)
 
-    # Cruise state
-    cruise_state = self.can_define.dv["DI_state"]["DI_cruiseState"].get(int(cp_party.vl["DI_state"]["DI_cruiseState"]), None)
+    # Cruise state + cruise set speed
     speed_units = self._get_speed_units(cp_party, self.can_define.dv)
 
+    # keep a copy of the last stalk message for virtual stalk requests
+    try:
+      self.msg_stw_actn_req = copy.copy(cp_party.vl["STW_ACTN_RQ"])
+      self.prev_cruise_buttons = getattr(self, "cruise_buttons", _CRUISE_BTN_IDLE)
+      self.cruise_buttons = int(cp_party.vl["STW_ACTN_RQ"]["SpdCtrlLvr_Stat"])
+    except Exception:
+      self.msg_stw_actn_req = None
+      self.prev_cruise_buttons = getattr(self, "cruise_buttons", _CRUISE_BTN_IDLE)
+      self.cruise_buttons = _CRUISE_BTN_IDLE
+
+    cruise_state_raw = int(cp_party.vl["DI_state"]["DI_cruiseState"])
+    cruise_state_name = self.can_define.dv["DI_state"]["DI_cruiseState"].get(cruise_state_raw, None)
+
     autopark_state = self.can_define.dv["DI_state"]["DI_autoparkState"].get(int(cp_party.vl["DI_state"]["DI_autoparkState"]), None)
-    cruise_enabled = cruise_state in ("ENABLED", "STANDSTILL", "OVERRIDE", "PRE_FAULT", "PRE_CANCEL")
+    cruise_enabled = cruise_state_name in ("ENABLED", "STANDSTILL", "OVERRIDE", "PRE_FAULT", "PRE_CANCEL")
     self.update_autopark_state(autopark_state, cruise_enabled)
 
-    # Manual cruise input (Unity parity) when enabled
-    if self._tinkla.autopilot_disabled:
-      self._update_manual_cruise_from_stalk(cp_party, speed_units, ret.vEgo * CV.MS_TO_KPH)
-      self._apply_manual_cruise_state(ret, speed_units)
-    else:
-      ret.cruiseState.enabled = cruise_enabled and not self.autopark
-      if speed_units == "KPH":
-        ret.cruiseState.speed = max(cp_party.vl["DI_state"]["DI_digitalSpeed"] * CV.KPH_TO_MS, 1e-3)
-      else:
-        ret.cruiseState.speed = max(cp_party.vl["DI_state"]["DI_digitalSpeed"] * CV.MPH_TO_MS, 1e-3)
-      ret.cruiseState.available = (cruise_state == "STANDBY" or ret.cruiseState.enabled)
-      ret.cruiseState.standstill = False
+    # Cruise set speed (Unity parity): DI_cruiseSet is in the UI units.
+    try:
+      cruise_set_uom = float(cp_party.vl["DI_state"]["DI_cruiseSet"])
+    except Exception:
+      cruise_set_uom = float(cp_party.vl["DI_state"]["DI_digitalSpeed"])
 
-    ret.standstill = cruise_state == "STANDSTILL"
-    ret.accFaulted = cruise_state == "FAULT"
+    if speed_units == "KPH":
+      cruise_set_kph = cruise_set_uom
+    else:
+      cruise_set_kph = cruise_set_uom * CV.MPH_TO_KPH
+
+    self.cruise_state = cruise_state_raw
+    self.speed_units = speed_units
+    self.v_cruise_actual_kph = cruise_set_kph
+
+    ret.cruiseState.available = True
+    ret.cruiseState.enabled = cruise_enabled and (not self.autopark)
+    ret.cruiseState.speed = max(cruise_set_kph * CV.KPH_TO_MS, 1e-3)
+    ret.cruiseState.standstill = cruise_state_name == "STANDSTILL"
+
+    ret.standstill = cruise_state_name == "STANDSTILL"
+    ret.accFaulted = cruise_state_name == "FAULT"
 
     # AEB
     ret.stockAeb = (cp_ap_party.vl["DAS_control"]["DAS_aebEvent"] == 1) and (not self.ignore_stock_aeb)
@@ -342,25 +361,43 @@ class CarState(CarStateBase):
     # Speed limit signals (optional)
     self._update_speed_limit(cp_chassis)
 
-    # Cruise state
-    cruise_state = self.can_defines["DI_state"]["DI_cruiseState"].get(int(cp_chassis.vl["DI_state"]["DI_cruiseState"]), None)
+    # Cruise state + cruise set speed
     speed_units = self._get_speed_units(cp_chassis, self.can_defines)
-    cruise_enabled = cruise_state in ("ENABLED", "STANDSTILL", "OVERRIDE", "PRE_FAULT", "PRE_CANCEL")
 
-    if self._tinkla.autopilot_disabled:
-      self._update_manual_cruise_from_stalk(cp_chassis, speed_units, ret.vEgo * CV.MS_TO_KPH)
-      self._apply_manual_cruise_state(ret, speed_units)
+    try:
+      self.msg_stw_actn_req = copy.copy(cp_chassis.vl["STW_ACTN_RQ"])
+      self.prev_cruise_buttons = getattr(self, "cruise_buttons", _CRUISE_BTN_IDLE)
+      self.cruise_buttons = int(cp_chassis.vl["STW_ACTN_RQ"]["SpdCtrlLvr_Stat"])
+    except Exception:
+      self.msg_stw_actn_req = None
+      self.prev_cruise_buttons = getattr(self, "cruise_buttons", _CRUISE_BTN_IDLE)
+      self.cruise_buttons = _CRUISE_BTN_IDLE
+
+    cruise_state_raw = int(cp_chassis.vl["DI_state"]["DI_cruiseState"])
+    cruise_state_name = self.can_defines["DI_state"]["DI_cruiseState"].get(cruise_state_raw, None)
+    cruise_enabled = cruise_state_name in ("ENABLED", "STANDSTILL", "OVERRIDE", "PRE_FAULT", "PRE_CANCEL")
+
+    try:
+      cruise_set_uom = float(cp_chassis.vl["DI_state"]["DI_cruiseSet"])
+    except Exception:
+      cruise_set_uom = float(cp_chassis.vl["DI_state"]["DI_digitalSpeed"])
+
+    if speed_units == "KPH":
+      cruise_set_kph = cruise_set_uom
     else:
-      ret.cruiseState.enabled = cruise_enabled
-      if speed_units == "KPH":
-        ret.cruiseState.speed = max(cp_chassis.vl["DI_state"]["DI_digitalSpeed"] * CV.KPH_TO_MS, 1e-3)
-      else:
-        ret.cruiseState.speed = max(cp_chassis.vl["DI_state"]["DI_digitalSpeed"] * CV.MPH_TO_MS, 1e-3)
-      ret.cruiseState.available = (cruise_state == "STANDBY" or ret.cruiseState.enabled)
-      ret.cruiseState.standstill = False
+      cruise_set_kph = cruise_set_uom * CV.MPH_TO_KPH
 
-    ret.standstill = cruise_state == "STANDSTILL"
-    ret.accFaulted = cruise_state == "FAULT"
+    self.cruise_state = cruise_state_raw
+    self.speed_units = speed_units
+    self.v_cruise_actual_kph = cruise_set_kph
+
+    ret.cruiseState.available = True
+    ret.cruiseState.enabled = cruise_enabled
+    ret.cruiseState.speed = max(cruise_set_kph * CV.KPH_TO_MS, 1e-3)
+    ret.cruiseState.standstill = cruise_state_name == "STANDSTILL"
+
+    ret.standstill = cruise_state_name == "STANDSTILL"
+    ret.accFaulted = cruise_state_name == "FAULT"
 
     # AEB
     ret.stockAeb = cp_ap_pt.vl["DAS_control"]["DAS_aebEvent"] == 1
