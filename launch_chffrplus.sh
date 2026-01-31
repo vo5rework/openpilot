@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+export NO_PREBUILT=1
+
 
 DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" >/dev/null && pwd )"
 
