@@ -54,48 +54,48 @@ class CarState(CarStateBase):
     self.hands_on_level = 0
     self.das_control = None
 
-# Unity parity fields
-self.msg_stw_actn_req: dict | None = None
-self.cruise_buttons = 0
-self.turnSignalStalkState = 0
-self.tap_direction = 0
-self.leftBlinkerLamp = False
-self.rightBlinkerLamp = False
-self.human_control = False
+    # Unity parity fields
+    self.msg_stw_actn_req: dict | None = None
+    self.cruise_buttons = 0
+    self.turnSignalStalkState = 0
+    self.tap_direction = 0
+    self.leftBlinkerLamp = False
+    self.rightBlinkerLamp = False
+    self.human_control = False
 
-self.speed_units = "MPH"
-self.speed_limit_ms = 0.0
-self.speed_limit_ms_das = 0.0
+    self.speed_units = "MPH"
+    self.speed_limit_ms = 0.0
+    self.speed_limit_ms_das = 0.0
 
-self._tinkla = _TinklaConfig()
-self._reload_tinkla_params()
-self.autopilot_disabled = bool(self._tinkla.autopilot_disabled)
-self.cruiseEnabled = False
+    self._tinkla = _TinklaConfig()
+    self._reload_tinkla_params()
+    self.autopilot_disabled = bool(self._tinkla.autopilot_disabled)
+    self.cruiseEnabled = False
 
-self._prev_cruise_buttons = 0
-self._param_frame = 0
+    self._prev_cruise_buttons = 0
+    self._param_frame = 0
 
-def _reload_tinkla_params(self) -> None:
-  self._tinkla.autopilot_disabled = load_bool_param("TinklaAutopilotDisabled", False)
-  self._tinkla.hands_on_level = load_float_param("TinklaHandsOnLevel", 2.0)
-  self._tinkla.adjust_acc_with_speed_limit = load_bool_param("TinklaAdjustAccWithSpeedLimit", False)
-  self._tinkla.speed_limit_offset = load_float_param("TinklaSpeedLimitOffset", 0.0)
-  self._tinkla.speed_limit_use_relative = load_bool_param("TinklaSpeedLimitUseRelative", False)
-  self._tinkla.enable_alc = load_bool_param("TinklaEnableALC", True)
-  self._tinkla.alc_delay = load_float_param("TinklaAlcDelay", 0.75)
+  def _reload_tinkla_params(self) -> None:
+    self._tinkla.autopilot_disabled = load_bool_param("TinklaAutopilotDisabled", False)
+    self._tinkla.hands_on_level = load_float_param("TinklaHandsOnLevel", 2.0)
+    self._tinkla.adjust_acc_with_speed_limit = load_bool_param("TinklaAdjustAccWithSpeedLimit", False)
+    self._tinkla.speed_limit_offset = load_float_param("TinklaSpeedLimitOffset", 0.0)
+    self._tinkla.speed_limit_use_relative = load_bool_param("TinklaSpeedLimitUseRelative", False)
+    self._tinkla.enable_alc = load_bool_param("TinklaEnableALC", True)
+    self._tinkla.alc_delay = load_float_param("TinklaAlcDelay", 0.75)
 
-def _calc_speed_limit_target_ms(self, speed_units: str) -> float:
-  limit_ms = float(self.speed_limit_ms_das or self.speed_limit_ms or 0.0)
-  if limit_ms <= 0.0:
-    return 0.0
+  def _calc_speed_limit_target_ms(self, speed_units: str) -> float:
+    limit_ms = float(self.speed_limit_ms_das or self.speed_limit_ms or 0.0)
+    if limit_ms <= 0.0:
+      return 0.0
 
-  off = float(self._tinkla.speed_limit_offset)
-  if self._tinkla.speed_limit_use_relative:
-    return max(0.0, limit_ms * (1.0 + off / 100.0))
+    off = float(self._tinkla.speed_limit_offset)
+    if self._tinkla.speed_limit_use_relative:
+      return max(0.0, limit_ms * (1.0 + off / 100.0))
 
-  if speed_units == "KPH":
-    return max(0.0, limit_ms + off * CV.KPH_TO_MS)
-  return max(0.0, limit_ms + off * CV.MPH_TO_MS)
+    if speed_units == "KPH":
+      return max(0.0, limit_ms + off * CV.KPH_TO_MS)
+    return max(0.0, limit_ms + off * CV.MPH_TO_MS)
 
   def update_autopark_state(self, autopark_state: str, cruise_enabled: bool):
     autopark_now = autopark_state in ("ACTIVE", "COMPLETE", "SELFPARK_STARTED")
