@@ -31,7 +31,6 @@ a.out
 *.o-*
 *.os
 *.os-*
-*.so
 *.a
 *.clb
 *.class
