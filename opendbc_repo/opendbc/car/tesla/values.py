@@ -179,20 +179,18 @@ class CruiseButtons:
     return btn in (cls.DECEL_SET, cls.DECEL_2ND)
 class CarControllerParams:
   ANGLE_LIMITS: AngleSteeringLimits = AngleSteeringLimits(
-    # EPAS faults above this angle
-    360,  # deg
-    # Tesla uses a vehicle model instead, check carcontroller.py for details
-    ([], []),
-    ([], []),
+  # EPAS faults above this angle
+  360,  # deg
 
-    # Vehicle model angle limits
-    # Add extra tolerance for average banked road since safety doesn't have the roll
-    MAX_LATERAL_ACCEL=ISO_LATERAL_ACCEL + (ACCELERATION_DUE_TO_GRAVITY * AVERAGE_ROAD_ROLL),  # ~3.6 m/s^2
-    MAX_LATERAL_JERK=3.0 + (ACCELERATION_DUE_TO_GRAVITY * AVERAGE_ROAD_ROLL),  # ~3.6 m/s^3
+  # Unity C3 parity angle rate limits
+  ([0., 5., 15.], [5., 4., 0.75]),   # up
+  ([0., 5., 15.], [5., 5.5, 2.4]),   # down
 
-    # limit angle rate to both prevent a fault and for low speed comfort (~12 mph rate down to 0 mph)
-    MAX_ANGLE_RATE=5,  # deg/20ms frame, EPS faults at 12 at a standstill
-  )
+  # v2 (vehicle model) fields unused by std limiter
+  MAX_LATERAL_ACCEL=ISO_LATERAL_ACCEL + (ACCELERATION_DUE_TO_GRAVITY * AVERAGE_ROAD_ROLL),
+  MAX_LATERAL_JERK=3.0 + (ACCELERATION_DUE_TO_GRAVITY * AVERAGE_ROAD_ROLL),
+  MAX_ANGLE_RATE=5,
+)
 
   STEER_STEP = 2  # Angle command is sent at 50 Hz
   ACCEL_MAX = 2.0    # m/s^2

@@ -4,12 +4,86 @@ from opendbc.car.tesla.carcontroller import CarController
 from opendbc.car.tesla.carstate import CarState
 from opendbc.car.tesla.values import TeslaSafetyFlags, CAR, TeslaLegacyParams, LEGACY_CARS
 from opendbc.car.tesla.radar_interface import RadarInterface
+from cereal import messaging
+from openpilot.selfdrive.car.modules.ALC_module import ALCController
+from openpilot.selfdrive.car.modules.BLNK_module import BLNKController
+from openpilot.selfdrive.car.modules.HSO_module import HSOController
+from openpilot.selfdrive.car.modules.CFG_module import load_bool_param, load_float_param
+
 
 
 class CarInterface(CarInterfaceBase):
   CarState = CarState
   CarController = CarController
   RadarInterface = RadarInterface
+
+
+def __init__(self, CP, CarController, CarState):
+  super().__init__(CP, CarController, CarState)
+
+  # Unity parity sockets/modules
+  self.CS.laP = messaging.sub_sock('lateralPlan')
+  self.CS.human_control = False
+
+  # Params
+  self.CS._tinkla_enable_alc = load_bool_param("TinklaEnableALC", True)
+  self.CS._tinkla_alc_delay = load_float_param("TinklaAlcDelay", 0.75)
+
+  # Controllers
+  self.CS.alca_controller = ALCController()
+  self.CS.blinker_controller = BLNKController()
+  self.CS.HSO = HSOController()
+
+def pre_apply(self, c: structs.CarControl, now_nanos: int | None = None) -> None:
+  self.CS.lat_plan = messaging.recv_one_or_none(self.CS.laP)
+
+  try:
+    self.CS._tinkla_enable_alc = load_bool_param("TinklaEnableALC", True)
+    self.CS._tinkla_alc_delay = load_float_param("TinklaAlcDelay", 0.75)
+    self.CS.alca_controller.autoStartAlcaDelay = float(self.CS._tinkla_alc_delay)
+  except Exception:
+    pass
+
+  try:
+    self.CS.human_control = bool(self.CS.HSO.update_stat(self.CS, bool(c.latActive), c.actuators, self.frame))
+  except Exception:
+    self.CS.human_control = False
+
+  try:
+    self.CS.blinker_controller.update_state(self.CS, self.frame)
+    self.CS.tap_direction = int(getattr(self.CS.blinker_controller, "tap_direction", 0))
+  except Exception:
+    self.CS.tap_direction = 0
+
+  if bool(getattr(self.CS, "_tinkla_enable_alc", True)):
+    try:
+      self.CS.alca_controller.autoStartAlcaDelay = float(getattr(self.CS, "_tinkla_alc_delay", 0.75))
+      self.CS.alca_controller.update(bool(c.latActive), self.CS, self.frame, getattr(self.CS, "lat_plan", None))
+    except Exception:
+      pass
+
+def post_update(self, c: structs.CarControl, ret: structs.CarState) -> None:
+  enable_alc = bool(getattr(self.CS, "_tinkla_enable_alc", True))
+
+  # Tap-only blinkers: lamp on + stalk released + latched tap direction
+  try:
+    stalk_released = int(getattr(self.CS, "turnSignalStalkState", 0)) == 0
+    tap_dir = int(getattr(self.CS, "tap_direction", 0))
+    left_lamp = bool(getattr(self.CS, "leftBlinkerLamp", False))
+    right_lamp = bool(getattr(self.CS, "rightBlinkerLamp", False))
+    ret.leftBlinker = left_lamp and stalk_released and (tap_dir == 1)
+    ret.rightBlinker = right_lamp and stalk_released and (tap_dir == 2)
+  except Exception:
+    pass
+
+  # Auto-start ALC torque spoof after delay (Unity)
+  if enable_alc and bool(getattr(self.CS, "alca_need_engagement", False)):
+    try:
+      ret.steeringPressed = True
+      direction = int(getattr(self.CS, "alca_direction", 0))
+      ret.steeringTorque = 0.1 if direction == 1 else (-0.1 if direction == 2 else ret.steeringTorque)
+    except Exception:
+      pass
 
   @staticmethod
   def _get_params(ret: structs.CarParams, candidate, fingerprint, car_fw, alpha_long, is_release, docs) -> structs.CarParams:
@@ -20,9 +94,9 @@ class CarInterface(CarInterfaceBase):
 
     ret.safetyConfigs = [get_safety_config(structs.CarParams.SafetyModel.tesla)]
 
-    ret.steerLimitTimer = 0.4
+    ret.steerLimitTimer = 1.0
     ret.steerActuatorDelay = 0.1
-    ret.steerAtStandstill = True
+    ret.steerAtStandstill = False
 
     ret.steerControlType = structs.CarParams.SteerControlType.angle
     ret.radarUnavailable = True
@@ -62,9 +136,9 @@ class CarInterface(CarInterfaceBase):
         get_safety_config(structs.CarParams.SafetyModel.teslaLegacy, int(TeslaSafetyFlags.FLAG_HW3 | TeslaSafetyFlags.FLAG_EXTERNAL_PANDA)),
       ]
 
-    ret.steerLimitTimer = 0.4
+    ret.steerLimitTimer = 1.0
     ret.steerActuatorDelay = 0.1
-    ret.steerAtStandstill = True
+    ret.steerAtStandstill = False
 
     ret.steerControlType = structs.CarParams.SteerControlType.angle
     ret.radarUnavailable = candidate in (CAR.TESLA_MODEL_S_HW2, )

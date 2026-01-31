@@ -108,6 +108,14 @@ class CarInterfaceBase(ABC):
     dbc_names = {bus: cp.dbc_name for bus, cp in self.can_parsers.items()}
     self.CC: CarControllerBase = self.CarController(dbc_names, CP)
 
+  def pre_apply(self, c: structs.CarControl, now_nanos: int | None = None) -> None:
+    """Hook called from card.py before apply(). Override in brand interfaces."""
+    return
+
+  def post_update(self, c: structs.CarControl, ret: structs.CarState) -> None:
+    """Hook called from card.py after update() and sm.update(). Override in brand interfaces."""
+    return
+
   def apply(self, c: structs.CarControl, now_nanos: int | None = None) -> tuple[structs.CarControl.Actuators, list[CanData]]:
     if now_nanos is None:
       now_nanos = int(time.monotonic() * 1e9)

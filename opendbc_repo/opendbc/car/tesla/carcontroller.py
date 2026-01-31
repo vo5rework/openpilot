@@ -1,7 +1,7 @@
 import numpy as np
 from opendbc.can import CANPacker
 from opendbc.car import Bus
-from opendbc.car.lateral import apply_steer_angle_limits_vm
+from opendbc.car.lateral import apply_std_steer_angle_limits
 from opendbc.car.interfaces import CarControllerBase
 from opendbc.car.tesla.teslacan import TeslaCAN
 from opendbc.car.tesla.teslacan_legacy import TeslaCANRaven
@@ -94,8 +94,8 @@ class CarController(CarControllerBase):
     # Tesla EPS enforces disabling steering on heavy lateral override force.
     # When enabling in a tight curve, we wait until user reduces steering force to start steering.
     # Canceling is done on rising edge and is handled generically with CC.cruiseControl.cancel
-    autopilot_disabled = bool(getattr(getattr(CS, "_tinkla", None), "autopilot_disabled", False))
-    lat_active = CC.latActive and CS.hands_on_level < self.hands_on_level_limit
+    autopilot_disabled = bool(getattr(CS, 'autopilot_disabled', False))
+    lat_active = CC.latActive and (not bool(getattr(CS, 'human_control', False))) and (not CS.out.cruiseState.standstill)
     if self.frame % 2 == 0:
       # Angular rate limit based on speed
       self.apply_angle_last = apply_steer_angle_limits_vm(actuators.steeringAngleDeg, self.apply_angle_last, CS.out.vEgoRaw, CS.out.steeringAngleDeg,
@@ -152,7 +152,7 @@ class CarController(CarControllerBase):
 
           if btn != CruiseButtons.IDLE and getattr(CS, "msg_stw_actn_req", None) is not None:
             # On legacy platforms STW_ACTN_RQ is on the chassis bus
-            bus = CANBUS.chassis if CANBUS.chassis != -1 else CANBUS.party
+            bus = CANBUS.party
             can_sends.insert(0, self._action_can.create_action_request(bus, CS.msg_stw_actn_req, btn))
 
     else:

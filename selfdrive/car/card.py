@@ -175,6 +175,12 @@ class Car:
 
     self.sm.update(0)
 
+    # Unity parity hooks (Tesla uses this for tap-to-ALC + blinker gating)
+    try:
+      self.CI.post_update(self.sm['carControl'], CS)
+    except Exception:
+      pass
+
     can_rcv_valid = len(can_strs) > 0
 
     # Check for CAN timeout
