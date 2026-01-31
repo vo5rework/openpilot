@@ -9,6 +9,7 @@
 
 #include "common/watchdog.h"
 #include "common/util.h"
+#include "common/params.h"
 #include "selfdrive/ui/qt/network/networking.h"
 #include "selfdrive/ui/qt/offroad/settings.h"
 #include "selfdrive/ui/qt/qt_window.h"
@@ -16,6 +17,29 @@
 #include "selfdrive/ui/qt/widgets/scrollview.h"
 #include "selfdrive/ui/qt/offroad/developer_panel.h"
 #include "selfdrive/ui/qt/offroad/firehose.h"
+
+static float getFloatParamOrDefault(Params &params, const std::string &key, float default_val);
+static void putFloatParam(Params &params, const std::string &key, float val, int precision);
+
+
+
+
+static float getFloatParamOrDefault(Params &params, const std::string &key, float default_val) {
+  const auto s = params.get(key);
+  if (!s.empty()) {
+    try {
+      return std::stof(s);
+    } catch (...) {
+      return default_val;
+    }
+  }
+  return default_val;
+}
+
+static void putFloatParam(Params &params, const std::string &key, float val, int precision) {
+  const std::string fmt = util::string_format("%%.%df", precision);
+  params.put(key, util::string_format(fmt, val));
+}
 
 TogglesPanel::TogglesPanel(SettingsWindow *parent) : ListWidget(parent) {
   // param, title, desc, icon, restart needed
@@ -650,21 +674,3 @@ SettingsWindow::SettingsWindow(QWidget *parent) : QFrame(parent) {
     }
   )");
 }
-static float getFloatParamOrDefault(Params &params, const std::string &key, float default_val) {
-  const auto s = params.get(key);
-  if (!s.empty()) {
-    try {
-      return std::stof(s);
-    } catch (...) {
-      return default_val;
-    }
-  }
-  return default_val;
-}
-
-static void putFloatParam(Params &params, const std::string &key, float val, int precision) {
-  const std::string fmt = util::string_format("%%.%df", precision);
-  params.put(key, util::string_format(fmt, val));
-}
-
-
