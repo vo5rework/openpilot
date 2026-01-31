@@ -90,7 +90,7 @@ class TeslaLayout(Widget):
     return "Ignore stock AEB events reported by the vehicle."
 
   def _autopilot_disabled_desc(self) -> str:
-    return "Minimal-safe: treat cruise as available even if stock Autopilot is disabled."
+    return "Lateral-only mode: disables openpilot longitudinal and allows steering when Tesla Autopilot is disabled (useful below ~18 mph)."
 
   def _mute_start_stop_desc(self) -> str:
     return "Disable engage/disengage sounds."

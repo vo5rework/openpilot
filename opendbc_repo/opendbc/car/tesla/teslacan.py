@@ -1,37 +1,19 @@
-import copy
-
 from opendbc.car.common.conversions import Conversions as CV
 from opendbc.car.tesla.values import CANBUS, CarControllerParams
+def _crc8_11d(data: bytes) -> int:
+  """CRC8 poly 0x11D, init 0x00, xorout 0xFF, not reflected (Unity parity)."""
+  crc = 0x00
+  for b in data:
+    crc ^= b
+    for _ in range(8):
+      crc = ((crc << 1) ^ 0x11D) if (crc & 0x80) else (crc << 1)
+      crc &= 0xFF
+  return crc ^ 0xFF
 
 
 class TeslaCAN:
   def __init__(self, packer):
     self.packer = packer
-  @staticmethod
-  def _crc_stw_actn_req(data: bytes) -> int:
-    """CRC-8 as implemented by Tesla SCCM for STW_ACTN_RQ."""
-    crc = 0
-    for byte in data:
-      crc ^= byte
-      for _ in range(8):
-        if crc & 0x80:
-          crc = ((crc << 1) ^ 0x11D) & 0xFF
-        else:
-          crc = (crc << 1) & 0xFF
-    return crc ^ 0xFF
-
-  def create_action_request(self, base_msg: dict, button: int, counter: int) -> tuple[int, int, bytes]:
-    """Create a STW_ACTN_RQ cruise stalk virtual button request."""
-    values = copy.copy(base_msg) if base_msg is not None else {}
-    values["SpdCtrlLvr_Stat"] = int(button)
-    values["MC_STW_ACTN_RQ"] = int(counter) & 0xF
-
-    # Pack once to compute CRC over first 7 bytes, then repack with CRC_STW_ACTN_RQ.
-    msg = self.packer.make_can_msg("STW_ACTN_RQ", CANBUS.party, values)
-    crc = self._crc_stw_actn_req(msg[2][:7])
-    values["CRC_STW_ACTN_RQ"] = crc
-    return self.packer.make_can_msg("STW_ACTN_RQ", CANBUS.party, values)
-
 
   def create_steering_control(self, angle, enabled):
     values = {
@@ -42,13 +24,16 @@ class TeslaCAN:
 
     return self.packer.make_can_msg("DAS_steeringControl", CANBUS.party, values)
 
-  def create_longitudinal_command(self, acc_state, accel, counter, v_ego, active):
+  def create_longitudinal_command(self, acc_state, accel, counter, v_ego, active, set_speed_kph: float | None = None):
     from opendbc.car.interfaces import V_CRUISE_MAX
 
-    set_speed = max(v_ego * CV.MS_TO_KPH, 0)
-    if active:
-      # TODO: this causes jerking after gas override when above set speed
-      set_speed = 0 if accel < 0 else V_CRUISE_MAX
+    if set_speed_kph is not None:
+      set_speed = float(max(0.0, min(float(set_speed_kph), V_CRUISE_MAX)))
+    else:
+      set_speed = max(v_ego * CV.MS_TO_KPH, 0.0)
+      if active:
+        # TODO: this causes jerking after gas override when above set speed
+        set_speed = 0.0 if accel < 0 else V_CRUISE_MAX
 
     values = {
       "DAS_setSpeed": set_speed,
@@ -61,13 +46,29 @@ class TeslaCAN:
       "DAS_controlCounter": counter,
     }
     return self.packer.make_can_msg("DAS_control", CANBUS.party, values)
-
   def create_steering_allowed(self, counter):
     values = {
       "APS_eacAllow": 1,
     }
 
     return self.packer.make_can_msg("APS_eacMonitor", CANBUS.party, values)
+
+  def create_action_request(self, bus: int, msg_stw_actn_req: dict, cruise_button: int) -> tuple[int, int, bytes]:
+    """Create STW_ACTN_RQ to emulate cruise stalk up/down/cancel (Unity parity)."""
+    if msg_stw_actn_req is None:
+      msg_stw_actn_req = {}
+    values = dict(msg_stw_actn_req)
+    values["SpdCtrlLvr_Stat"] = int(cruise_button)
+    counter = (int(values.get("MC_STW_ACTN_RQ", 0)) + 1) % 16
+    values["MC_STW_ACTN_RQ"] = counter
+    values["CRC_STW_ACTN_RQ"] = 0
+
+    msg = self.packer.make_can_msg("STW_ACTN_RQ", bus, values)
+    # msg[2] is bytes payload
+    dat = msg[2]
+    crc = _crc8_11d(dat[:7])
+    values["CRC_STW_ACTN_RQ"] = crc
+    return self.packer.make_can_msg("STW_ACTN_RQ", bus, values)
 
 
 def tesla_checksum(address: int, sig, d: bytearray) -> int:

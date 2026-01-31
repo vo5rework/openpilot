@@ -623,7 +623,7 @@ TeslaPanel::TeslaPanel(SettingsWindow *parent) : ListWidget(parent) {
   addItem(new ParamControl("TinklaIgnoreStockAeb", tr("Ignore Stock AEB"),
                            tr("Ignore Tesla stock Automatic Emergency Braking events."), "../assets/icons/info.png"));
   addItem(new ParamControl("TinklaAutopilotDisabled", tr("Autopilot Disabled"),
-                           tr("Emulates cruise for cars where Autopilot is disabled. Engage with stalk pull."), "../assets/icons/info.png"));
+                           tr("Lateral-only mode: allows steering when Tesla Autopilot is disabled (useful below ~18 mph)."), "../assets/icons/info.png"));
   addItem(new ParamControl("TinklaDisableStartStopSounds", tr("Mute Engage/Disengage Sounds"),
                            tr("Disables the start/stop sounds."), "../assets/icons/info.png"));
   addItem(new ParamControl("TinklaDisablePromptSounds", tr("Mute Prompt Sounds"),
