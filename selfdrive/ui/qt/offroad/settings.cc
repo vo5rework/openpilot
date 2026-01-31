@@ -615,6 +615,21 @@ TeslaPanel::TeslaPanel(SettingsWindow *parent) : ListWidget(parent) {
   });
   addItem(speed_limit_offset_btn);
 
+// Auto lane change (Unity parity): tap indicator -> lane change starts after delay
+addItem(new ParamControl("TinklaEnableALC", tr("Auto Lane Change"),
+                         tr("Starts a lane change automatically after tapping the turn signal, if blind spot is clear."), "../assets/icons/info.png"));
+
+alc_delay_btn = new ButtonControl(tr("Auto Lane Change Delay"), tr("CHANGE"),
+                                  tr("Delay before auto-starting a lane change after the indicator tap (seconds)."));
+QObject::connect(alc_delay_btn, &ButtonControl::clicked, [this]() {
+  const float cur = std::clamp(getFloatParamOrDefault(params, "TinklaAlcDelay", 2.0f), 0.0f, 10.0f);
+  float v = cur + 0.5f;
+  if (v > 10.0f) v = 0.0f;
+  putFloatParam(params, "TinklaAlcDelay", v, 1);
+  updateLabels();
+});
+addItem(alc_delay_btn);
+
   // Existing toggles
   addItem(new ParamControl("TinklaUseTeslaRadarUpsideDown", tr("Radar Upside Down"),
                            tr("Use if your Tesla radar is mounted upside down."), "../assets/icons/info.png"));
@@ -623,7 +638,7 @@ TeslaPanel::TeslaPanel(SettingsWindow *parent) : ListWidget(parent) {
   addItem(new ParamControl("TinklaIgnoreStockAeb", tr("Ignore Stock AEB"),
                            tr("Ignore Tesla stock Automatic Emergency Braking events."), "../assets/icons/info.png"));
   addItem(new ParamControl("TinklaAutopilotDisabled", tr("Autopilot Disabled"),
-                           tr("Lateral-only mode: allows steering when Tesla Autopilot is disabled (useful below ~18 mph)."), "../assets/icons/info.png"));
+                           tr("Emulates cruise for cars where Autopilot is disabled. Engage with stalk pull."), "../assets/icons/info.png"));
   addItem(new ParamControl("TinklaDisableStartStopSounds", tr("Mute Engage/Disengage Sounds"),
                            tr("Disables the start/stop sounds."), "../assets/icons/info.png"));
   addItem(new ParamControl("TinklaDisablePromptSounds", tr("Mute Prompt Sounds"),
@@ -645,6 +660,9 @@ void TeslaPanel::updateLabels() {
   const float slo = getFloatParamOrDefault(params, "TinklaSpeedLimitOffset", 0.0f);
   const bool is_metric = params.getBool("IsMetric");
   speed_limit_offset_btn->setValue(QString::number(slo, 'f', 1) + (is_metric ? " kph" : " mph"));
+
+  const float alc_delay = std::clamp(getFloatParamOrDefault(params, \"TinklaAlcDelay\", 2.0f), 0.0f, 10.0f);
+  alc_delay_btn->setValue(QString::number(alc_delay, 'f', 1) + \" s\");
 }
 
 void TeslaPanel::showEvent(QShowEvent *event) {

@@ -119,6 +119,7 @@ private:
   ButtonControl *hands_on_level_btn = nullptr;
   ButtonControl *radar_offset_btn = nullptr;
   ButtonControl *speed_limit_offset_btn = nullptr;
+  ButtonControl *alc_delay_btn = nullptr;
 };
 
 // Forward declaration
