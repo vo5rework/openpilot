@@ -1,25 +1,17 @@
 import copy
-from dataclasses import dataclass
-
-from openpilot.selfdrive.car.modules.CFG_module import load_bool_param, load_float_param
 from opendbc.can import CANDefine, CANParser
 from opendbc.car import Bus, structs
 from opendbc.car.common.conversions import Conversions as CV
 from opendbc.car.interfaces import CarStateBase
-from opendbc.car.tesla.values import DBC, CANBUS, GEAR_MAP, STEER_THRESHOLD, CAR, TeslaLegacyParams, LEGACY_CARS
+from opendbc.car.tesla.values import DBC, CANBUS, GEAR_MAP, STEER_THRESHOLD, CAR, TeslaLegacyParams, LEGACY_CARS, CruiseButtons
+
+try:
+  from openpilot.common.params import Params
+except Exception:  # pragma: no cover
+  from common.params import Params
+
 
 ButtonType = structs.CarState.ButtonEvent.Type
-
-
-@dataclass
-class _TinklaConfig:
-  autopilot_disabled: bool = False
-  hands_on_level: float = 2.0
-  adjust_acc_with_speed_limit: bool = False
-  speed_limit_offset: float = 0.0
-  speed_limit_use_relative: bool = False
-  enable_alc: bool = True
-  alc_delay: float = 0.75
 
 
 class CarState(CarStateBase):
@@ -54,48 +46,11 @@ class CarState(CarStateBase):
     self.hands_on_level = 0
     self.das_control = None
 
-    # Unity parity fields
+    # Unity parity (legacy): used for virtual stalk speed updates + AP-disabled low-speed lateral
     self.msg_stw_actn_req: dict | None = None
-    self.cruise_buttons = 0
-    self.turnSignalStalkState = 0
-    self.tap_direction = 0
-    self.leftBlinkerLamp = False
-    self.rightBlinkerLamp = False
-    self.human_control = False
-
-    self.speed_units = "MPH"
-    self.speed_limit_ms = 0.0
-    self.speed_limit_ms_das = 0.0
-
-    self._tinkla = _TinklaConfig()
-    self._reload_tinkla_params()
-    self.autopilot_disabled = bool(self._tinkla.autopilot_disabled)
     self.cruiseEnabled = False
-
-    self._prev_cruise_buttons = 0
-    self._param_frame = 0
-
-  def _reload_tinkla_params(self) -> None:
-    self._tinkla.autopilot_disabled = load_bool_param("TinklaAutopilotDisabled", False)
-    self._tinkla.hands_on_level = load_float_param("TinklaHandsOnLevel", 2.0)
-    self._tinkla.adjust_acc_with_speed_limit = load_bool_param("TinklaAdjustAccWithSpeedLimit", False)
-    self._tinkla.speed_limit_offset = load_float_param("TinklaSpeedLimitOffset", 0.0)
-    self._tinkla.speed_limit_use_relative = load_bool_param("TinklaSpeedLimitUseRelative", False)
-    self._tinkla.enable_alc = load_bool_param("TinklaEnableALC", True)
-    self._tinkla.alc_delay = load_float_param("TinklaAlcDelay", 0.75)
-
-  def _calc_speed_limit_target_ms(self, speed_units: str) -> float:
-    limit_ms = float(self.speed_limit_ms_das or self.speed_limit_ms or 0.0)
-    if limit_ms <= 0.0:
-      return 0.0
-
-    off = float(self._tinkla.speed_limit_offset)
-    if self._tinkla.speed_limit_use_relative:
-      return max(0.0, limit_ms * (1.0 + off / 100.0))
-
-    if speed_units == "KPH":
-      return max(0.0, limit_ms + off * CV.KPH_TO_MS)
-    return max(0.0, limit_ms + off * CV.MPH_TO_MS)
+    self._tinkla_autopilot_disabled = Params().get_bool("TinklaAutopilotDisabled")
+    self._cruise_buttons_prev = CruiseButtons.IDLE
 
   def update_autopark_state(self, autopark_state: str, cruise_enabled: bool):
     autopark_now = autopark_state in ("ACTIVE", "COMPLETE", "SELFPARK_STARTED")
@@ -145,46 +100,49 @@ class CarState(CarStateBase):
                                                          eac_error_code == "EAC_ERROR_HIGH_ANGLE_RATE_SAFETY")
 
     # Cruise state
-    cruise_state = self.can_define.dv["DI_state"]["DI_cruiseState"].get(int(cp_party.vl["DI_state"]["DI_cruiseState"]), None)
-    speed_units = self.can_define.dv["DI_state"]["DI_speedUnits"].get(int(cp_party.vl["DI_state"]["DI_speedUnits"]), None)
+    cruise_state = self.can_defines["DI_state"]["DI_cruiseState"].get(int(cp_chassis.vl["DI_state"]["DI_cruiseState"]), None)
+    speed_units = self.can_defines["DI_state"]["DI_speedUnits"].get(int(cp_chassis.vl["DI_state"]["DI_speedUnits"]), None)
 
-    autopark_state = self.can_define.dv["DI_state"]["DI_autoparkState"].get(int(cp_party.vl["DI_state"]["DI_autoparkState"]), None)
-    cruise_enabled = cruise_state in ("ENABLED", "STANDSTILL", "OVERRIDE", "PRE_FAULT", "PRE_CANCEL")
-    self.update_autopark_state(autopark_state, cruise_enabled)
-
-    # Match panda safety cruise engaged logic
-    ret.cruiseState.enabled = cruise_enabled and not self.autopark
-    if speed_units == "KPH":
-      ret.cruiseState.speed = max(cp_party.vl["DI_state"]["DI_digitalSpeed"] * CV.KPH_TO_MS, 1e-3)
-    elif speed_units == "MPH":
-      ret.cruiseState.speed = max(cp_party.vl["DI_state"]["DI_digitalSpeed"] * CV.MPH_TO_MS, 1e-3)
-    ret.cruiseState.available = cruise_state == "STANDBY" or ret.cruiseState.enabled
-    ret.cruiseState.standstill = False  # This needs to be false, since we can resume from stop without sending anything special
-    ret.standstill = cruise_state == "STANDSTILL"
-    ret.accFaulted = cruise_state == "FAULT"
-
-    # Unity parity: store last STW_ACTN_RQ for virtual stalk + tap-to-ALC
-    self.speed_units = speed_units if speed_units in ("KPH", "MPH") else "MPH"
-
-    stw = None
-    for _cp in (can_parsers.get(Bus.party), can_parsers.get(Bus.chassis), can_parsers.get(Bus.pt)):
-      if _cp is not None and "STW_ACTN_RQ" in _cp.vl:
-        stw = _cp.vl["STW_ACTN_RQ"]
-        break
-    if stw is not None:
-      self.msg_stw_actn_req = copy.copy(stw)
-      self.cruise_buttons = int(stw.get("SpdCtrlLvr_Stat", 0))
-      self.turnSignalStalkState = int(stw.get("TurnIndLvr_Stat", 0))
+    # Store STW_ACTN_RQ for virtual stalk + follow-distance
+    self.msg_stw_actn_req = copy.copy(cp_chassis.vl["STW_ACTN_RQ"])
+    cruise_buttons = int(cp_chassis.vl["STW_ACTN_RQ"]["SpdCtrlLvr_Stat"])
+    cruise_distance = int(cp_chassis.vl["STW_ACTN_RQ"]["DTR_Dist_Rq"])
+    if cruise_distance != 255:
+      ret.followDistanceS = int(cruise_distance / 33)
     else:
-      self.cruise_buttons = 0
-      self.turnSignalStalkState = 0
+      ret.followDistanceS = 255
 
-    if self.autopilot_disabled:
-      if self.cruise_buttons == 2:  # MAIN
+    # Tesla reported cruise enabled (matches stock)
+    cruise_enabled = cruise_state in ("ENABLED", "STANDSTILL", "OVERRIDE", "PRE_FAULT", "PRE_CANCEL")
+
+    # Unity parity: when Autopilot Disabled is enabled, we drive openpilot engagement from a latch toggled by MAIN/CANCEL stalk.
+    if self._tinkla_autopilot_disabled:
+      if (cruise_buttons == CruiseButtons.MAIN) and (self._cruise_buttons_prev != CruiseButtons.MAIN):
         self.cruiseEnabled = True
-      if self.cruise_buttons == 1:  # CANCEL
+      elif (cruise_buttons == CruiseButtons.CANCEL) and (self._cruise_buttons_prev != CruiseButtons.CANCEL):
         self.cruiseEnabled = False
 
+      # Hard safety gates (Unity parity)
+      if ret.doorOpen or ret.seatbeltUnlatched or (ret.gearShifter != structs.CarState.GearShifter.drive):
+        self.cruiseEnabled = False
+
+      ret.cruiseState.available = True
+      ret.cruiseState.enabled = bool(self.cruiseEnabled)
+    else:
+      ret.cruiseState.enabled = cruise_enabled
+      ret.cruiseState.available = (cruise_state == "STANDBY") or ret.cruiseState.enabled
+
+    # Cruise set speed (use DI_cruiseSet; DI_digitalSpeed is vehicle speed)
+    cruise_set = float(cp_chassis.vl["DI_state"]["DI_cruiseSet"])
+    if speed_units == "KPH":
+      ret.cruiseState.speed = max(cruise_set * CV.KPH_TO_MS, 1e-3)
+    elif speed_units == "MPH":
+      ret.cruiseState.speed = max(cruise_set * CV.MPH_TO_MS, 1e-3)
+
+    ret.cruiseState.standstill = False  # can resume from stop without special handling
+    ret.standstill = cruise_state == "STANDSTILL"
+    ret.accFaulted = cruise_state == "FAULT"
+    self._cruise_buttons_prev = cruise_buttons
 
     # Gear
     ret.gearShifter = GEAR_MAP[self.can_define.dv["DI_systemStatus"]["DI_gear"].get(int(cp_party.vl["DI_systemStatus"]["DI_gear"]), "DI_GEAR_INVALID")]
@@ -195,10 +153,8 @@ class CarState(CarStateBase):
     # Blinkers
     # Blinkers: modern Teslas report 1=blinking (stalk released), 2=stalk held
     # Unity ALC uses tap-to-change; expose only "tap/comfort" blink to DesireHelper
-    self.leftBlinkerLamp = cp_party.vl["UI_warning"]["leftBlinkerBlinking"] != 0
-    self.rightBlinkerLamp = cp_party.vl["UI_warning"]["rightBlinkerBlinking"] != 0
-    ret.leftBlinker = self.leftBlinkerLamp
-    ret.rightBlinker = self.rightBlinkerLamp
+    ret.leftBlinker = cp_party.vl["UI_warning"]["leftBlinkerBlinking"] == 1
+    ret.rightBlinker = cp_party.vl["UI_warning"]["rightBlinkerBlinking"] == 1
 
     # Seatbelt
     ret.seatbeltUnlatched = cp_party.vl["UI_warning"]["buckleStatus"] != 1
@@ -222,63 +178,6 @@ class CarState(CarStateBase):
 
     # Messages needed by carcontroller
     self.das_control = copy.copy(cp_ap_party.vl["DAS_control"])
-
-    # Unity parity tail
-    if (self._param_frame % 100) == 0:
-      try:
-        self._reload_tinkla_params()
-        self.autopilot_disabled = bool(self._tinkla.autopilot_disabled)
-      except Exception:
-        pass
-    self._param_frame += 1
-
-    if self.autopilot_disabled:
-      ret.cruiseState.available = True
-      ret.cruiseState.enabled = bool(self.cruiseEnabled) and (not ret.doorOpen) and (ret.gearShifter == structs.CarState.GearShifter.drive) and (not ret.seatbeltUnlatched)
-      self.cruiseEnabled = bool(ret.cruiseState.enabled)
-
-    # Speed limit best-effort (needed for speed-limit matching)
-    try:
-      msu = can_parsers[Bus.party].vl.get("UI_gpsVehicleSpeed", {}).get("UI_mapSpeedLimitUnits", 0)
-      map_uom_to_ms = CV.KPH_TO_MS if int(msu) == 1 else CV.MPH_TO_MS
-      map_ms_to_uom = CV.MS_TO_KPH if int(msu) == 1 else CV.MS_TO_MPH
-      rd = can_parsers[Bus.party].vl.get("UI_driverAssistRoadSign", {})
-      if int(rd.get("UI_roadSign", 0)) == 3:
-        base = float(rd.get("UI_baseMapSpeedLimitMPS", 0.0))
-        base = int(base * map_ms_to_uom + 0.99) / map_ms_to_uom
-        self.speed_limit_ms = base
-      gps = can_parsers[Bus.party].vl.get("UI_gpsVehicleSpeed", {})
-      if self.speed_limit_ms <= 0.0:
-        self.speed_limit_ms = float(gps.get("UI_mppSpeedLimit", 0.0)) * map_uom_to_ms
-    except Exception:
-      pass
-
-    try:
-      ds = can_parsers.get(Bus.ap_party).vl.get("DAS_status", {}) if can_parsers.get(Bus.ap_party) is not None else {}
-      if "DAS_fusedSpeedLimit" in ds:
-        self.speed_limit_ms_das = float(ds.get("DAS_fusedSpeedLimit", 0.0)) / (CV.MS_TO_KPH if self.speed_units == "KPH" else CV.MS_TO_MPH)
-    except Exception:
-      pass
-
-    ret.buttonEvents = []
-    try:
-      prev = int(self._prev_cruise_buttons)
-      cur = int(getattr(self, "cruise_buttons", 0))
-      def _be(t, pressed):
-        e = structs.CarState.ButtonEvent()
-        e.type = t
-        e.pressed = pressed
-        return e
-      accel_vals = (4, 16)
-      decel_vals = (8, 32)
-      if (prev in accel_vals) and (cur not in accel_vals): ret.buttonEvents.append(_be(ButtonType.accelCruise, False))
-      if (prev in decel_vals) and (cur not in decel_vals): ret.buttonEvents.append(_be(ButtonType.decelCruise, False))
-      if (prev == 1) and (cur != 1): ret.buttonEvents.append(_be(ButtonType.cancel, False))
-      if (prev == 2) and (cur != 2): ret.buttonEvents.append(_be(ButtonType.resumeCruise, False))
-      self._prev_cruise_buttons = cur
-    except Exception:
-      pass
-
 
     return ret
 
@@ -340,29 +239,6 @@ class CarState(CarStateBase):
     ret.standstill = cruise_state == "STANDSTILL"
     ret.accFaulted = cruise_state == "FAULT"
 
-    # Unity parity: store last STW_ACTN_RQ for virtual stalk + tap-to-ALC
-    self.speed_units = speed_units if speed_units in ("KPH", "MPH") else "MPH"
-
-    stw = None
-    for _cp in (can_parsers.get(Bus.party), can_parsers.get(Bus.chassis), can_parsers.get(Bus.pt)):
-      if _cp is not None and "STW_ACTN_RQ" in _cp.vl:
-        stw = _cp.vl["STW_ACTN_RQ"]
-        break
-    if stw is not None:
-      self.msg_stw_actn_req = copy.copy(stw)
-      self.cruise_buttons = int(stw.get("SpdCtrlLvr_Stat", 0))
-      self.turnSignalStalkState = int(stw.get("TurnIndLvr_Stat", 0))
-    else:
-      self.cruise_buttons = 0
-      self.turnSignalStalkState = 0
-
-    if self.autopilot_disabled:
-      if self.cruise_buttons == 2:  # MAIN
-        self.cruiseEnabled = True
-      if self.cruise_buttons == 1:  # CANCEL
-        self.cruiseEnabled = False
-
-
     # Gear
     ret.gearShifter = GEAR_MAP[self.can_defines["DI_torque2"]["DI_gear"].get(int(cp_chassis.vl["DI_torque2"]["DI_gear"]), "DI_GEAR_INVALID")]
 
@@ -371,10 +247,8 @@ class CarState(CarStateBase):
     ret.doorOpen = any((self.can_defines["GTW_carState"][door].get(int(cp_chassis.vl["GTW_carState"][door]), "OPEN") == "OPEN") for door in DOORS)
 
     # Blinkers
-    self.leftBlinkerLamp = cp_chassis.vl["GTW_carState"]["BC_indicatorLStatus"] == 1
-    self.rightBlinkerLamp = cp_chassis.vl["GTW_carState"]["BC_indicatorRStatus"] == 1
-    ret.leftBlinker = self.leftBlinkerLamp
-    ret.rightBlinker = self.rightBlinkerLamp
+    ret.leftBlinker = cp_chassis.vl["GTW_carState"]["BC_indicatorLStatus"] == 1
+    ret.rightBlinker = cp_chassis.vl["GTW_carState"]["BC_indicatorRStatus"] == 1
 
     # Seatbelt
     if self.CP.flags & TeslaLegacyParams.NO_SDM1:

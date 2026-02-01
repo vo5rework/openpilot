@@ -6,6 +6,7 @@ static bool tesla_external_panda = false;
 static bool tesla_hw1 = false;
 static bool tesla_hw2 = false;
 static bool tesla_hw3 = false;
+static bool tesla_legacy_stalk_enable = false;  // Unity parity: stalk enables controls
 
 static int chassis_bus = 0U;
 static int das_control_msg = 0x2bfU;
@@ -64,6 +65,17 @@ static void tesla_legacy_rx_hook(const CANPacket_t *msg) {
       vehicle_moving = cruise_state != 3; // STANDSTILL
       pcm_cruise_check(cruise_engaged);
    }
+
+  // Unity parity: stalk-based enable/disengage when Tesla cruise can't engage (e.g. <~18mph)
+  if (tesla_legacy_stalk_enable && (msg->addr == 0x45U) &&
+      (((tesla_external_panda) && (msg->bus == 0U)) || ((!tesla_external_panda) && (msg->bus == chassis_bus)))) {
+    const int spdctrl = msg->data[0] & 0x3FU;  // SpdCtrlLvr_Stat
+    if (spdctrl == 2) {        // MAIN (pull)
+      pcm_cruise_check(true);
+    } else if (spdctrl == 1) { // CANCEL (push)
+      pcm_cruise_check(false);
+    }
+  }
 
   if (msg->bus == 2U) {
     // DAS_control
@@ -194,12 +206,14 @@ static bool tesla_legacy_fwd_hook(int bus_num, int addr) {
 }
 
 static safety_config tesla_legacy_init(uint16_t param) {
+  const int TESLA_FLAG_LONG_CONTROL = 1;
   const int TESLA_FLAG_EXTERNAL_PANDA = 2;
   const int TESLA_FLAG_HW1 = 4;
   const int TESLA_FLAG_HW2 = 8;
   const int TESLA_FLAG_HW3 = 16;
 
   // Extract flags
+  tesla_legacy_stalk_enable = GET_FLAG(param, TESLA_FLAG_LONG_CONTROL);
   tesla_external_panda = GET_FLAG(param, TESLA_FLAG_EXTERNAL_PANDA);
   tesla_hw1 = GET_FLAG(param, TESLA_FLAG_HW1);
   tesla_hw2 = GET_FLAG(param, TESLA_FLAG_HW2);
