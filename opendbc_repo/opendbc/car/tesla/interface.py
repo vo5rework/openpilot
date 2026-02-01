@@ -28,11 +28,9 @@ class CarInterface(CarInterfaceBase):
 def __init__(self, CP, CarController, CarState):
   super().__init__(CP, CarController, CarState)
 
-  # Unity parity sockets/modules
   self.CS.laP = messaging.sub_sock('lateralPlan')
   self.CS.human_control = False
 
-  # Params (Unity-style)
   self.CS._tinkla_enable_alc = load_bool_param("TinklaEnableALC", True)
   self.CS._tinkla_alc_delay = load_float_param("TinklaAlcDelay", 0.75)
 
@@ -41,7 +39,6 @@ def __init__(self, CP, CarController, CarState):
   self.CS.HSO = HSOController()
 
 def pre_apply(self, c: structs.CarControl, now_nanos: int | None = None) -> None:
-  # Update per-frame Unity parity state machines before apply()
   self.CS.lat_plan = messaging.recv_one_or_none(self.CS.laP)
 
   try:
@@ -70,7 +67,6 @@ def pre_apply(self, c: structs.CarControl, now_nanos: int | None = None) -> None
       pass
 
 def post_update(self, c: structs.CarControl, ret: structs.CarState) -> None:
-  # Tap-only blinkers and ALC autostart spoof (Unity parity)
   enable_alc = bool(getattr(self.CS, "_tinkla_enable_alc", True))
 
   try:

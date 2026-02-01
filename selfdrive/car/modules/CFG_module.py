@@ -1,11 +1,8 @@
-"""Config helpers backed by Params.
-
-This is a compatibility shim for Unity-derived modules.
-"""
+"""Config helpers backed by Params (Unity compatibility shim)."""
 from __future__ import annotations
 
 try:
-  from openpilot.common.params import Params  # some layouts
+  from openpilot.common.params import Params
 except ImportError:  # pragma: no cover
   from common.params import Params
 

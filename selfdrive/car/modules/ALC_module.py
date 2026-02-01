@@ -1,8 +1,4 @@
-"""Auto lane change helpers (Unity parity) with schema-compatible enums.
-
-xnor-c3 cereal exposes LaneChangeState/Direction as top-level enums (log.LaneChangeState),
-while Unity referenced log.LateralPlan.LaneChangeState.
-"""
+"""Auto lane change helpers (Unity parity) with schema-compatible enums."""
 
 from cereal import log
 
@@ -10,8 +6,8 @@ try:
   LaneChangeState = log.LaneChangeState
   LaneChangeDirection = log.LaneChangeDirection
 except AttributeError:  # pragma: no cover
-  LaneChangeState = log.LateralPlan.LaneChangeState
-  LaneChangeDirection = log.LateralPlan.LaneChangeDirection
+  LaneChangeState = LaneChangeState
+  LaneChangeDirection = LaneChangeDirection
 
 class ALCController:
 

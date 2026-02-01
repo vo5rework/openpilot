@@ -109,11 +109,11 @@ class CarInterfaceBase(ABC):
     self.CC: CarControllerBase = self.CarController(dbc_names, CP)
 
   def pre_apply(self, c: structs.CarControl, now_nanos: int | None = None) -> None:
-    """Hook called from card.py before apply(). Override in brand interfaces."""
+    """Hook called from card.py before apply()."""
     return
 
   def post_update(self, c: structs.CarControl, ret: structs.CarState) -> None:
-    """Hook called from card.py after update() and sm.update(). Override in brand interfaces."""
+    """Hook called from card.py after update()."""
     return
 
   def apply(self, c: structs.CarControl, now_nanos: int | None = None) -> tuple[structs.CarControl.Actuators, list[CanData]]:
