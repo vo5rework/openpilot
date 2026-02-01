@@ -32,16 +32,12 @@ class CarState(CarStateBase):
         CANBUS.autopilot_powertrain = CANBUS.autopilot_party
 
       self.can_defines = {
-        "DI_state": CANDefine(DBC[CP.carFingerprint][Bus.chassis]).dv,
-        "DI_torque2": CANDefine(DBC[CP.carFingerprint][Bus.chassis]).dv,
-        "GTW_carState": CANDefine(DBC[CP.carFingerprint][Bus.chassis]).dv,
-        "EPAS_sysStatus": CANDefine(DBC[CP.carFingerprint][Bus.chassis]).dv,
+        "DI_state": CANDefine(DBC[CP.carFingerprint][Bus.chassis]),
+        "DI_torque2": CANDefine(DBC[CP.carFingerprint][Bus.chassis]),
+        "GTW_carState": CANDefine(DBC[CP.carFingerprint][Bus.chassis]),
+        "EPAS_sysStatus": CANDefine(DBC[CP.carFingerprint][Bus.chassis]),
       }
 
-      from collections import defaultdict
-      self.can_defines = defaultdict(lambda: defaultdict(dict), {k: defaultdict(dict, v) for k, v in self.can_defines.items()})
-      from collections import defaultdict
-      self.can_defines = defaultdict(lambda: defaultdict(dict), {k: defaultdict(dict, v) for k, v in self.can_defines.items()})
     # Unity parity state (used by CarController virtual stalk + lat-only enable)
     self.msg_stw_actn_req = None
     self.prev_cruise_buttons = CruiseButtons.IDLE
@@ -60,14 +56,6 @@ class CarState(CarStateBase):
     self.das_control = None
     self.hands_on_level = 0
     self.autopark = False
-
-  def _dv_lookup(self, msg_name: str, sig_name: str, raw_val: int):
-    try:
-      m = self.can_defines.get(msg_name, {})
-      s = m.get(sig_name, {})
-      return s.get(int(raw_val), None)
-    except Exception:
-      return None
 
   def _update_stalk_and_cache(self, cp_party: CANParser, ret: structs.CarState) -> None:
     stw = cp_party.vl.get("STW_ACTN_RQ")
@@ -171,18 +159,17 @@ class CarState(CarStateBase):
     ret.steeringTorque = -epas_status["EPAS_torsionBarTorque"]
     ret.steeringPressed = self.update_steering_pressed(abs(ret.steeringTorque) > STEER_THRESHOLD, 5)
 
-    eac_status = self._dv_lookup("EPAS_sysStatus", "EPAS_eacStatus", int(epas_status.get("EPAS_eacStatus", 0)))
-    ret.steerFaultPermanent = (eac_status == "EAC_FAULT") if eac_status is not None else False
-    ret.steerFaultTemporary = (eac_status == "EAC_INHIBITED") if eac_status is not None else False
+    eac_status = self.can_defines["EPAS_sysStatus"]["EPAS_eacStatus"].get(int(epas_status["EPAS_eacStatus"]), None)
+    ret.steerFaultPermanent = eac_status == "EAC_FAULT"
+    ret.steerFaultTemporary = eac_status == "EAC_INHIBITED"
 
-    eac_error_code = self._dv_lookup("EPAS_sysStatus", "EPAS_eacErrorCode", int(epas_status.get("EPAS_eacErrorCode", 0)))
-    ret.steeringDisengage = self.hands_on_level >= 3 or (
-      (eac_status == "EAC_INHIBITED") and (eac_error_code == "EAC_ERROR_HIGH_ANGLE_RATE_SAFETY")
-    )
+    eac_error_code = self.can_defines["EPAS_sysStatus"]["EPAS_eacErrorCode"].get(int(epas_status["EPAS_eacErrorCode"]), None)
+    ret.steeringDisengage = self.hands_on_level >= 3 or (eac_status == "EAC_INHIBITED" and
+                                                         eac_error_code == "EAC_ERROR_HIGH_ANGLE_RATE_SAFETY")
 
     # Cruise state
-    cruise_state = self.can_defines["DI_state"]["DI_cruiseState"].get(int(cp_chassis.vl["DI_state"].get("DI_cruiseState", 0)), None)
-    speed_units = self.can_defines["DI_state"]["DI_speedUnits"].get(int(cp_chassis.vl["DI_state"].get("DI_speedUnits", 0)), None)
+    cruise_state = self.can_defines["DI_state"]["DI_cruiseState"].get(int(cp_chassis.vl["DI_state"]["DI_cruiseState"]), None)
+    speed_units = self.can_defines["DI_state"]["DI_speedUnits"].get(int(cp_chassis.vl["DI_state"]["DI_speedUnits"]), None)
     cruise_enabled = cruise_state in ("ENABLED", "STANDSTILL", "OVERRIDE", "PRE_FAULT", "PRE_CANCEL")
 
     # Unity parity: stash stalk + msg for controller and latch cruiseEnabled if AutopilotDisabled

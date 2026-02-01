@@ -1,4 +1,16 @@
-#pragma once
+#!/usr/bin/env python3
+"""
+v18 overlay applier (HW2 S/X legacy): overwrites tesla_legacy.h with a known-good v18 version.
+
+Usage:
+  python3 /data/openpilot/v18_apply.py
+"""
+from __future__ import annotations
+import time
+from pathlib import Path
+
+V18_MARKER = "UNITY_PARITY_CONTROLS_ALLOWED_V18"
+TESLA_LEGACY_H = r"""#pragma once
 
 #include "opendbc/safety/safety_declarations.h"
 
@@ -8,7 +20,7 @@ static bool tesla_external_panda = false;
 #define UNITY_PARITY_CONTROLS_ALLOWED_V18 1
 static bool tesla_legacy_op_autopilot_disabled = false;  // set via fake DAS msg 0x659
 static bool tesla_legacy_op_cruise_enabled = false;      // MAIN/CANCEL latch from 0x45 when autopilot_disabled
-static uint8_t tesla_legacy_last_ap_lever_position __attribute__((unused)) = 0U;
+static uint8_t tesla_legacy_last_ap_lever_position = 0U;
 static bool tesla_hw1 = false;
 static bool tesla_hw2 = false;
 static bool tesla_hw3 = false;
@@ -25,13 +37,6 @@ static bool tesla_legacy_stock_lkas = false;
 static bool tesla_legacy_stock_lkas_prev = false;
 
 static void tesla_legacy_rx_hook(const CANPacket_t *msg) {
-  // UNITY_V18_RX_0x45: Unity parity stalk latch (0x45) when AP-disabled is active
-  if ((msg->addr == 0x45U) && tesla_legacy_op_autopilot_disabled) {
-    const int ap_lever_position = (int)(msg->data[0] & 0x3FU);  // 2=MAIN(enable), 1=CANCEL
-    if (ap_lever_position == 2) { tesla_legacy_op_cruise_enabled = true; }
-    else if (ap_lever_position == 1) { tesla_legacy_op_cruise_enabled = false; }
-  }
-
 
   // Steering angle: (0.1 * val) - 819.2 in deg.
   if (!tesla_external_panda && (msg->bus == 0U) && (msg->addr == 0x370U)) {
@@ -104,12 +109,6 @@ static void tesla_legacy_rx_hook(const CANPacket_t *msg) {
 
 
 static bool tesla_legacy_tx_hook(const CANPacket_t *msg) {
-  // UNITY_V18_TX_0x659: Unity parity fake DAS status (0x659) => AP-disabled flag for stalk-latched engagement
-  if (msg->addr == 0x659U) {
-    tesla_legacy_op_autopilot_disabled = ((msg->data[5] & 0x80U) != 0U);
-    if (!tesla_legacy_op_autopilot_disabled) { tesla_legacy_op_cruise_enabled = false; }
-  }
-
   const AngleSteeringLimits TESLA_STEERING_LIMITS = {
     .max_angle = 3600,  // 360 deg, EPAS faults above this
     .angle_deg_to_can = 10,
@@ -312,3 +311,49 @@ const safety_hooks tesla_legacy_hooks = {
   .tx = tesla_legacy_tx_hook,
   .fwd = tesla_legacy_fwd_hook,
 };
+"""
+
+def write_file(path: Path, content: str) -> None:
+  path.parent.mkdir(parents=True, exist_ok=True)
+  if path.exists():
+    ts = time.strftime("%Y%m%d_%H%M%S")
+    bak = path.with_suffix(path.suffix + f".bak_v18_{ts}")
+    bak.write_text(path.read_text(encoding="utf-8", errors="ignore"), encoding="utf-8")
+    print(f"backup : {bak}")
+  path.write_text(content, encoding="utf-8")
+  print(f"patched: {path}")
+
+def main() -> int:
+  root = Path("/data/openpilot")
+  if not root.exists():
+    root = Path(__file__).resolve().parent
+    for _ in range(6):
+      if (root / "opendbc_repo").exists() or (root / "opendbc").exists():
+        break
+      root = root.parent
+
+  targets = [
+    root / "opendbc_repo" / "opendbc" / "safety" / "modes" / "tesla_legacy.h",
+    root / "opendbc" / "safety" / "modes" / "tesla_legacy.h",
+  ]
+
+  any_written = False
+  for p in targets:
+    if p.exists():
+      cur = p.read_text(encoding="utf-8", errors="ignore")
+      if V18_MARKER in cur and cur.strip() == TESLA_LEGACY_H.strip():
+        print(f"already v18: {p}")
+        any_written = True
+        continue
+      write_file(p, TESLA_LEGACY_H)
+      any_written = True
+
+  if not any_written:
+    print("ERROR: didn't find tesla_legacy.h under opendbc_repo/ or opendbc/.")
+    return 2
+
+  print("done.")
+  return 0
+
+if __name__ == "__main__":
+  raise SystemExit(main())

@@ -38,10 +38,6 @@ class CarState(CarStateBase):
         "EPAS_sysStatus": CANDefine(DBC[CP.carFingerprint][Bus.chassis]).dv,
       }
 
-      from collections import defaultdict
-      self.can_defines = defaultdict(lambda: defaultdict(dict), {k: defaultdict(dict, v) for k, v in self.can_defines.items()})
-      from collections import defaultdict
-      self.can_defines = defaultdict(lambda: defaultdict(dict), {k: defaultdict(dict, v) for k, v in self.can_defines.items()})
     # Unity parity state (used by CarController virtual stalk + lat-only enable)
     self.msg_stw_actn_req = None
     self.prev_cruise_buttons = CruiseButtons.IDLE
@@ -181,8 +177,8 @@ class CarState(CarStateBase):
     )
 
     # Cruise state
-    cruise_state = self.can_defines["DI_state"]["DI_cruiseState"].get(int(cp_chassis.vl["DI_state"].get("DI_cruiseState", 0)), None)
-    speed_units = self.can_defines["DI_state"]["DI_speedUnits"].get(int(cp_chassis.vl["DI_state"].get("DI_speedUnits", 0)), None)
+    cruise_state = self.can_defines["DI_state"]["DI_cruiseState"].get(int(cp_chassis.vl["DI_state"]["DI_cruiseState"]), None)
+    speed_units = self.can_defines["DI_state"]["DI_speedUnits"].get(int(cp_chassis.vl["DI_state"]["DI_speedUnits"]), None)
     cruise_enabled = cruise_state in ("ENABLED", "STANDSTILL", "OVERRIDE", "PRE_FAULT", "PRE_CANCEL")
 
     # Unity parity: stash stalk + msg for controller and latch cruiseEnabled if AutopilotDisabled

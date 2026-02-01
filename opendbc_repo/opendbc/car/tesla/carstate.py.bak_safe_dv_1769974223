@@ -40,8 +40,6 @@ class CarState(CarStateBase):
 
       from collections import defaultdict
       self.can_defines = defaultdict(lambda: defaultdict(dict), {k: defaultdict(dict, v) for k, v in self.can_defines.items()})
-      from collections import defaultdict
-      self.can_defines = defaultdict(lambda: defaultdict(dict), {k: defaultdict(dict, v) for k, v in self.can_defines.items()})
     # Unity parity state (used by CarController virtual stalk + lat-only enable)
     self.msg_stw_actn_req = None
     self.prev_cruise_buttons = CruiseButtons.IDLE

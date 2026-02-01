@@ -8,7 +8,7 @@ static bool tesla_external_panda = false;
 #define UNITY_PARITY_CONTROLS_ALLOWED_V18 1
 static bool tesla_legacy_op_autopilot_disabled = false;  // set via fake DAS msg 0x659
 static bool tesla_legacy_op_cruise_enabled = false;      // MAIN/CANCEL latch from 0x45 when autopilot_disabled
-static uint8_t tesla_legacy_last_ap_lever_position __attribute__((unused)) = 0U;
+static uint8_t tesla_legacy_last_ap_lever_position = 0U;
 static bool tesla_hw1 = false;
 static bool tesla_hw2 = false;
 static bool tesla_hw3 = false;
@@ -25,13 +25,6 @@ static bool tesla_legacy_stock_lkas = false;
 static bool tesla_legacy_stock_lkas_prev = false;
 
 static void tesla_legacy_rx_hook(const CANPacket_t *msg) {
-  // UNITY_V18_RX_0x45: Unity parity stalk latch (0x45) when AP-disabled is active
-  if ((msg->addr == 0x45U) && tesla_legacy_op_autopilot_disabled) {
-    const int ap_lever_position = (int)(msg->data[0] & 0x3FU);  // 2=MAIN(enable), 1=CANCEL
-    if (ap_lever_position == 2) { tesla_legacy_op_cruise_enabled = true; }
-    else if (ap_lever_position == 1) { tesla_legacy_op_cruise_enabled = false; }
-  }
-
 
   // Steering angle: (0.1 * val) - 819.2 in deg.
   if (!tesla_external_panda && (msg->bus == 0U) && (msg->addr == 0x370U)) {
@@ -104,12 +97,6 @@ static void tesla_legacy_rx_hook(const CANPacket_t *msg) {
 
 
 static bool tesla_legacy_tx_hook(const CANPacket_t *msg) {
-  // UNITY_V18_TX_0x659: Unity parity fake DAS status (0x659) => AP-disabled flag for stalk-latched engagement
-  if (msg->addr == 0x659U) {
-    tesla_legacy_op_autopilot_disabled = ((msg->data[5] & 0x80U) != 0U);
-    if (!tesla_legacy_op_autopilot_disabled) { tesla_legacy_op_cruise_enabled = false; }
-  }
-
   const AngleSteeringLimits TESLA_STEERING_LIMITS = {
     .max_angle = 3600,  // 360 deg, EPAS faults above this
     .angle_deg_to_can = 10,
