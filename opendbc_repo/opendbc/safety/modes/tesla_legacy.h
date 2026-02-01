@@ -18,7 +18,8 @@ static bool tesla_legacy_stock_aeb = false;
 static bool tesla_legacy_stock_lkas = false;
 static bool tesla_legacy_stock_lkas_prev = false;
 
-static bool tesla_legacy_op_cruise_enabled = false;  // Unity parity: allow lat-only engage without Tesla cruise
+// UNITY_PARITY_CONTROLS_ALLOWED_V17
+static bool tesla_legacy_op_cruise_enabled = false;  // stalk-latched controlsAllowed (Unity parity)
 
 static void tesla_legacy_rx_hook(const CANPacket_t *msg) {
 
@@ -41,17 +42,6 @@ static void tesla_legacy_rx_hook(const CANPacket_t *msg) {
     // Vehicle speed: (0.01 * val) * KPH_TO_MS
     float speed = ((msg->data[6] | (msg->data[5] << 8)) * 0.01) * KPH_TO_MS;
     UPDATE_VEHICLE_SPEED(speed);
-
-  // Unity parity: stalk-based cruise latch (STW_ACTN_RQ 0x45)
-  if (msg->addr == 0x45U) {
-    const int stw_lvr_stat = (int)(msg->data[3] & 0x07U);  // StW_Lvr_Stat @ bit 24 len 3
-    const int spd_ctrl_lvr_stat = (int)(msg->data[0] & 0x3FU);  // SpdCtrlLvr_Stat @ bit 0 len 6
-    if (stw_lvr_stat == 4) {  // STW_BACK
-      tesla_legacy_op_cruise_enabled = false;
-    } else if ((stw_lvr_stat == 1) || (stw_lvr_stat == 2) || (stw_lvr_stat == 3) || (spd_ctrl_lvr_stat != 0)) {
-      tesla_legacy_op_cruise_enabled = true;
-    }
-  }
   }
 
   // Gas pressed
@@ -62,7 +52,21 @@ static void tesla_legacy_rx_hook(const CANPacket_t *msg) {
   if (((tesla_external_panda) && (msg->bus == 0U) && (msg->addr == 0x1f8U)) ||
      ((!tesla_external_panda) && (msg->bus == chassis_bus) && (msg->addr == 0x20aU))) {
     brake_pressed = (((msg->data[0] & 0x0CU) >> 2) != 1U);
-     if (brake_pressed) { tesla_legacy_op_cruise_enabled = false; }
+    if (brake_pressed) { tesla_legacy_op_cruise_enabled = false; }
+  }
+
+  // Unity parity: stalk-based cruise latch from STW_ACTN_RQ (0x45)
+  // DBC bits: SpdCtrlLvr_Stat 0|6@1, StW_Lvr_Stat 24|3@1
+  if (((tesla_external_panda) && (msg->bus == 0U) && (msg->addr == 0x45U)) ||
+     ((!tesla_external_panda) && (msg->bus == chassis_bus) && (msg->addr == 0x45U))) {
+    const int spd_ctrl_lvr_stat = (int)(msg->data[0] & 0x3FU);
+    const int stw_lvr_stat = (int)(msg->data[3] & 0x07U);
+    // 4=STW_BACK cancels; any non-zero action enables
+    if (stw_lvr_stat == 4) {
+      tesla_legacy_op_cruise_enabled = false;
+    } else if ((stw_lvr_stat != 0) || (spd_ctrl_lvr_stat != 0)) {
+      tesla_legacy_op_cruise_enabled = true;
+    }
   }
 
   // Cruise
@@ -76,7 +80,7 @@ static void tesla_legacy_rx_hook(const CANPacket_t *msg) {
                             (cruise_state == 6) ||  // PRE_FAULT
                             (cruise_state == 7);    // PRE_CANCEL
       vehicle_moving = cruise_state != 3; // STANDSTILL
-       pcm_cruise_check(cruise_engaged || tesla_legacy_op_cruise_enabled);
+      pcm_cruise_check(cruise_engaged || tesla_legacy_op_cruise_enabled);
    }
 
   if (msg->bus == 2U) {
@@ -223,7 +227,6 @@ static safety_config tesla_legacy_init(uint16_t param) {
   tesla_legacy_stock_aeb = false;
   tesla_legacy_stock_lkas = false;
   tesla_legacy_stock_lkas_prev = false;
-  tesla_legacy_op_cruise_enabled = false;
   chassis_bus = 0U;
   di_torque1_msg = 0x106U;
 
