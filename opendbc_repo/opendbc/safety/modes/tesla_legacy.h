@@ -6,7 +6,6 @@ static bool tesla_external_panda = false;
 static bool tesla_hw1 = false;
 static bool tesla_hw2 = false;
 static bool tesla_hw3 = false;
-static bool tesla_legacy_stalk_enable = false;  // Unity parity: stalk enables controls
 
 static int chassis_bus = 0U;
 static int das_control_msg = 0x2bfU;
@@ -18,6 +17,8 @@ static bool tesla_legacy_stock_aeb = false;
 // TODO: Only LKAS (non-emergency) is currently supported since we've only seen it
 static bool tesla_legacy_stock_lkas = false;
 static bool tesla_legacy_stock_lkas_prev = false;
+
+static bool tesla_legacy_op_cruise_enabled = false;  // Unity parity: allow lat-only engage without Tesla cruise
 
 static void tesla_legacy_rx_hook(const CANPacket_t *msg) {
 
@@ -40,6 +41,17 @@ static void tesla_legacy_rx_hook(const CANPacket_t *msg) {
     // Vehicle speed: (0.01 * val) * KPH_TO_MS
     float speed = ((msg->data[6] | (msg->data[5] << 8)) * 0.01) * KPH_TO_MS;
     UPDATE_VEHICLE_SPEED(speed);
+
+  // Unity parity: stalk-based cruise latch (STW_ACTN_RQ 0x45)
+  if (msg->addr == 0x45U) {
+    const int stw_lvr_stat = (int)(msg->data[3] & 0x07U);  // StW_Lvr_Stat @ bit 24 len 3
+    const int spd_ctrl_lvr_stat = (int)(msg->data[0] & 0x3FU);  // SpdCtrlLvr_Stat @ bit 0 len 6
+    if (stw_lvr_stat == 4) {  // STW_BACK
+      tesla_legacy_op_cruise_enabled = false;
+    } else if ((stw_lvr_stat == 1) || (stw_lvr_stat == 2) || (stw_lvr_stat == 3) || (spd_ctrl_lvr_stat != 0)) {
+      tesla_legacy_op_cruise_enabled = true;
+    }
+  }
   }
 
   // Gas pressed
@@ -50,6 +62,7 @@ static void tesla_legacy_rx_hook(const CANPacket_t *msg) {
   if (((tesla_external_panda) && (msg->bus == 0U) && (msg->addr == 0x1f8U)) ||
      ((!tesla_external_panda) && (msg->bus == chassis_bus) && (msg->addr == 0x20aU))) {
     brake_pressed = (((msg->data[0] & 0x0CU) >> 2) != 1U);
+     if (brake_pressed) { tesla_legacy_op_cruise_enabled = false; }
   }
 
   // Cruise
@@ -63,19 +76,8 @@ static void tesla_legacy_rx_hook(const CANPacket_t *msg) {
                             (cruise_state == 6) ||  // PRE_FAULT
                             (cruise_state == 7);    // PRE_CANCEL
       vehicle_moving = cruise_state != 3; // STANDSTILL
-      pcm_cruise_check(cruise_engaged);
+       pcm_cruise_check(cruise_engaged || tesla_legacy_op_cruise_enabled);
    }
-
-  // Unity parity: stalk-based enable/disengage when Tesla cruise can't engage (e.g. <~18mph)
-  if (tesla_legacy_stalk_enable && (msg->addr == 0x45U) &&
-      (((tesla_external_panda) && (msg->bus == 0U)) || ((!tesla_external_panda) && (msg->bus == chassis_bus)))) {
-    const int spdctrl = msg->data[0] & 0x3FU;  // SpdCtrlLvr_Stat
-    if (spdctrl == 2) {        // MAIN (pull)
-      pcm_cruise_check(true);
-    } else if (spdctrl == 1) { // CANCEL (push)
-      pcm_cruise_check(false);
-    }
-  }
 
   if (msg->bus == 2U) {
     // DAS_control
@@ -206,14 +208,12 @@ static bool tesla_legacy_fwd_hook(int bus_num, int addr) {
 }
 
 static safety_config tesla_legacy_init(uint16_t param) {
-  const int TESLA_FLAG_LONG_CONTROL = 1;
   const int TESLA_FLAG_EXTERNAL_PANDA = 2;
   const int TESLA_FLAG_HW1 = 4;
   const int TESLA_FLAG_HW2 = 8;
   const int TESLA_FLAG_HW3 = 16;
 
   // Extract flags
-  tesla_legacy_stalk_enable = GET_FLAG(param, TESLA_FLAG_LONG_CONTROL);
   tesla_external_panda = GET_FLAG(param, TESLA_FLAG_EXTERNAL_PANDA);
   tesla_hw1 = GET_FLAG(param, TESLA_FLAG_HW1);
   tesla_hw2 = GET_FLAG(param, TESLA_FLAG_HW2);
@@ -223,6 +223,7 @@ static safety_config tesla_legacy_init(uint16_t param) {
   tesla_legacy_stock_aeb = false;
   tesla_legacy_stock_lkas = false;
   tesla_legacy_stock_lkas_prev = false;
+  tesla_legacy_op_cruise_enabled = false;
   chassis_bus = 0U;
   di_torque1_msg = 0x106U;
 
