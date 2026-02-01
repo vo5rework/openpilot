@@ -5,10 +5,17 @@ from opendbc.car.tesla.carstate import CarState
 from opendbc.car.tesla.values import TeslaSafetyFlags, CAR, TeslaLegacyParams, LEGACY_CARS
 from opendbc.car.tesla.radar_interface import RadarInterface
 from cereal import messaging
-from openpilot.selfdrive.car.modules.ALC_module import ALCController
-from openpilot.selfdrive.car.modules.BLNK_module import BLNKController
-from openpilot.selfdrive.car.modules.HSO_module import HSOController
-from openpilot.selfdrive.car.modules.CFG_module import load_bool_param, load_float_param
+
+try:
+  from selfdrive.car.modules.ALC_module import ALCController
+  from selfdrive.car.modules.BLNK_module import BLNKController
+  from selfdrive.car.modules.HSO_module import HSOController
+  from selfdrive.car.modules.CFG_module import load_bool_param, load_float_param
+except ImportError:  # pragma: no cover
+  from openpilot.selfdrive.car.modules.ALC_module import ALCController
+  from openpilot.selfdrive.car.modules.BLNK_module import BLNKController
+  from openpilot.selfdrive.car.modules.HSO_module import HSOController
+  from openpilot.selfdrive.car.modules.CFG_module import load_bool_param, load_float_param
 
 
 
@@ -25,16 +32,16 @@ def __init__(self, CP, CarController, CarState):
   self.CS.laP = messaging.sub_sock('lateralPlan')
   self.CS.human_control = False
 
-  # Params
+  # Params (Unity-style)
   self.CS._tinkla_enable_alc = load_bool_param("TinklaEnableALC", True)
   self.CS._tinkla_alc_delay = load_float_param("TinklaAlcDelay", 0.75)
 
-  # Controllers
   self.CS.alca_controller = ALCController()
   self.CS.blinker_controller = BLNKController()
   self.CS.HSO = HSOController()
 
 def pre_apply(self, c: structs.CarControl, now_nanos: int | None = None) -> None:
+  # Update per-frame Unity parity state machines before apply()
   self.CS.lat_plan = messaging.recv_one_or_none(self.CS.laP)
 
   try:
@@ -63,9 +70,9 @@ def pre_apply(self, c: structs.CarControl, now_nanos: int | None = None) -> None
       pass
 
 def post_update(self, c: structs.CarControl, ret: structs.CarState) -> None:
+  # Tap-only blinkers and ALC autostart spoof (Unity parity)
   enable_alc = bool(getattr(self.CS, "_tinkla_enable_alc", True))
 
-  # Tap-only blinkers: lamp on + stalk released + latched tap direction
   try:
     stalk_released = int(getattr(self.CS, "turnSignalStalkState", 0)) == 0
     tap_dir = int(getattr(self.CS, "tap_direction", 0))
@@ -76,7 +83,6 @@ def post_update(self, c: structs.CarControl, ret: structs.CarState) -> None:
   except Exception:
     pass
 
-  # Auto-start ALC torque spoof after delay (Unity)
   if enable_alc and bool(getattr(self.CS, "alca_need_engagement", False)):
     try:
       ret.steeringPressed = True

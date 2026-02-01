@@ -1,19 +1,18 @@
-"""Tinkla/Unity config helpers for Params.
+"""Config helpers backed by Params.
 
-Exposes the same API as Unity's CFG_module but backed by openpilot Params.
+This is a compatibility shim for Unity-derived modules.
 """
 from __future__ import annotations
 
-from typing import Any
-from openpilot.common.params import Params
-
+try:
+  from openpilot.common.params import Params  # some layouts
+except ImportError:  # pragma: no cover
+  from common.params import Params
 
 _P = Params()
 
-
 def save_bool_param(param: str, val: bool) -> None:
   _P.put_bool(param, bool(val))
-
 
 def load_bool_param(param: str, default_val: bool) -> bool:
   if _P.get(param) is None:
@@ -21,10 +20,8 @@ def load_bool_param(param: str, default_val: bool) -> bool:
     return bool(default_val)
   return _P.get_bool(param)
 
-
 def save_float_param(param: str, val: float) -> None:
   _P.put(param, str(float(val)))
-
 
 def load_float_param(param: str, default_val: float) -> float:
   v = _P.get(param)
@@ -37,10 +34,8 @@ def load_float_param(param: str, default_val: float) -> float:
     _P.put(param, str(float(default_val)))
     return float(default_val)
 
-
 def save_str_param(param: str, val: str) -> None:
   _P.put(param, str(val))
-
 
 def load_str_param(param: str, default_val: str) -> str:
   v = _P.get(param)

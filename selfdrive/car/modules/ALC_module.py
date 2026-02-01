@@ -1,7 +1,17 @@
+"""Auto lane change helpers (Unity parity) with schema-compatible enums.
+
+xnor-c3 cereal exposes LaneChangeState/Direction as top-level enums (log.LaneChangeState),
+while Unity referenced log.LateralPlan.LaneChangeState.
+"""
+
 from cereal import log
 
-LaneChangeState = log.LateralPlan.LaneChangeState
-LaneChangeDirection = log.LateralPlan.LaneChangeDirection
+try:
+  LaneChangeState = log.LaneChangeState
+  LaneChangeDirection = log.LaneChangeDirection
+except AttributeError:  # pragma: no cover
+  LaneChangeState = log.LateralPlan.LaneChangeState
+  LaneChangeDirection = log.LateralPlan.LaneChangeDirection
 
 class ALCController:
 
@@ -19,9 +29,9 @@ class ALCController:
             CS.alca_done = lat_plan.lateralPlan.laneChangeState in [LaneChangeState.laneChangeFinishing]
             # 0-none, 1-left, 2-right 
             if (CS.alca_pre_engage or CS.alca_engaged) and not CS.alca_done:
-                if lat_plan.lateralPlan.laneChangeDirection == log.LateralPlan.LaneChangeDirection.left:
+                if lat_plan.lateralPlan.laneChangeDirection == LaneChangeDirection.left:
                     CS.alca_direction = 1
-                elif lat_plan.lateralPlan.laneChangeDirection == log.LateralPlan.LaneChangeDirection.right:
+                elif lat_plan.lateralPlan.laneChangeDirection == LaneChangeDirection.right:
                     CS.alca_direction = 2
                 else:
                     CS.alca_direction = 0
