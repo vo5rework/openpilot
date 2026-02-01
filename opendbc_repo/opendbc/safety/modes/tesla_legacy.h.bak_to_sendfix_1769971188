@@ -110,8 +110,8 @@ static void tesla_legacy_rx_hook(const CANPacket_t *msg) {
 static bool tesla_legacy_tx_hook(const CANPacket_t *msg) {
   // UNITY_PARITY_0x659_PEDAL_ENABLED_V19
   // Fake DAS message used by Unity to pass mode bits to safety; never forward to the car.
-  if (msg->addr == 0x659U) {
-    const uint8_t b5 = (uint8_t)GET_BYTES(msg, 5U, 1U);
+  if (to_send->addr == 0x659U) {
+    const uint8_t b5 = (uint8_t)GET_BYTES(to_send, 5U, 1U);
     tesla_legacy_op_autopilot_disabled = (b5 & 0x80U) != 0U;  // bit7
     tesla_legacy_op_pedal_enabled = (b5 & 0x20U) != 0U;       // bit5
     return false;

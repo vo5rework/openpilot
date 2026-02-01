@@ -64,11 +64,21 @@ class TeslaCAN:
     values["CRC_STW_ACTN_RQ"] = 0
 
     msg = self.packer.make_can_msg("STW_ACTN_RQ", bus, values)
-    # msg[2] is bytes payload
-    dat = msg[2]
+    # msg[1] is bytes payload
+    dat = msg[1]
     crc = _crc8_11d(dat[:7])
     values["CRC_STW_ACTN_RQ"] = crc
     return self.packer.make_can_msg("STW_ACTN_RQ", bus, values)
+
+
+  def create_fake_das_msg(self, pedalEnabled: bool, autopilot_disabled: bool, bus: int = CANBUS.party):
+    """Unity parity: internal openpilot->panda message (0x659) to configure safety.
+    Byte5 bit5: pedalEnabled, bit7: autopilot_disabled.
+    Not in any DBC; safety tx_hook consumes and blocks it from hitting the car.
+    """
+    dat = bytearray(8)
+    dat[5] = (0x20 if pedalEnabled else 0) | (0x80 if autopilot_disabled else 0)
+    return (0x659, bytes(dat), bus)
 
 
 def tesla_checksum(address: int, sig, d: bytearray) -> int:

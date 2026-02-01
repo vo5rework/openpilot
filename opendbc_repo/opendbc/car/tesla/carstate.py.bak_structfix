@@ -56,9 +56,24 @@ class CarState(CarStateBase):
     self.das_control = None
 
 # Unity parity fields
+self.cruise_buttons = 0
+self.turnSignalStalkState = 0
+self.tap_direction = 0
+self.leftBlinkerLamp = False
+self.rightBlinkerLamp = False
+self.human_control = False
 
+self.speed_units = "MPH"
+self.speed_limit_ms = 0.0
+self.speed_limit_ms_das = 0.0
 
+self._tinkla = _TinklaConfig()
+self._reload_tinkla_params()
+self.autopilot_disabled = bool(self._tinkla.autopilot_disabled)
+self.cruiseEnabled = False
 
+self._prev_cruise_buttons = 0
+self._param_frame = 0
 
 def _reload_tinkla_params(self) -> None:
   self._tinkla.autopilot_disabled = load_bool_param("TinklaAutopilotDisabled", False)

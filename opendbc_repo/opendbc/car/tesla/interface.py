@@ -1,22 +1,15 @@
-"""Tesla CarInterface (xnor-c3) with legacy-only Unity parity latch.
-
-Copy this file to BOTH:
-  - opendbc/car/tesla/interface.py
-  - opendbc_repo/opendbc/car/tesla/interface.py
-
-Legacy-only additions:
-  - Capture latest STW_ACTN_RQ into CS.msg_stw_actn_req (enables legacy virtual stalk emulation).
-  - Unity-style cruiseEnabled latch (allows engagement under Tesla's low-speed cruise restriction).
-"""
-
-import copy
-
-from opendbc.car import Bus, get_safety_config, structs
+from opendbc.car import get_safety_config, structs
 from opendbc.car.interfaces import CarInterfaceBase
 from opendbc.car.tesla.carcontroller import CarController
 from opendbc.car.tesla.carstate import CarState
+from opendbc.car.tesla.values import TeslaSafetyFlags, CAR, TeslaLegacyParams, LEGACY_CARS
 from opendbc.car.tesla.radar_interface import RadarInterface
-from opendbc.car.tesla.values import CAR, LEGACY_CARS, TeslaLegacyParams, TeslaSafetyFlags
+from cereal import messaging
+from openpilot.selfdrive.car.modules.ALC_module import ALCController
+from openpilot.selfdrive.car.modules.BLNK_module import BLNKController
+from openpilot.selfdrive.car.modules.HSO_module import HSOController
+from openpilot.selfdrive.car.modules.CFG_module import load_bool_param, load_float_param
+
 
 
 class CarInterface(CarInterfaceBase):
@@ -24,9 +17,73 @@ class CarInterface(CarInterfaceBase):
   CarController = CarController
   RadarInterface = RadarInterface
 
-  def __init__(self, CP: structs.CarParams):
-    super().__init__(CP)
-    self._unity_cruise_enabled = False
+
+def __init__(self, CP, CarController, CarState):
+  super().__init__(CP, CarController, CarState)
+
+  # Unity parity sockets/modules
+  self.CS.laP = messaging.sub_sock('lateralPlan')
+  self.CS.human_control = False
+
+  # Params
+  self.CS._tinkla_enable_alc = load_bool_param("TinklaEnableALC", True)
+  self.CS._tinkla_alc_delay = load_float_param("TinklaAlcDelay", 0.75)
+
+  # Controllers
+  self.CS.alca_controller = ALCController()
+  self.CS.blinker_controller = BLNKController()
+  self.CS.HSO = HSOController()
+
+def pre_apply(self, c: structs.CarControl, now_nanos: int | None = None) -> None:
+  self.CS.lat_plan = messaging.recv_one_or_none(self.CS.laP)
+
+  try:
+    self.CS._tinkla_enable_alc = load_bool_param("TinklaEnableALC", True)
+    self.CS._tinkla_alc_delay = load_float_param("TinklaAlcDelay", 0.75)
+    self.CS.alca_controller.autoStartAlcaDelay = float(self.CS._tinkla_alc_delay)
+  except Exception:
+    pass
+
+  try:
+    self.CS.human_control = bool(self.CS.HSO.update_stat(self.CS, bool(c.latActive), c.actuators, self.frame))
+  except Exception:
+    self.CS.human_control = False
+
+  try:
+    self.CS.blinker_controller.update_state(self.CS, self.frame)
+    self.CS.tap_direction = int(getattr(self.CS.blinker_controller, "tap_direction", 0))
+  except Exception:
+    self.CS.tap_direction = 0
+
+  if bool(getattr(self.CS, "_tinkla_enable_alc", True)):
+    try:
+      self.CS.alca_controller.autoStartAlcaDelay = float(getattr(self.CS, "_tinkla_alc_delay", 0.75))
+      self.CS.alca_controller.update(bool(c.latActive), self.CS, self.frame, getattr(self.CS, "lat_plan", None))
+    except Exception:
+      pass
+
+def post_update(self, c: structs.CarControl, ret: structs.CarState) -> None:
+  enable_alc = bool(getattr(self.CS, "_tinkla_enable_alc", True))
+
+  # Tap-only blinkers: lamp on + stalk released + latched tap direction
+  try:
+    stalk_released = int(getattr(self.CS, "turnSignalStalkState", 0)) == 0
+    tap_dir = int(getattr(self.CS, "tap_direction", 0))
+    left_lamp = bool(getattr(self.CS, "leftBlinkerLamp", False))
+    right_lamp = bool(getattr(self.CS, "rightBlinkerLamp", False))
+    ret.leftBlinker = left_lamp and stalk_released and (tap_dir == 1)
+    ret.rightBlinker = right_lamp and stalk_released and (tap_dir == 2)
+  except Exception:
+    pass
+
+  # Auto-start ALC torque spoof after delay (Unity)
+  if enable_alc and bool(getattr(self.CS, "alca_need_engagement", False)):
+    try:
+      ret.steeringPressed = True
+      direction = int(getattr(self.CS, "alca_direction", 0))
+      ret.steeringTorque = 0.1 if direction == 1 else (-0.1 if direction == 2 else ret.steeringTorque)
+    except Exception:
+      pass
 
   @staticmethod
   def _get_params(ret: structs.CarParams, candidate, fingerprint, car_fw, alpha_long, is_release, docs) -> structs.CarParams:
@@ -34,11 +91,12 @@ class CarInterface(CarInterfaceBase):
       return CarInterface._get_params_sx(ret, candidate, fingerprint, car_fw, alpha_long, is_release, docs)
 
     ret.brand = "tesla"
+
     ret.safetyConfigs = [get_safety_config(structs.CarParams.SafetyModel.tesla)]
 
-    ret.steerLimitTimer = 0.4
+    ret.steerLimitTimer = 1.0
     ret.steerActuatorDelay = 0.1
-    ret.steerAtStandstill = True
+    ret.steerAtStandstill = False
 
     ret.steerControlType = structs.CarParams.SteerControlType.angle
     ret.radarUnavailable = True
@@ -51,6 +109,8 @@ class CarInterface(CarInterfaceBase):
       ret.vEgoStopping = 0.1
       ret.vEgoStarting = 0.1
       ret.stoppingDecelRate = 0.3
+
+    # ret.dashcamOnly = candidate in (CAR.TESLA_MODEL_X) # dashcam only, pending find invalidLkasSetting signal
 
     return ret
 
@@ -76,7 +136,6 @@ class CarInterface(CarInterfaceBase):
         get_safety_config(structs.CarParams.SafetyModel.teslaLegacy, int(TeslaSafetyFlags.FLAG_HW3 | TeslaSafetyFlags.FLAG_EXTERNAL_PANDA)),
       ]
 
-    # Unity C3 parity for legacy S/X: reduce EPS faults from low-speed/standstill steering
     ret.steerLimitTimer = 1.0
     ret.steerActuatorDelay = 0.1
     ret.steerAtStandstill = False
@@ -92,72 +151,6 @@ class CarInterface(CarInterfaceBase):
     ret.vEgoStarting = 0.1
     ret.stoppingDecelRate = 0.3
 
-    return ret
-
-  def update(self, can_packets):
-    ret = super().update(can_packets)
-
-    if self.CP.carFingerprint in LEGACY_CARS:
-      self._legacy_capture_action_request()
-      self._legacy_apply_unity_cruise_latch(ret)
+    # ret.dashcamOnly = candidate in (CAR.TESLA_MODEL_X) # dashcam only, pending find invalidLkasSetting signal
 
     return ret
-
-  def _legacy_capture_action_request(self) -> None:
-    """Keep a copy of the latest STW_ACTN_RQ for legacy virtual stalk emulation."""
-    try:
-      cp_chassis = self.can_parsers[Bus.chassis]
-      msg = cp_chassis.vl.get("STW_ACTN_RQ", None)
-      if isinstance(msg, dict) and msg:
-        self.CS.msg_stw_actn_req = copy.copy(msg)
-    except Exception:
-      pass
-
-    # Expose speed units for conversions (best-effort).
-    try:
-      cp_chassis = self.can_parsers[Bus.chassis]
-      raw = int(cp_chassis.vl["DI_state"]["DI_speedUnits"])
-      units = self.CS.can_defines["DI_state"]["DI_speedUnits"].get(raw, None)
-      if units in ("MPH", "KPH"):
-        self.CS.speed_units = units
-    except Exception:
-      pass
-
-  def _legacy_apply_unity_cruise_latch(self, ret: structs.CarState) -> None:
-    """Unity parity: allow engagement even when Tesla won't enable cruise under ~18mph."""
-    try:
-      if getattr(self.CS, "autopark", False):
-        self._unity_cruise_enabled = False
-
-      cp_chassis = self.can_parsers[Bus.chassis]
-      stw = None
-      spd = None
-
-      try:
-        raw_stw = int(cp_chassis.vl["STW_ACTN_RQ"]["StW_Lvr_Stat"])
-        stw = self.CS.can_defines["STW_ACTN_RQ"]["StW_Lvr_Stat"].get(raw_stw, None)
-      except Exception:
-        stw = None
-
-      try:
-        raw_spd = int(cp_chassis.vl["STW_ACTN_RQ"]["SpdCtrlLvr_Stat"])
-        spd = self.CS.can_defines["STW_ACTN_RQ"]["SpdCtrlLvr_Stat"].get(raw_spd, None)
-      except Exception:
-        spd = None
-
-      # Driver cancel / brake cancels latch
-      if stw == "STW_BACK" or bool(getattr(ret, "brakePressed", False)):
-        self._unity_cruise_enabled = False
-
-      # Any forward/up/down or speed lever action enables latch (MAIN/RES/SET/speed +/-)
-      if stw in ("STW_FWD", "STW_UP", "STW_DOWN") or spd in ("FWD", "RWD", "UP_1ST", "DN_1ST", "UP_2ND", "DN_2ND"):
-        self._unity_cruise_enabled = True
-
-      # If Tesla cruise is actually enabled, keep our latch enabled
-      if bool(getattr(ret.cruiseState, "enabled", False)):
-        self._unity_cruise_enabled = True
-
-      ret.cruiseState.available = True
-      ret.cruiseState.enabled = bool(self._unity_cruise_enabled)
-    except Exception:
-      pass

@@ -1,23 +1,14 @@
 import numpy as np
 from opendbc.can import CANPacker
 from opendbc.car import Bus
+from opendbc.car.lateral import apply_std_steer_angle_limits
 from opendbc.car.interfaces import CarControllerBase
 from opendbc.car.tesla.teslacan import TeslaCAN
 from opendbc.car.tesla.teslacan_legacy import TeslaCANRaven
 from opendbc.car.tesla.values import CarControllerParams, CANBUS, LEGACY_CARS, CAR, CruiseButtons
 from opendbc.car.common.conversions import Conversions as CV
 from opendbc.car.vehicle_model import VehicleModel
-
-try:
-  from opendbc.car.lateral import apply_steer_angle_limits_vm
-except Exception:  # pragma: no cover
-  from opendbc.car.lateral import apply_std_steer_angle_limits as _apply_std_steer_angle_limits
-
-  def apply_steer_angle_limits_vm(apply_angle: float, apply_angle_last: float, v_ego_raw: float, steering_angle: float,
-                                  lat_active: bool, limits, VM) -> float:
-    """Fallback for forks missing apply_steer_angle_limits_vm."""
-    return _apply_std_steer_angle_limits(apply_angle, apply_angle_last, float(v_ego_raw), steering_angle, lat_active, limits)
-
+from openpilot.common.params import Params
 
 
 def get_safety_CP():
@@ -30,6 +21,11 @@ def get_safety_CP():
 class CarController(CarControllerBase):
   def __init__(self, dbc_names, CP):
     super().__init__(dbc_names, CP)
+    # Unity parity: publish internal panda-config message (0x659) so safety can latch controlsAllowed
+    self._params = Params()
+    self._cached_autopilot_disabled = False
+    self._cached_pedal_enabled = False
+    self._params_last_read_frame = -100000
     self.hands_on_level_limit = 3
     self.apply_angle_last = 0
     self.packer = CANPacker(dbc_names[Bus.party])
@@ -101,14 +97,25 @@ class CarController(CarControllerBase):
     actuators = CC.actuators
     can_sends = []
 
+    # Refresh params occasionally (avoid hammering paramfs)
+    if (self.frame - self._params_last_read_frame) >= 50:
+      self._params_last_read_frame = self.frame
+      # Keys vary across forks; try the common ones
+      self._cached_autopilot_disabled = bool(self._params.get_bool("TinklaAutopilotDisabled"))
+      self._cached_pedal_enabled = bool(self._params.get_bool("TinklaPedalEnabled") or self._params.get_bool("PedalEnabled"))
+
+    # Send fake DAS msg at 10Hz (consumed by panda safety, blocked from hitting the car)
+    if (self.frame % 10) == 0:
+      can_sends.append(self._action_can.create_fake_das_msg(self._cached_pedal_enabled, self._cached_autopilot_disabled, CANBUS.party))
+
     # Tesla EPS enforces disabling steering on heavy lateral override force.
     # When enabling in a tight curve, we wait until user reduces steering force to start steering.
     # Canceling is done on rising edge and is handled generically with CC.cruiseControl.cancel
-    autopilot_disabled = bool(getattr(getattr(CS, "_tinkla", None), "autopilot_disabled", False))
-    lat_active = CC.latActive and CS.hands_on_level < self.hands_on_level_limit
+    autopilot_disabled = bool(getattr(CS, 'autopilot_disabled', False))
+    lat_active = CC.latActive and (not bool(getattr(CS, 'human_control', False))) and (not CS.out.cruiseState.standstill)
     if self.frame % 2 == 0:
       # Angular rate limit based on speed
-      self.apply_angle_last = apply_steer_angle_limits_vm(actuators.steeringAngleDeg, self.apply_angle_last, CS.out.vEgoRaw, CS.out.steeringAngleDeg,
+      self.apply_angle_last = apply_std_steer_angle_limits(actuators.steeringAngleDeg, self.apply_angle_last, CS.out.vEgoRaw, CS.out.steeringAngleDeg,
                                                           lat_active, CarControllerParams, self.VM)
       if lat_active:
         # Unity C3 parity: prevent EPS faults from large instantaneous angle steps
@@ -162,7 +169,7 @@ class CarController(CarControllerBase):
 
           if btn != CruiseButtons.IDLE and getattr(CS, "msg_stw_actn_req", None) is not None:
             # On legacy platforms STW_ACTN_RQ is on the chassis bus
-            bus = CANBUS.chassis if CANBUS.chassis != -1 else CANBUS.party
+            bus = CANBUS.party
             can_sends.insert(0, self._action_can.create_action_request(bus, CS.msg_stw_actn_req, btn))
 
     else:
