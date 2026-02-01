@@ -186,4 +186,43 @@ class CarInterface(TeslaCarInterface):
         pass
 
 
+
+  def update(self, can_parsers):
+    ret = super().update(can_parsers)
+
+    # UNITY_PARITY_CRUISE_LATCH_LEGACY (Model S/X only)
+    try:
+      fp = str(getattr(self.CP, "carFingerprint", ""))
+      if fp.startswith("TESLA_MODEL_S") or fp.startswith("TESLA_MODEL_X"):
+        from cereal import car
+        ButtonType = car.CarState.ButtonEvent.Type
+
+        ue = bool(getattr(self, "_unity_cruise_enabled", False))
+
+        enable_types = []
+        for n in ("mainCruise", "resumeCruise", "accelCruise", "decelCruise", "setCruise"):
+          if hasattr(ButtonType, n):
+            enable_types.append(getattr(ButtonType, n))
+        cancel_type = getattr(ButtonType, "cancel", None)
+
+        for be in getattr(ret, "buttonEvents", []):
+          if not getattr(be, "pressed", False):
+            continue
+          bt = getattr(be, "type", None)
+          if cancel_type is not None and bt == cancel_type:
+            ue = False
+          elif bt in enable_types:
+            ue = True
+
+        if bool(getattr(ret.cruiseState, "enabled", False)):
+          ue = True
+
+        self._unity_cruise_enabled = ue
+        ret.cruiseState.available = True
+        ret.cruiseState.enabled = ue
+    except Exception:
+      pass
+
+    return ret
+
 update_abstractmethods(CarInterface)
