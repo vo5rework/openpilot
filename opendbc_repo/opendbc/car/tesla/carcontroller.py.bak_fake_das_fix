@@ -9,10 +9,8 @@ from opendbc.car.tesla.values import CarControllerParams, CANBUS, LEGACY_CARS, C
 from opendbc.car.common.conversions import Conversions as CV
 from opendbc.car.vehicle_model import VehicleModel
 from openpilot.common.params import Params
-try:
-  from opendbc.car.tesla.teslacan import create_fake_das_msg as _create_fake_das
-except ImportError:
-  from opendbc.car.tesla.teslacan import create_fake_das_message as _create_fake_das
+from opendbc.car.tesla.teslacan import create_fake_das_msg
+
 
 def get_safety_CP():
   # We use the TESLA_MODEL_Y platform for lateral limiting to match safety
@@ -117,7 +115,7 @@ class CarController(CarControllerBase):
 
     if ((self.frame % 10) == 0) or stalk_main_edge or stalk_cancel_edge:
       for bus in (CANBUS.party, CANBUS.party + 4):
-        can_sends.append(self._action_can._create_fake_das(
+        can_sends.append(self._action_can.create_fake_das_msg(
           self._cached_pedal_enabled,
           self._cached_autopilot_disabled,
           bus=bus,
@@ -217,7 +215,7 @@ class CarController(CarControllerBase):
       pedal_en = False
     if ((self.frame % 10) == 0) or stalk_main_edge or stalk_cancel_edge:
       for bus in (0, 4):
-        can_sends.append(_create_fake_das(pedal_en, ap_disabled, bus,
+        can_sends.append(create_fake_das_msg(pedal_en, ap_disabled, bus,
                                        stalk_main=stalk_main_edge,
                                        stalk_cancel=stalk_cancel_edge))
     return new_actuators, can_sends

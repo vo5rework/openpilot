@@ -9,10 +9,7 @@ from opendbc.car.tesla.values import CarControllerParams, CANBUS, LEGACY_CARS, C
 from opendbc.car.common.conversions import Conversions as CV
 from opendbc.car.vehicle_model import VehicleModel
 from openpilot.common.params import Params
-try:
-  from opendbc.car.tesla.teslacan import create_fake_das_msg as _create_fake_das
-except ImportError:
-  from opendbc.car.tesla.teslacan import create_fake_das_message as _create_fake_das
+
 
 def get_safety_CP():
   # We use the TESLA_MODEL_Y platform for lateral limiting to match safety
@@ -117,7 +114,7 @@ class CarController(CarControllerBase):
 
     if ((self.frame % 10) == 0) or stalk_main_edge or stalk_cancel_edge:
       for bus in (CANBUS.party, CANBUS.party + 4):
-        can_sends.append(self._action_can._create_fake_das(
+        can_sends.append(self._action_can.create_fake_das_msg(
           self._cached_pedal_enabled,
           self._cached_autopilot_disabled,
           bus=bus,
@@ -200,24 +197,4 @@ class CarController(CarControllerBase):
     new_actuators.steeringAngleDeg = self.apply_angle_last
 
     self.frame += 1
-
-    # Dual-panda carrier: send internal 0x659 to bus 0 and bus 4.
-    # Prevents controlsAllowed mismatch when only one panda sees STW_ACTN_RQ (0x45).
-    stalk_btn = int(getattr(CS, 'cruise_buttons', 0))
-    prev_btn = int(getattr(self, '_prev_cruise_buttons', 0))
-    stalk_main_edge = (stalk_btn == 2) and (prev_btn != 2)
-    stalk_cancel_edge = (stalk_btn == 1) and (prev_btn != 1)
-    self._prev_cruise_buttons = stalk_btn
-    try:
-      from openpilot.common.params import Params
-      ap_disabled = Params().get_bool('TinklaAutopilotDisabled')
-      pedal_en = Params().get_bool('TinklaPedalEnabled')
-    except Exception:
-      ap_disabled = True
-      pedal_en = False
-    if ((self.frame % 10) == 0) or stalk_main_edge or stalk_cancel_edge:
-      for bus in (0, 4):
-        can_sends.append(_create_fake_das(pedal_en, ap_disabled, bus,
-                                       stalk_main=stalk_main_edge,
-                                       stalk_cancel=stalk_cancel_edge))
     return new_actuators, can_sends
