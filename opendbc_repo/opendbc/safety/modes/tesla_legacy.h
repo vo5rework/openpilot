@@ -3,12 +3,10 @@
 #include "opendbc/safety/safety_declarations.h"
 
 static bool tesla_external_panda = false;
-
-// --- Unity parity controlsAllowed latch (v18) ---
-#define UNITY_PARITY_CONTROLS_ALLOWED_V18 1
-static bool tesla_legacy_op_autopilot_disabled = false;  // set via fake DAS msg 0x659
-static bool tesla_legacy_op_cruise_enabled = false;      // MAIN/CANCEL latch from 0x45 when autopilot_disabled
-static uint8_t tesla_legacy_last_ap_lever_position __attribute__((unused)) = 0U;
+static bool tesla_legacy_op_autopilot_disabled = false;  // set via fake DAS msg 0x659 (Unity parity)
+static bool tesla_legacy_op_pedal_enabled = false;       // set via fake DAS msg 0x659 (Unity parity)
+static bool tesla_legacy_use_stalk_controls_allowed = false;  // opt-in via safetyParam bit
+// UNITY_PARITY_CONTROLS_ALLOWED_V18
 static bool tesla_hw1 = false;
 static bool tesla_hw2 = false;
 static bool tesla_hw3 = false;
@@ -25,12 +23,8 @@ static bool tesla_legacy_stock_lkas = false;
 static bool tesla_legacy_stock_lkas_prev = false;
 
 static void tesla_legacy_rx_hook(const CANPacket_t *msg) {
-  // UNITY_V18_RX_0x45: Unity parity stalk latch (0x45) when AP-disabled is active
-  if ((msg->addr == 0x45U) && tesla_legacy_op_autopilot_disabled) {
-    const int ap_lever_position = (int)(msg->data[0] & 0x3FU);  // 2=MAIN(enable), 1=CANCEL
-    if (ap_lever_position == 2) { tesla_legacy_op_cruise_enabled = true; }
-    else if (ap_lever_position == 1) { tesla_legacy_op_cruise_enabled = false; }
-  }
+  const bool has_ap_hardware = tesla_hw1 || tesla_hw2 || tesla_hw3;
+  const bool use_stalk_for_controls_allowed = tesla_legacy_use_stalk_controls_allowed || (!has_ap_hardware) || tesla_legacy_op_autopilot_disabled;
 
 
   // Steering angle: (0.1 * val) - 819.2 in deg.
@@ -64,6 +58,20 @@ static void tesla_legacy_rx_hook(const CANPacket_t *msg) {
     brake_pressed = (((msg->data[0] & 0x0CU) >> 2) != 1U);
   }
 
+  // Unity parity: when Tesla AP is disabled, controlsAllowed is latched by the real stalk (STW_ACTN_RQ)
+  // ap_lever_position: byte0[5:0], 2=pull forward (MAIN), 1=push back (CANCEL)
+  if (((msg->bus == 0U) || (msg->bus == 2U)) && (msg->addr == 0x45U) && use_stalk_for_controls_allowed) {
+    const int ap_lever_position = (int)(GET_BYTES(msg, 0U, 1U) & 0x3FU);
+    if (ap_lever_position == 2) {
+      controls_allowed = true;
+      cruise_engaged_prev = true;
+    } else if (ap_lever_position == 1) {
+      controls_allowed = false;
+      cruise_engaged_prev = false;
+    }
+  }
+
+
   // Cruise
   if (((tesla_external_panda) && (msg->bus == 0U) && (msg->addr == 0x256U)) ||
      ((!tesla_external_panda) && (msg->bus == chassis_bus) && (msg->addr == 0x368U))) {
@@ -75,8 +83,14 @@ static void tesla_legacy_rx_hook(const CANPacket_t *msg) {
                             (cruise_state == 6) ||  // PRE_FAULT
                             (cruise_state == 7);    // PRE_CANCEL
       vehicle_moving = cruise_state != 3; // STANDSTILL
-      pcm_cruise_check(cruise_engaged || tesla_legacy_op_cruise_enabled);
+      if (!tesla_legacy_op_autopilot_disabled) {
+        if (!use_stalk_for_controls_allowed) {
+
+          pcm_cruise_check(cruise_engaged);
+
+        }
 }
+   }
 
   if (msg->bus == 2U) {
     // DAS_control
@@ -104,10 +118,13 @@ static void tesla_legacy_rx_hook(const CANPacket_t *msg) {
 
 
 static bool tesla_legacy_tx_hook(const CANPacket_t *msg) {
-  // UNITY_V18_TX_0x659: Unity parity fake DAS status (0x659) => AP-disabled flag for stalk-latched engagement
+  // UNITY_PARITY_0x659_PEDAL_ENABLED_V19
+  // Fake DAS message used by Unity to pass mode bits to safety; never forward to the car.
   if (msg->addr == 0x659U) {
-    tesla_legacy_op_autopilot_disabled = ((msg->data[5] & 0x80U) != 0U);
-    if (!tesla_legacy_op_autopilot_disabled) { tesla_legacy_op_cruise_enabled = false; }
+    const uint8_t b5 = (uint8_t)GET_BYTES(msg, 5U, 1U);
+    tesla_legacy_op_autopilot_disabled = (b5 & 0x80U) != 0U;  // bit7
+    tesla_legacy_op_pedal_enabled = (b5 & 0x20U) != 0U;       // bit5
+    return false;
   }
 
   const AngleSteeringLimits TESLA_STEERING_LIMITS = {
@@ -217,6 +234,7 @@ static safety_config tesla_legacy_init(uint16_t param) {
   const int TESLA_FLAG_HW1 = 4;
   const int TESLA_FLAG_HW2 = 8;
   const int TESLA_FLAG_HW3 = 16;
+  const int TESLA_FLAG_OP_STALK_ENABLE = 32;
 
   // Extract flags
   tesla_external_panda = GET_FLAG(param, TESLA_FLAG_EXTERNAL_PANDA);
@@ -228,6 +246,7 @@ static safety_config tesla_legacy_init(uint16_t param) {
   tesla_legacy_stock_aeb = false;
   tesla_legacy_stock_lkas = false;
   tesla_legacy_stock_lkas_prev = false;
+
   chassis_bus = 0U;
   di_torque1_msg = 0x106U;
 
@@ -236,25 +255,26 @@ static safety_config tesla_legacy_init(uint16_t param) {
 
   // Define message arrays (keeping them as is)
   static const CanMsg TESLA_TX_LEGACY_MSGS[] = {
+  {0x659, 0, 8, .check_relay = false, .disable_static_blocking = true},  // openpilot->panda state (Unity parity)
     {0x488, 0, 4, .check_relay = true, .disable_static_blocking = true},  // DAS_steeringControl
     {0x27D, 0, 3, .check_relay = true, .disable_static_blocking = true},  // APS_eacMonitor
-    {0x45, 0, 8, .check_relay = true, .disable_static_blocking = true},  // STW_ACTN_RQ (virtual stalk)
-  {0x659, 0, 8, .check_relay = true, .disable_static_blocking = true}, // fake DAS status (AutopilotDisabled)
-};
+  };
 
   static const CanMsg TESLA_LEGACY_PT_MSGS[] = {
+    {0x659, 0, 8, .check_relay = false, .disable_static_blocking = true},  // openpilot->panda state (Unity parity)
     {0x2bf, 0, 8, .check_relay = true, .disable_static_blocking = true},  // DAS_control
-    {0x45, 0, 8, .check_relay = true, .disable_static_blocking = true},  // STW_ACTN_RQ (virtual stalk)
-  {0x659, 0, 8, .check_relay = true, .disable_static_blocking = true}, // fake DAS status (AutopilotDisabled)
-};
+  };
 
   static const CanMsg TESLA_TX_LEGACY_HW1_MSGS[] = {
+  {0x659, 0, 8, .check_relay = false, .disable_static_blocking = true},  // openpilot->panda state (Unity parity)
     {0x488, 0, 4, .check_relay = true, .disable_static_blocking = true},  // DAS_steeringControl
     {0x2b9, 0, 8, .check_relay = true, .disable_static_blocking = true},  // DAS_control
   };
 
   // Define RX check arrays (keeping them as is)
   static RxCheck tesla_legacy_pt_rx_checks[] = {
+    {.msg = {{0x45, 0, 8, 10U, .ignore_quality_flag = true, .ignore_checksum = true, .ignore_counter = true}, { 0 }, { 0 }}},   // STW_ACTN_RQ (stalk)
+    {.msg = {{0x45, 2, 8, 10U, .ignore_quality_flag = true, .ignore_checksum = true, .ignore_counter = true}, { 0 }, { 0 }}},   // STW_ACTN_RQ (stalk bus2)
     {.msg = {{0x106, 0, 8, 100U, .ignore_quality_flag = true, .ignore_checksum = true, .ignore_counter = true}, { 0 }, { 0 }}},  // DI_torque1
     {.msg = {{0x1f8, 0, 8, 50U, .ignore_quality_flag = true, .ignore_checksum = true, .ignore_counter = true}, { 0 }, { 0 }}},   // BrakeMessage
     {.msg = {{0x2bf, 2, 8, 25U, .ignore_quality_flag = true, .ignore_checksum = true, .ignore_counter = true}, { 0 }, { 0 }}},   // DAS_control
@@ -262,6 +282,8 @@ static safety_config tesla_legacy_init(uint16_t param) {
   };
 
   static RxCheck tesla_legacy_hw1_rx_checks[] = {
+    {.msg = {{0x45, 0, 8, 10U, .ignore_quality_flag = true, .ignore_checksum = true, .ignore_counter = true}, { 0 }, { 0 }}},   // STW_ACTN_RQ (stalk)
+    {.msg = {{0x45, 2, 8, 10U, .ignore_quality_flag = true, .ignore_checksum = true, .ignore_counter = true}, { 0 }, { 0 }}},   // STW_ACTN_RQ (stalk bus2)
     {.msg = {{0x108, 0, 8, 100U, .ignore_quality_flag = true, .ignore_checksum = true, .ignore_counter = true}, { 0 }, { 0 }}},  // DI_torque1
     {.msg = {{0x2b9, 2, 8, 25U, .ignore_quality_flag = true, .ignore_checksum = true, .ignore_counter = true}, { 0 }, { 0 }}},   // DAS_control
     {.msg = {{0x370, 0, 8, 25U, .ignore_quality_flag = true, .ignore_checksum = true, .ignore_counter = true}, { 0 }, { 0 }}},   // EPAS_sysStatus (25hz)
@@ -272,6 +294,8 @@ static safety_config tesla_legacy_init(uint16_t param) {
   };
 
   static RxCheck tesla_legacy_hw2_rx_checks[] = {
+    {.msg = {{0x45, 0, 8, 10U, .ignore_quality_flag = true, .ignore_checksum = true, .ignore_counter = true}, { 0 }, { 0 }}},   // STW_ACTN_RQ (stalk)
+    {.msg = {{0x45, 2, 8, 10U, .ignore_quality_flag = true, .ignore_checksum = true, .ignore_counter = true}, { 0 }, { 0 }}},   // STW_ACTN_RQ (stalk bus2)
     {.msg = {{0x370, 0, 8, 25U, .ignore_quality_flag = true, .ignore_checksum = true, .ignore_counter = true}, { 0 }, { 0 }}},   // EPAS_sysStatus (25hz)
     {.msg = {{0x155, 0, 8, 50U, .ignore_quality_flag = true, .ignore_checksum = true, .ignore_counter = true}, { 0 }, { 0 }}},   // ESP_private1
     {.msg = {{0x20a, 0, 8, 50U, .ignore_quality_flag = true, .ignore_checksum = true, .ignore_counter = true}, { 0 }, { 0 }}},   // BrakeMessage
@@ -280,6 +304,8 @@ static safety_config tesla_legacy_init(uint16_t param) {
   };
 
   static RxCheck tesla_legacy_hw3_rx_checks[] = {
+    {.msg = {{0x45, 0, 8, 10U, .ignore_quality_flag = true, .ignore_checksum = true, .ignore_counter = true}, { 0 }, { 0 }}},   // STW_ACTN_RQ (stalk)
+    {.msg = {{0x45, 2, 8, 10U, .ignore_quality_flag = true, .ignore_checksum = true, .ignore_counter = true}, { 0 }, { 0 }}},   // STW_ACTN_RQ (stalk bus2)
     {.msg = {{0x370, 0, 8, 100U, .ignore_quality_flag = true, .ignore_checksum = true, .ignore_counter = true}, { 0 }, { 0 }}},   // EPAS_sysStatus (100hz)
     {.msg = {{0x155, 1, 8, 50U, .ignore_quality_flag = true, .ignore_checksum = true, .ignore_counter = true}, { 0 }, { 0 }}},   // ESP_private1
     {.msg = {{0x20a, 1, 8, 50U, .ignore_quality_flag = true, .ignore_checksum = true, .ignore_counter = true}, { 0 }, { 0 }}},   // BrakeMessage

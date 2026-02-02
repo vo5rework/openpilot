@@ -1,14 +1,13 @@
-import numpy as np
+#import numpy as np
 from opendbc.can import CANPacker
 from opendbc.car import Bus
-from opendbc.car.lateral import apply_steer_angle_limits_vm
+from opendbc.car.lateral import apply_std_steer_angle_limits
 from opendbc.car.interfaces import CarControllerBase
 from opendbc.car.tesla.teslacan import TeslaCAN
 from opendbc.car.tesla.teslacan_legacy import TeslaCANRaven
 from opendbc.car.tesla.values import CarControllerParams, CANBUS, LEGACY_CARS, CAR, CruiseButtons
 from opendbc.car.common.conversions import Conversions as CV
 from opendbc.car.vehicle_model import VehicleModel
-from opendbc.car.lateral import apply_steer_angle_limits_vm
 from openpilot.common.params import Params
 
 
@@ -18,13 +17,6 @@ def get_safety_CP():
   from opendbc.car.tesla.interface import CarInterface
   return CarInterface.get_non_essential_params("TESLA_MODEL_Y")
 
-
-
-def _safe_get_bool(params, key: str, default: bool = False) -> bool:
-  try:
-    return bool(params.get_bool(key))
-  except Exception:
-    return default
 
 class CarController(CarControllerBase):
   def __init__(self, dbc_names, CP):
@@ -109,12 +101,13 @@ class CarController(CarControllerBase):
     if (self.frame - self._params_last_read_frame) >= 50:
       self._params_last_read_frame = self.frame
       # Keys vary across forks; try the common ones
-      self._cached_autopilot_disabled = bool(_safe_get_bool(self._params, "TinklaAutopilotDisabled"))
-      self._cached_pedal_enabled = bool(_safe_get_bool(self._params, "TinklaPedalEnabled") or _safe_get_bool(self._params, "PedalEnabled"))
+      self._cached_autopilot_disabled = bool(self._params.get_bool("TinklaAutopilotDisabled"))
+      self._cached_pedal_enabled = bool(self._params.get_bool("TinklaPedalEnabled") or self._params.get_bool("PedalEnabled"))
 
     # Send fake DAS msg at 10Hz (consumed by panda safety, blocked from hitting the car)
     if (self.frame % 10) == 0:
       can_sends.append(self._action_can.create_fake_das_msg(self._cached_pedal_enabled, self._cached_autopilot_disabled, CANBUS.party))
+      can_sends.append(self._action_can.create_fake_das_msg(self._cached_pedal_enabled, self._cached_autopilot_disabled, CANBUS.party + 4))
 
     # Tesla EPS enforces disabling steering on heavy lateral override force.
     # When enabling in a tight curve, we wait until user reduces steering force to start steering.
@@ -123,7 +116,7 @@ class CarController(CarControllerBase):
     lat_active = CC.latActive and (not bool(getattr(CS, 'human_control', False))) and (not CS.out.cruiseState.standstill)
     if self.frame % 2 == 0:
       # Angular rate limit based on speed
-      self.apply_angle_last = apply_steer_angle_limits_vm(actuators.steeringAngleDeg, self.apply_angle_last, CS.out.vEgoRaw, CS.out.steeringAngleDeg,
+      self.apply_angle_last = apply_std_steer_angle_limits(actuators.steeringAngleDeg, self.apply_angle_last, CS.out.vEgoRaw, CS.out.steeringAngleDeg,
                                                           lat_active, CarControllerParams, self.VM)
       if lat_active:
         # Unity C3 parity: prevent EPS faults from large instantaneous angle steps
@@ -192,3 +185,4 @@ class CarController(CarControllerBase):
 
     self.frame += 1
     return new_actuators, can_sends
+

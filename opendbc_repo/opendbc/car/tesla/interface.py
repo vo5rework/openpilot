@@ -4,6 +4,7 @@ from opendbc.car.tesla.carcontroller import CarController
 from opendbc.car.tesla.carstate import CarState
 from opendbc.car.tesla.values import TeslaSafetyFlags, CAR, TeslaLegacyParams, LEGACY_CARS
 from opendbc.car.tesla.radar_interface import RadarInterface
+from common.params import Params
 
 
 class CarInterface(CarInterfaceBase):
@@ -31,6 +32,10 @@ class CarInterface(CarInterfaceBase):
     if alpha_long:
       ret.openpilotLongitudinalControl = True
       ret.safetyConfigs[0].safetyParam |= TeslaSafetyFlags.LONG_CONTROL.value
+
+    if Params().get_bool("TinklaAutopilotDisabled"):
+      for sc in ret.safetyConfigs:
+        sc.safetyParam |= TeslaSafetyFlags.OP_STALK_ENABLE.value
 
       ret.vEgoStopping = 0.1
       ret.vEgoStarting = 0.1

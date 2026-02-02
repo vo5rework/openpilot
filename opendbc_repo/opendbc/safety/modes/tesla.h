@@ -3,6 +3,8 @@
 #include "opendbc/safety/safety_declarations.h"
 
 static bool tesla_longitudinal = false;
+static bool tesla_op_autopilot_disabled = false;  // openpilot->panda state (Unity parity)
+static bool tesla_op_pedal_enabled = false;       // openpilot->panda state (Unity parity)
 static bool tesla_stock_aeb = false;
 
 // Only rising edges while controls are not allowed are considered for these systems:
@@ -132,6 +134,18 @@ static void tesla_rx_hook(const CANPacket_t *msg) {
       brake_pressed = ((msg->data[3] & 0x60U) >> 5) == 2U;
     }
 
+    // Unity parity: when Tesla AP is disabled, controlsAllowed is latched by the real stalk (STW_ACTN_RQ)
+    // ap_lever_position: byte0[5:0], 2=pull forward (MAIN), 1=push back (CANCEL)
+    if ((msg->addr == 0x45U) && tesla_op_autopilot_disabled) {
+      const int ap_lever_position = (int)(GET_BYTES(msg, 0U, 1U) & 0x3FU);
+      if (ap_lever_position == 2) {
+        pcm_cruise_check(true);
+      } else if (ap_lever_position == 1) {
+        pcm_cruise_check(false);
+      } else {
+      }
+    }
+
     // Cruise and Autopark/Summon state
     if (msg->addr == 0x286U) {
       // Autopark state
@@ -159,7 +173,9 @@ static void tesla_rx_hook(const CANPacket_t *msg) {
       cruise_engaged = cruise_engaged && !tesla_autopark;
 
       vehicle_moving = cruise_state != 3; // STANDSTILL
-      pcm_cruise_check(cruise_engaged);
+      if (!tesla_op_autopilot_disabled) {
+        pcm_cruise_check(cruise_engaged);
+      }
     }
   }
 
@@ -189,6 +205,14 @@ static void tesla_rx_hook(const CANPacket_t *msg) {
 
 
 static bool tesla_tx_hook(const CANPacket_t *msg) {
+  // Fake DAS message used to pass mode bits to safety; never forward to the car.
+  if (msg->addr == 0x659U) {
+    const uint8_t b5 = (uint8_t)GET_BYTES(msg, 5U, 1U);
+    tesla_op_autopilot_disabled = (b5 & 0x80U) != 0U;  // bit7
+    tesla_op_pedal_enabled = (b5 & 0x20U) != 0U;       // bit5
+    return false;
+  }
+
   const AngleSteeringLimits TESLA_STEERING_LIMITS = {
     .max_angle = 3600,  // 360 deg, EPAS faults above this
     .angle_deg_to_can = 10,
@@ -317,12 +341,14 @@ static safety_config tesla_init(uint16_t param) {
     {0x488, 0, 4, .check_relay = true, .disable_static_blocking = true},   // DAS_steeringControl
     {0x2b9, 0, 8, .check_relay = false},                                   // DAS_control (for cancel)
     {0x27D, 0, 3, .check_relay = true, .disable_static_blocking = true},   // APS_eacMonitor
+    {0x659, 0, 8, .check_relay = false, .disable_static_blocking = true},  // openpilot->panda state (Unity parity)
   };
 
   static const CanMsg TESLA_M3_Y_LONG_TX_MSGS[] = {
     {0x488, 0, 4, .check_relay = true, .disable_static_blocking = true},  // DAS_steeringControl
     {0x2b9, 0, 8, .check_relay = true, .disable_static_blocking = true},  // DAS_control
     {0x27D, 0, 3, .check_relay = true, .disable_static_blocking = true},  // APS_eacMonitor
+    {0x659, 0, 8, .check_relay = false, .disable_static_blocking = true}, // openpilot->panda state (Unity parity)
   };
 
   UNUSED(param);
@@ -334,6 +360,8 @@ static safety_config tesla_init(uint16_t param) {
   tesla_stock_aeb = false;
   tesla_stock_lkas = false;
   tesla_stock_lkas_prev = false;
+  tesla_op_autopilot_disabled = false;
+  tesla_op_pedal_enabled = false;
   // we need to assume Autopark/Summon on startup since DI_state is a low freq msg.
   // this is so that we don't fault if starting while these systems are active
   tesla_autopark = true;
