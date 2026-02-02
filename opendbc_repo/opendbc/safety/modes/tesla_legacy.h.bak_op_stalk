@@ -5,7 +5,6 @@
 static bool tesla_external_panda = false;
 static bool tesla_legacy_op_autopilot_disabled = false;  // set via fake DAS msg 0x659 (Unity parity)
 static bool tesla_legacy_op_pedal_enabled = false;       // set via fake DAS msg 0x659 (Unity parity)
-static bool tesla_legacy_op_stalk_enable = false;      // safetyParam bit (Unity stalk contract)
 static bool tesla_legacy_use_stalk_controls_allowed = false;  // opt-in via safetyParam bit
 // UNITY_PARITY_CONTROLS_ALLOWED_V18
 static bool tesla_hw1 = false;
@@ -25,7 +24,7 @@ static bool tesla_legacy_stock_lkas_prev = false;
 
 static void tesla_legacy_rx_hook(const CANPacket_t *msg) {
   const bool has_ap_hardware = tesla_hw1 || tesla_hw2 || tesla_hw3;
-  const bool use_stalk_for_controls_allowed = tesla_legacy_op_stalk_enable || (tesla_legacy_use_stalk_controls_allowed || (!has_ap_hardware) || tesla_legacy_op_autopilot_disabled);
+  const bool use_stalk_for_controls_allowed = tesla_legacy_use_stalk_controls_allowed || (!has_ap_hardware) || tesla_legacy_op_autopilot_disabled;
 
 
   // Steering angle: (0.1 * val) - 819.2 in deg.
@@ -236,8 +235,6 @@ static safety_config tesla_legacy_init(uint16_t param) {
   const int TESLA_FLAG_HW2 = 8;
   const int TESLA_FLAG_HW3 = 16;
   const int TESLA_FLAG_OP_STALK_ENABLE = 32;
-
-  tesla_legacy_op_stalk_enable = GET_FLAG(param, TESLA_FLAG_OP_STALK_ENABLE);
 
   // Extract flags
   tesla_external_panda = GET_FLAG(param, TESLA_FLAG_EXTERNAL_PANDA);

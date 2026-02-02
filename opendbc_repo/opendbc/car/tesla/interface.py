@@ -4,7 +4,7 @@ from opendbc.car.tesla.carcontroller import CarController
 from opendbc.car.tesla.carstate import CarState
 from opendbc.car.tesla.values import TeslaSafetyFlags, CAR, TeslaLegacyParams, LEGACY_CARS
 from opendbc.car.tesla.radar_interface import RadarInterface
-from common.params import Params
+from openpilot.common.params import Params
 
 
 class CarInterface(CarInterfaceBase):
@@ -21,6 +21,11 @@ class CarInterface(CarInterfaceBase):
 
     ret.safetyConfigs = [get_safety_config(structs.CarParams.SafetyModel.tesla)]
 
+    # Unity parity: enable stalk->controlsAllowed contract via safetyParam bit
+    if Params().get_bool("TinklaAutopilotDisabled"):
+      for cfg in ret.safetyConfigs:
+        cfg.safetyParam |= int(TeslaSafetyFlags.OP_STALK_ENABLE)
+
     ret.steerLimitTimer = 0.4
     ret.steerActuatorDelay = 0.1
     ret.steerAtStandstill = True
@@ -32,10 +37,6 @@ class CarInterface(CarInterfaceBase):
     if alpha_long:
       ret.openpilotLongitudinalControl = True
       ret.safetyConfigs[0].safetyParam |= TeslaSafetyFlags.LONG_CONTROL.value
-
-    if Params().get_bool("TinklaAutopilotDisabled"):
-      for sc in ret.safetyConfigs:
-        sc.safetyParam |= TeslaSafetyFlags.OP_STALK_ENABLE.value
 
       ret.vEgoStopping = 0.1
       ret.vEgoStarting = 0.1
@@ -64,6 +65,11 @@ class CarInterface(CarInterfaceBase):
         get_safety_config(structs.CarParams.SafetyModel.teslaLegacy, int(TeslaSafetyFlags.FLAG_HW3)),
         get_safety_config(structs.CarParams.SafetyModel.teslaLegacy, int(TeslaSafetyFlags.FLAG_HW3 | TeslaSafetyFlags.FLAG_EXTERNAL_PANDA)),
       ]
+
+    # Unity parity: enable stalk->controlsAllowed contract via safetyParam bit
+    if Params().get_bool("TinklaAutopilotDisabled"):
+      for cfg in ret.safetyConfigs:
+        cfg.safetyParam |= int(TeslaSafetyFlags.OP_STALK_ENABLE)
 
     ret.steerLimitTimer = 0.4
     ret.steerActuatorDelay = 0.1
