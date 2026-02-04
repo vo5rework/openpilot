@@ -102,12 +102,6 @@ class CarController(CarControllerBase):
     actuators = CC.actuators
     can_sends = []
 
-    # UNITY_PARITY_0x659_FROM_MSG_STW
-    stw = getattr(CS, 'msg_stw_actn_req', None) or {}
-    lever = int(stw.get('SpdCtrlLvr_Stat', getattr(CS, 'cruise_buttons', 0) or 0))
-    stalk_main = (lever == 2)
-    stalk_cancel = (lever == 1)
-
     # Refresh params occasionally (avoid hammering paramfs)
     if (self.frame - self._params_last_read_frame) >= 50:
       self._params_last_read_frame = self.frame
@@ -140,7 +134,7 @@ class CarController(CarControllerBase):
     if self.frame % 2 == 0:
       # Angular rate limit based on speed
       self.apply_angle_last = apply_std_steer_angle_limits(actuators.steeringAngleDeg, self.apply_angle_last, CS.out.vEgoRaw, CS.out.steeringAngleDeg,
-                                                          lat_active, CarControllerParams.ANGLE_LIMITS)
+                                                          lat_active, CarControllerParams, self.VM)
       if lat_active:
         # Unity C3 parity: prevent EPS faults from large instantaneous angle steps
         self.apply_angle_last = float(np.clip(self.apply_angle_last, CS.out.steeringAngleDeg - 20.0, CS.out.steeringAngleDeg + 20.0))
@@ -242,22 +236,4 @@ class CarController(CarControllerBase):
                                        stalk_main=main_edge,
                                        stalk_cancel=cancel_edge,
                                        bus=bus))
-
-    # UNITY_PARITY_0x659_CARRIER_NOPARAMS: internal carrier for panda safety (no multi-publisher daemon)
-    # pedal_enabled removed (pre-AP feature): always False
-    # autopilot_disabled forced True (lateral-only)
-    stalk_btn = int(getattr(CS, "cruise_buttons", 0))
-    prev_btn = int(getattr(self, "_prev_cruise_buttons", 0))
-    main_edge = (stalk_btn == 2) and (prev_btn != 2)
-    cancel_edge = (stalk_btn == 1) and (prev_btn != 1)
-    self._prev_cruise_buttons = stalk_btn
-
-    ap_disabled = True
-    pedal_en = False
-
-    if ((self.frame % 10) == 0) or main_edge or cancel_edge:
-      for bus in (0, 4):
-        can_sends.append(_create_fake_das(pedal_en, ap_disabled, bus,
-                                             stalk_main=main_edge,
-                                             stalk_cancel=cancel_edge))
     return new_actuators, can_sends

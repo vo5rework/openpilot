@@ -102,12 +102,6 @@ class CarController(CarControllerBase):
     actuators = CC.actuators
     can_sends = []
 
-    # UNITY_PARITY_0x659_FROM_MSG_STW
-    stw = getattr(CS, 'msg_stw_actn_req', None) or {}
-    lever = int(stw.get('SpdCtrlLvr_Stat', getattr(CS, 'cruise_buttons', 0) or 0))
-    stalk_main = (lever == 2)
-    stalk_cancel = (lever == 1)
-
     # Refresh params occasionally (avoid hammering paramfs)
     if (self.frame - self._params_last_read_frame) >= 50:
       self._params_last_read_frame = self.frame

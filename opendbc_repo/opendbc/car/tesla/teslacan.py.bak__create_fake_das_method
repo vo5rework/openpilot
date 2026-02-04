@@ -43,12 +43,6 @@ def create_fake_das_message(pedal_enabled: bool,
                              stalk_main=stalk_main, stalk_cancel=stalk_cancel)
 
 class TeslaCAN:
-  def _create_fake_das(self, pedal_enabled: bool, autopilot_disabled: bool, bus: int,
-                       stalk_main: bool = False, stalk_cancel: bool = False):
-    """Compatibility wrapper expected by some Tesla controller forks."""
-    return create_fake_das_msg(pedal_enabled, autopilot_disabled, bus,
-                               stalk_main=stalk_main, stalk_cancel=stalk_cancel)
-
   def __init__(self, packer):
     self.packer = packer
 

@@ -418,6 +418,32 @@ class CarState(CarStateBase):
     self.das_control = copy.copy(cp_ap_pt.vl["DAS_control"])
 
 
+    # UNITY_PARITY_CRUISE_BUTTONS_FROM_STALK_V2
+
+    btn = None
+
+    for msg_name in ("STW_ACTN_RQ", "STW_ACTN_REQ", "STW_ACTN"):
+
+      if msg_name in cp.vl:
+
+        vl = cp.vl[msg_name]
+
+        for sig in ("SpdCtrlLvr_Stat", "SpdCtrlLvr_StatRaw", "SpdCtrlLvrStat"):
+
+          if sig in vl:
+
+            btn = int(vl[sig])
+
+            break
+
+        if btn is not None:
+
+          break
+
+    if btn is not None:
+
+      self.cruise_buttons = btn
+
     return ret
 
 
