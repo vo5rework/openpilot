@@ -33,6 +33,7 @@ class CarController(CarControllerBase):
     self._prev_cruise_buttons = 0
     self.hands_on_level_limit = 3
     self.apply_angle_last = 0
+    self._angle_initialized = False
     self.packer = CANPacker(dbc_names[Bus.party])
     self.tesla_can = TeslaCAN(self.packer)
     # Legacy cruise stalk emulation uses tesla_can.dbc (not present in model3_party dbc)
@@ -137,6 +138,9 @@ class CarController(CarControllerBase):
     # Canceling is done on rising edge and is handled generically with CC.cruiseControl.cancel
     autopilot_disabled = bool(getattr(CS, 'autopilot_disabled', False))
     lat_active = CC.latActive and (not bool(getattr(CS, 'human_control', False))) and (not CS.out.cruiseState.standstill)
+    if not self._angle_initialized:
+      self.apply_angle_last = float(CS.out.steeringAngleDeg)
+      self._angle_initialized = True
     if self.frame % 2 == 0:
       # Angular rate limit based on speed
       self.apply_angle_last = apply_std_steer_angle_limits(actuators.steeringAngleDeg, self.apply_angle_last, CS.out.vEgoRaw, CS.out.steeringAngleDeg,
@@ -208,56 +212,5 @@ class CarController(CarControllerBase):
 
     self.frame += 1
 
-    # Dual-panda carrier: send internal 0x659 to bus 0 and bus 4.
-    # Prevents controlsAllowed mismatch when only one panda sees STW_ACTN_RQ (0x45).
-    stalk_btn = int(getattr(CS, 'cruise_buttons', 0))
-    prev_btn = int(getattr(self, '_prev_cruise_buttons', 0))
-    stalk_main_edge = (stalk_btn == 2) and (prev_btn != 2)
-    stalk_cancel_edge = (stalk_btn == 1) and (prev_btn != 1)
-    self._prev_cruise_buttons = stalk_btn
-    try:
-      from openpilot.common.params import Params
-      ap_disabled = Params().get_bool('TinklaAutopilotDisabled')
-      pedal_en = Params().get_bool('TinklaPedalEnabled')
-    except Exception:
-      ap_disabled = True
-      pedal_en = False
-    if ((self.frame % 10) == 0) or stalk_main_edge or stalk_cancel_edge:
-      for bus in (0, 4):
-        can_sends.append(_create_fake_das(pedal_en, ap_disabled, bus,
-                                       stalk_main=stalk_main_edge,
-                                       stalk_cancel=stalk_cancel_edge))
 
-    # OP_INTERNAL_0x659_CARRIER
-    stalk_btn = int(getattr(CS, 'cruise_buttons', 0))
-    prev_btn = int(getattr(self, '_op659_prev_btn', 0))
-    main_edge = (stalk_btn == 2) and (prev_btn != 2)
-    cancel_edge = (stalk_btn == 1) and (prev_btn != 1)
-    self._op659_prev_btn = stalk_btn
-    ap_disabled = Params().get_bool('TinklaAutopilotDisabled')
-    pedal_en = Params().get_bool('TinklaPedalEnabled')
-    if ((self.frame % 10) == 0) or main_edge or cancel_edge:
-      for bus in (CANBUS.party, CANBUS.party + 4):
-        can_sends.append(_create_fake_das(pedal_en, ap_disabled,
-                                       stalk_main=main_edge,
-                                       stalk_cancel=cancel_edge,
-                                       bus=bus))
-
-    # UNITY_PARITY_0x659_CARRIER_NOPARAMS: internal carrier for panda safety (no multi-publisher daemon)
-    # pedal_enabled removed (pre-AP feature): always False
-    # autopilot_disabled forced True (lateral-only)
-    stalk_btn = int(getattr(CS, "cruise_buttons", 0))
-    prev_btn = int(getattr(self, "_prev_cruise_buttons", 0))
-    main_edge = (stalk_btn == 2) and (prev_btn != 2)
-    cancel_edge = (stalk_btn == 1) and (prev_btn != 1)
-    self._prev_cruise_buttons = stalk_btn
-
-    ap_disabled = True
-    pedal_en = False
-
-    if ((self.frame % 10) == 0) or main_edge or cancel_edge:
-      for bus in (0, 4):
-        can_sends.append(_create_fake_das(pedal_en, ap_disabled, bus,
-                                             stalk_main=main_edge,
-                                             stalk_cancel=cancel_edge))
     return new_actuators, can_sends
