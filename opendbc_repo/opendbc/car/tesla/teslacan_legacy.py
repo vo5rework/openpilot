@@ -43,7 +43,7 @@ class TeslaCANRaven:
     }
 
     data = self.packers[CANBUS.powertrain].make_can_msg("DAS_control", CANBUS.powertrain, values)[1]
-    values["DAS_controlChecksum"] = self.checksum(0x2b9, data[:7])
+    values["DAS_controlChecksum"] = self.checksum(0x2BF, data[:7])
     return self.packers[CANBUS.powertrain].make_can_msg("DAS_control", CANBUS.powertrain, values)
 
   def create_steering_allowed(self, counter):

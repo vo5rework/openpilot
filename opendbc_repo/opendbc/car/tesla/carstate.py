@@ -174,9 +174,13 @@ class CarState(CarStateBase):
 
     stw = None
     for _cp in (can_parsers.get(Bus.party), can_parsers.get(Bus.chassis), can_parsers.get(Bus.pt)):
-      if _cp is not None and "STW_ACTN_RQ" in _cp.vl:
+      if _cp is None:
+        continue
+      try:
         stw = _cp.vl["STW_ACTN_RQ"]
         break
+      except KeyError:
+        continue
     if stw is not None:
       self.msg_stw_actn_req = copy.copy(stw)
       self.cruise_buttons = int(stw.get("SpdCtrlLvr_Stat", 0))
@@ -352,9 +356,13 @@ class CarState(CarStateBase):
 
     stw = None
     for _cp in (can_parsers.get(Bus.party), can_parsers.get(Bus.chassis), can_parsers.get(Bus.pt)):
-      if _cp is not None and "STW_ACTN_RQ" in _cp.vl:
+      if _cp is None:
+        continue
+      try:
         stw = _cp.vl["STW_ACTN_RQ"]
         break
+      except KeyError:
+        continue
     if stw is not None:
       self.msg_stw_actn_req = copy.copy(stw)
       self.cruise_buttons = int(stw.get("SpdCtrlLvr_Stat", 0))
@@ -362,6 +370,7 @@ class CarState(CarStateBase):
     else:
       self.cruise_buttons = 0
       self.turnSignalStalkState = 0
+
 
     if self.autopilot_disabled:
       if self.cruise_buttons == 2:  # MAIN
