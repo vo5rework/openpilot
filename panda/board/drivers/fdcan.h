@@ -199,27 +199,22 @@ void can_rx(uint8_t can_number) {
     can_set_checksum(&to_push);
 
     // forwarding (panda only)
-    int bus_fwd_num = safety_fwd_hook(bus_number, to_push.addr);
+    CANPacket_t to_send = to_push;
+    to_send.returned = 0U;
+    to_send.rejected = 0U;
+    int bus_fwd_num = safety_fwd_hook(bus_number, &to_send);
     if (bus_fwd_num < 0) {
       bus_fwd_num = bus_config[can_number].forwarding_bus;
-    }
-    if (bus_fwd_num != -1) {
-      CANPacket_t to_send;
-
-      to_send.fd = to_push.fd;
+      to_send = to_push;  // do not forward safety-mutated frame on fallback
       to_send.returned = 0U;
       to_send.rejected = 0U;
-      to_send.extended = to_push.extended;
-      to_send.addr = to_push.addr;
-      to_send.bus = to_push.bus;
-      to_send.data_len_code = to_push.data_len_code;
-      (void)memcpy(to_send.data, to_push.data, dlc_to_len[to_push.data_len_code]);
+    }
+    if (bus_fwd_num != -1) {
+      to_send.bus = (uint8_t)bus_fwd_num;
       can_set_checksum(&to_send);
-
-      can_send(&to_send, bus_fwd_num, true);
+      can_send(&to_send, (uint8_t)bus_fwd_num, true);
       can_health[can_number].total_fwd_cnt += 1U;
     }
-
     safety_rx_invalid += safety_rx_hook(&to_push) ? 0U : 1U;
     ignition_can_hook(&to_push);
 
@@ -254,14 +249,24 @@ static void FDCAN3_IT0_IRQ_Handler(void) { can_rx(2);  }
 static void FDCAN3_IT1_IRQ_Handler(void) { process_can(2); }
 
 bool can_init(uint8_t can_number) {
-  bool ret = false;
+  bool ret = true;
 
-  REGISTER_INTERRUPT(FDCAN1_IT0_IRQn, FDCAN1_IT0_IRQ_Handler, CAN_INTERRUPT_RATE, FAULT_INTERRUPT_RATE_CAN_1)
-  REGISTER_INTERRUPT(FDCAN1_IT1_IRQn, FDCAN1_IT1_IRQ_Handler, CAN_INTERRUPT_RATE, FAULT_INTERRUPT_RATE_CAN_1)
-  REGISTER_INTERRUPT(FDCAN2_IT0_IRQn, FDCAN2_IT0_IRQ_Handler, CAN_INTERRUPT_RATE, FAULT_INTERRUPT_RATE_CAN_2)
-  REGISTER_INTERRUPT(FDCAN2_IT1_IRQn, FDCAN2_IT1_IRQ_Handler, CAN_INTERRUPT_RATE, FAULT_INTERRUPT_RATE_CAN_2)
-  REGISTER_INTERRUPT(FDCAN3_IT0_IRQn, FDCAN3_IT0_IRQ_Handler, CAN_INTERRUPT_RATE, FAULT_INTERRUPT_RATE_CAN_3)
-  REGISTER_INTERRUPT(FDCAN3_IT1_IRQn, FDCAN3_IT1_IRQ_Handler, CAN_INTERRUPT_RATE, FAULT_INTERRUPT_RATE_CAN_3)
+  switch (can_number) {
+    case 0U:
+      REGISTER_INTERRUPT(FDCAN1_IT0_IRQn, FDCAN1_IT0_IRQ_Handler, CAN_INTERRUPT_RATE, FAULT_INTERRUPT_RATE_CAN_1)
+      REGISTER_INTERRUPT(FDCAN1_IT1_IRQn, FDCAN1_IT1_IRQ_Handler, CAN_INTERRUPT_RATE, FAULT_INTERRUPT_RATE_CAN_1)
+      break;
+    case 1U:
+      REGISTER_INTERRUPT(FDCAN2_IT0_IRQn, FDCAN2_IT0_IRQ_Handler, CAN_INTERRUPT_RATE, FAULT_INTERRUPT_RATE_CAN_2)
+      REGISTER_INTERRUPT(FDCAN2_IT1_IRQn, FDCAN2_IT1_IRQ_Handler, CAN_INTERRUPT_RATE, FAULT_INTERRUPT_RATE_CAN_2)
+      break;
+    case 2U:
+      REGISTER_INTERRUPT(FDCAN3_IT0_IRQn, FDCAN3_IT0_IRQ_Handler, CAN_INTERRUPT_RATE, FAULT_INTERRUPT_RATE_CAN_3)
+      REGISTER_INTERRUPT(FDCAN3_IT1_IRQn, FDCAN3_IT1_IRQ_Handler, CAN_INTERRUPT_RATE, FAULT_INTERRUPT_RATE_CAN_3)
+      break;
+    default:
+      break;
+  }
 
   if (can_number != 0xffU) {
     FDCAN_GlobalTypeDef *FDCANx = CANIF_FROM_CAN_NUM(can_number);

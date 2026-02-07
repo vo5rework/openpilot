@@ -1,8 +1,34 @@
+#pragma once
+
+#include "power_saving_declarations.h"
+
 extern int _app_start[0xc000]; // Only first 3 sectors of size 0x4000 are used
 
 // Prototypes
 void set_safety_mode(uint16_t mode, uint16_t param);
 bool is_car_safety_mode(uint16_t mode);
+
+
+// Map openpilot "bus number" (0/1/2) to board transceiver controls.
+// Panda python set_can_enable() uses bus numbers; board APIs use transceiver IDs (1..4).
+// Unity parity: bus1 can be either transceiver 2 or 4 depending on harness mode, so toggle both.
+static void set_can_enable_by_bus(uint8_t bus_num, bool enabled) {
+  switch (bus_num) {
+    case 0U:
+      current_board->enable_can_transceiver(1U, enabled);
+      break;
+    case 1U:
+      current_board->enable_can_transceiver(2U, enabled);
+      current_board->enable_can_transceiver(4U, enabled);
+      break;
+    case 2U:
+      current_board->enable_can_transceiver(3U, enabled);
+      break;
+    default:
+      break;
+  }
+}
+
 
 static int get_health_pkt(void *dat) {
   COMPILE_TIME_ASSERT(sizeof(struct health_t) <= USBPACKET_MAX_SIZE);
@@ -299,6 +325,10 @@ int comms_control_handler(ControlPacket_t *req, uint8_t *resp) {
         heartbeat_engaged = (req->param1 == 1U);
         break;
       }
+    // **** 0xf4: set CAN transceivers enabled by bus number
+    case 0xf4:
+      set_can_enable_by_bus((uint8_t)req->param1, req->param2 > 0U);
+      break;
     // **** 0xf6: set siren enabled
     case 0xf6:
       siren_enabled = (req->param1 != 0U);

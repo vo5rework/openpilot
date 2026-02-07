@@ -16,6 +16,14 @@ int pending_can_live = 0;
 int can_silent = ALL_CAN_SILENT;
 bool can_loopback = false;
 
+// Enabled CAN controllers bitmask by CAN number (0=CAN1,1=CAN2,2=CAN3).
+// Default: all controllers enabled.
+uint8_t can_controller_enable_mask = (uint8_t)((1U << PANDA_CAN_CNT) - 1U);
+
+void can_set_controller_enable_mask(uint8_t mask) {
+  can_controller_enable_mask = (uint8_t)(mask & ((1U << PANDA_CAN_CNT) - 1U));
+}
+
 // ********************* instantiate queues *********************
 #define can_buffer(x, size) \
   static CANPacket_t elems_##x[size]; \
@@ -143,7 +151,11 @@ void can_init_all(void) {
       bus_config[i].can_data_speed = 0U;
     #endif
     can_clear(can_queues[i]);
-    (void)can_init(i);
+
+    const bool enabled = (can_controller_enable_mask & (1U << i)) != 0U;
+    if (enabled) {
+      (void)can_init(i);
+    }
   }
 }
 

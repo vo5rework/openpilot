@@ -1,9 +1,15 @@
+#pragma once
+
+#include <stdbool.h>
+#include <stdint.h>
+
 #include "power_saving_declarations.h"
+
+// Defined here to ensure a single linkable symbol in unity-style builds.
+__attribute__((weak)) int power_save_status = POWER_SAVE_STATUS_DISABLED;
 
 // WARNING: To stay in compliance with the SIL2 rules laid out in STM UM1840, we should never implement any of the available hardware low power modes.
 // See rule: CoU_3
-
-int power_save_status = POWER_SAVE_STATUS_DISABLED;
 
 void enable_can_transceivers(bool enabled) {
   // Leave main CAN always on for CAN-based ignition detection

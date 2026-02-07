@@ -1,3 +1,8 @@
+#pragma once
+// Guard against accidental macro collision with STM32 TIM_TypeDef
+#ifdef TIM_TypeDef
+  #undef TIM_TypeDef
+#endif
 #include "stm32h7xx.h"
 #include "stm32h7xx_hal_gpio_ex.h"
 #define MCU_IDCODE 0x483U
@@ -31,12 +36,13 @@ separate IRQs for RX and TX.
 #define NUM_INTERRUPTS 163U
 
 #define TICK_TIMER_IRQ TIM8_BRK_TIM12_IRQn
-#define TICK_TIMER TIM12
 
-#define MICROSECOND_TIMER TIM2
+#define TICK_TIMER ((TIM_TypeDef *)TIM12_BASE)
+
+#define MICROSECOND_TIMER ((TIM_TypeDef *)TIM2_BASE)
 
 #define INTERRUPT_TIMER_IRQ TIM6_DAC_IRQn
-#define INTERRUPT_TIMER TIM6
+#define INTERRUPT_TIMER ((TIM_TypeDef *)TIM6_BASE)
 
 #define IND_WDG IWDG1
 

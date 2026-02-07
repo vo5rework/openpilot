@@ -18,9 +18,8 @@ static void black_enable_can_transceiver(uint8_t transceiver, bool enabled) {
       set_gpio_output(GPIOA, 0, !enabled);
       break;
     case 4U:
-      set_gpio_output(GPIOB, 10, !enabled);
-      break;
-    default:
+      set_gpio_output(GPIOB, 10, !enabled);    break;
+default:
       print("Invalid CAN transceiver ("); puth(transceiver); print("): enabling failed\n");
       break;
   }
@@ -36,6 +35,13 @@ static void black_set_can_mode(uint8_t mode) {
   switch (mode) {
     case CAN_MODE_NORMAL:
     case CAN_MODE_OBD_CAN2:
+    case CAN_MODE_DISABLED:
+      // Disable both CAN2 pin mappings (normal + OBD) and leave transceivers off.
+      set_gpio_mode(GPIOB, 5, MODE_INPUT);
+      set_gpio_mode(GPIOB, 6, MODE_INPUT);
+      set_gpio_mode(GPIOB, 12, MODE_INPUT);
+      set_gpio_mode(GPIOB, 13, MODE_INPUT);
+      if (mode == CAN_MODE_DISABLED) { break; }
       if ((bool)(mode == CAN_MODE_NORMAL) != (bool)(harness.status == HARNESS_STATUS_FLIPPED)) {
         // B12,B13: disable OBD mode
         set_gpio_mode(GPIOB, 12, MODE_INPUT);

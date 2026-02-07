@@ -1,3 +1,8 @@
+#pragma once
+// Guard against accidental macro collision with STM32 TIM_TypeDef
+#ifdef TIM_TypeDef
+  #undef TIM_TypeDef
+#endif
 #include "stm32f4xx.h"
 #include "stm32f4xx_hal_gpio_ex.h"
 #define MCU_IDCODE 0x463U
@@ -18,12 +23,13 @@
 #define NUM_INTERRUPTS 102U                // There are 102 external interrupt sources (see stm32f413.h)
 
 #define TICK_TIMER_IRQ TIM1_BRK_TIM9_IRQn
-#define TICK_TIMER TIM9
 
-#define MICROSECOND_TIMER TIM2
+#define TICK_TIMER ((TIM_TypeDef *)TIM9_BASE)
+
+#define MICROSECOND_TIMER ((TIM_TypeDef *)TIM2_BASE)
 
 #define INTERRUPT_TIMER_IRQ TIM6_DAC_IRQn
-#define INTERRUPT_TIMER TIM6
+#define INTERRUPT_TIMER ((TIM_TypeDef *)TIM6_BASE)
 
 #define IND_WDG IWDG
 

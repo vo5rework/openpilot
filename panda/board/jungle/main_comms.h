@@ -1,3 +1,23 @@
+
+// Map openpilot "bus number" (0/1/2) to board transceiver controls.
+// Unity parity: bus1 can be either transceiver 2 or 4 depending on harness mode, so toggle both.
+static void set_can_enable_by_bus(uint8_t bus_num, bool enabled) {
+  switch (bus_num) {
+    case 0U:
+      current_board->enable_can_transceiver(1U, enabled);
+      break;
+    case 1U:
+      current_board->enable_can_transceiver(2U, enabled);
+      current_board->enable_can_transceiver(4U, enabled);
+      break;
+    case 2U:
+      current_board->enable_can_transceiver(3U, enabled);
+      break;
+    default:
+      break;
+  }
+}
+
 extern int _app_start[0xc000]; // Only first 3 sectors of size 0x4000 are used
 
 bool generated_can_traffic = false;
@@ -221,7 +241,7 @@ int comms_control_handler(ControlPacket_t *req, uint8_t *resp) {
       break;
     // **** 0xf4: Set CAN transceiver enable pin
     case 0xf4:
-      current_board->enable_can_transceiver(req->param1, req->param2 > 0U);
+      set_can_enable_by_bus((uint8_t)req->param1, req->param2 > 0U);
       break;
     // **** 0xf5: Set CAN silent mode
     case 0xf5:

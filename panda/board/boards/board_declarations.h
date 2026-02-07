@@ -61,6 +61,7 @@ struct board {
 // CAN modes
 #define CAN_MODE_NORMAL 0U
 #define CAN_MODE_OBD_CAN2 1U
+#define CAN_MODE_DISABLED 2U
 
 extern struct board board_black;
 extern struct board board_dos;

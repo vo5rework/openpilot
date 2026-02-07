@@ -39,6 +39,11 @@ extern int pending_can_live;
 extern int can_silent;
 extern bool can_loopback;
 
+// Enabled CAN controllers bitmask by CAN number (0=CAN1, 1=CAN2, 2=CAN3).
+// Used to avoid initializing floating/unwired controllers (prevents IRQ-rate faults).
+extern uint8_t can_controller_enable_mask;
+void can_set_controller_enable_mask(uint8_t mask);
+
 // ******************* functions prototypes *********************
 bool can_init(uint8_t can_number);
 void process_can(uint8_t can_number);

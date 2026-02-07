@@ -12,6 +12,9 @@
   #define CANPACKET_DATA_SIZE_MAX 8U
 #endif
 
+#ifndef CANPACKET_T_DEFINED
+#define CANPACKET_T_DEFINED
+
 typedef struct {
   unsigned char fd : 1;
   unsigned char bus : 3;
@@ -23,6 +26,8 @@ typedef struct {
   unsigned char checksum;
   unsigned char data[CANPACKET_DATA_SIZE_MAX];
 } __attribute__((packed, aligned(4))) CANPacket_t;
+
+#endif  // CANPACKET_T_DEFINED
 
 #define GET_BUS(msg) ((msg)->bus)
 #define GET_LEN(msg) (dlc_to_len[(msg)->data_len_code])

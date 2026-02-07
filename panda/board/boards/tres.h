@@ -44,9 +44,8 @@ static void tres_enable_can_transceiver(uint8_t transceiver, bool enabled) {
       can2_enabled = enabled;
       break;
     case 4U:
-      set_gpio_output(GPIOB, 11, !enabled);
-      break;
-    default:
+      set_gpio_output(GPIOB, 11, !enabled);    break;
+default:
       break;
   }
 
@@ -61,6 +60,17 @@ static void tres_set_can_mode(uint8_t mode) {
   switch (mode) {
     case CAN_MODE_NORMAL:
     case CAN_MODE_OBD_CAN2:
+    case CAN_MODE_DISABLED:
+      // Disable both CAN2 pin mappings (normal + OBD) and leave transceivers off.
+      set_gpio_pullup(GPIOB, 5, PULL_NONE);
+      set_gpio_mode(GPIOB, 5, MODE_ANALOG);
+      set_gpio_pullup(GPIOB, 6, PULL_NONE);
+      set_gpio_mode(GPIOB, 6, MODE_ANALOG);
+      set_gpio_pullup(GPIOB, 12, PULL_NONE);
+      set_gpio_mode(GPIOB, 12, MODE_ANALOG);
+      set_gpio_pullup(GPIOB, 13, PULL_NONE);
+      set_gpio_mode(GPIOB, 13, MODE_ANALOG);
+      if (mode == CAN_MODE_DISABLED) { break; }
       if ((bool)(mode == CAN_MODE_NORMAL) != (bool)(harness.status == HARNESS_STATUS_FLIPPED)) {
         // B12,B13: disable normal mode
         set_gpio_pullup(GPIOB, 12, PULL_NONE);

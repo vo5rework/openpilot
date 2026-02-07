@@ -89,6 +89,18 @@ void set_safety_mode(uint16_t mode, uint16_t param) {
       can_silent = ALL_CAN_LIVE;
       break;
   }
+
+// Avoid initializing floating/unwired CAN controllers (prevents FAULT_INTERRUPT_RATE_CAN_x).
+// Tesla legacy dual-panda wiring typically uses two controllers per panda, and the mapping
+// differs by panda role encoded in safety_param (41 vs 42). These differ in the LSB.
+if (mode_copy == SAFETY_TESLA_LEGACY) {
+  const bool internal_role = (param & 0x1U) != 0U;  // 41 -> internal, 42 -> external
+  can_set_controller_enable_mask(internal_role ? 0x5U : 0x3U);  // internal: CAN1+CAN3, external: CAN1+CAN2
+} else if (mode_copy == SAFETY_ELM327) {
+  can_set_controller_enable_mask(0x7U);  // CAN1+CAN2+CAN3
+} else {
+  can_set_controller_enable_mask((uint8_t)((1U << PANDA_CAN_CNT) - 1U));
+}
   can_init_all();
 }
 
