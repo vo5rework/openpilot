@@ -164,6 +164,24 @@ void Panda::set_can_speed_kbps(uint16_t bus, uint16_t speed) {
   handle->control_write(0xde, bus, (speed * 10));
 }
 
+void Panda::set_can_transceiver(uint16_t transceiver, bool enabled) {
+  // 0xF4: param1=transceiver index (1..N), param2=0/1
+  handle->control_write(0xf4, (uint16_t)transceiver, (uint16_t)(enabled ? 1U : 0U));
+}
+
+void Panda::set_can2_transceivers(bool enabled) {
+  // CAN2 can be wired to either transceiver 2 or 4 on BLACK/DOS depending on harness flip/OBD mode.
+  set_can_transceiver(2U, enabled);
+  if ((hw_type == cereal::PandaState::PandaType::BLACK_PANDA) ||
+      (hw_type == cereal::PandaState::PandaType::DOS)) {
+    set_can_transceiver(4U, enabled);
+  }
+}
+
+void Panda::set_can_enable(uint16_t bus_num, bool enabled) {
+  // Alias for python parity: treats bus_num as transceiver index.
+  set_can_transceiver(bus_num, enabled);
+}
 void Panda::set_can_fd_auto(uint16_t bus, bool enabled) {
   handle->control_write(0xe8, bus, enabled);
 }

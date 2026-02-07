@@ -1,9 +1,17 @@
+# /data/openpilot/opendbc/car/tesla/teslacan_legacy.py
 from opendbc.car.common.conversions import Conversions as CV
 from opendbc.car.interfaces import V_CRUISE_MAX
 from opendbc.car.tesla.values import CANBUS, CarControllerParams
 
 
 class TeslaCANRaven:
+  """
+  Legacy Tesla CAN helpers (HW2 "legacy" stack).
+
+  Note: This class name historically said "Raven" in some forks. For clarity, we provide:
+    TeslaCANLegacy = TeslaCANRaven
+  """
+
   def __init__(self, packers):
     self.packers = packers
 
@@ -28,7 +36,6 @@ class TeslaCANRaven:
   def create_longitudinal_command(self, acc_state, accel, counter, v_ego, active):
     set_speed = max(v_ego * CV.MS_TO_KPH, 0)
     if active:
-      # TODO: this causes jerking after gas override when above set speed
       set_speed = 0 if accel < 0 else V_CRUISE_MAX
 
     values = {
@@ -42,6 +49,7 @@ class TeslaCANRaven:
       "DAS_controlCounter": counter,
     }
 
+    # Powertrain DBC uses 0x2BF for DAS_control (legacy HW2)
     data = self.packers[CANBUS.powertrain].make_can_msg("DAS_control", CANBUS.powertrain, values)[1]
     values["DAS_controlChecksum"] = self.checksum(0x2BF, data[:7])
     return self.packers[CANBUS.powertrain].make_can_msg("DAS_control", CANBUS.powertrain, values)
@@ -53,5 +61,9 @@ class TeslaCANRaven:
     }
 
     data = self.packers[CANBUS.party].make_can_msg("APS_eacMonitor", CANBUS.party, values)[1]
-    values["APS_eacMonitorChecksum"] = self.checksum(0x27d, data[:2])
+    values["APS_eacMonitorChecksum"] = self.checksum(0x27D, data[:2])
     return self.packers[CANBUS.party].make_can_msg("APS_eacMonitor", CANBUS.party, values)
+
+
+# Clarity alias: HW2 is "legacy"
+TeslaCANLegacy = TeslaCANRaven

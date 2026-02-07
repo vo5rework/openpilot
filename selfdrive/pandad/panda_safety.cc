@@ -1,4 +1,5 @@
 #include "selfdrive/pandad/pandad.h"
+
 #include "cereal/messaging/messaging.h"
 #include "common/swaglog.h"
 
@@ -30,7 +31,7 @@ void PandaSafety::updateMultiplexingMode() {
   }
 
   // Switch between multiplexing modes based on the OBD multiplexing request
-  bool obd_multiplexing_requested = params_.getBool("ObdMultiplexingEnabled");
+  const bool obd_multiplexing_requested = params_.getBool("ObdMultiplexingEnabled");
   if (obd_multiplexing_requested != prev_obd_multiplexing_) {
     for (int i = 0; i < pandas_.size(); ++i) {
       const uint16_t safety_param = (i > 0 || !obd_multiplexing_requested) ? 1U : 0U;
@@ -62,8 +63,8 @@ void PandaSafety::setSafetyMode(const std::string &params_string) {
   capnp::FlatArrayMessageReader cmsg(aligned_buf.align(params_string.data(), params_string.size()));
   cereal::CarParams::Reader car_params = cmsg.getRoot<cereal::CarParams>();
 
-  auto safety_configs = car_params.getSafetyConfigs();
-  uint16_t alternative_experience = car_params.getAlternativeExperience();
+  const auto safety_configs = car_params.getSafetyConfigs();
+  const uint16_t alternative_experience = car_params.getAlternativeExperience();
 
   for (int i = 0; i < pandas_.size(); ++i) {
     // Default to SILENT safety model if not specified
@@ -74,8 +75,16 @@ void PandaSafety::setSafetyMode(const std::string &params_string) {
       safety_param = safety_configs[i].getSafetyParam();
     }
 
-    LOGW("Panda %d: setting safety model: %d, param: %d, alternative experience: %d", i, (int)safety_model, safety_param, alternative_experience);
+    LOGW("Panda %d: setting safety model: %d, param: %d, alternative experience: %d",
+         i, (int)safety_model, safety_param, alternative_experience);
+
     pandas_[i]->set_alternative_experience(alternative_experience);
     pandas_[i]->set_safety_model(safety_model, safety_param);
+
+    // Unity parity (Tesla legacy, dual-panda): CAN2 is unused. On BLACK/DOS CAN2 is transceiver 2 or 4
+    // depending on harness flip/OBD mode; disable both to prevent interrupt-rate faults (0x8).
+    if (safety_model == cereal::CarParams::SafetyModel::TESLA_LEGACY) {
+      pandas_[i]->set_can2_transceivers(false);
+    }
   }
 }
