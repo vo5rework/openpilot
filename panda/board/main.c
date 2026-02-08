@@ -143,17 +143,24 @@ void set_safety_mode(uint16_t mode, uint16_t param) {
   }
 
 // Avoid initializing floating/unwired CAN controllers (prevents FAULT_INTERRUPT_RATE_CAN_x).
-// Tesla legacy dual-panda wiring typically uses two controllers per panda, and the mapping
-// differs by panda role encoded in safety_param (41 vs 42). These differ in the LSB.
-uint8_t can_enable_mask = (uint8_t)((1U << PANDA_CAN_CNT) - 1U);
-if (mode_copy == SAFETY_TESLA_LEGACY) {
-  const bool internal_role = (param & 0x1U) != 0U;  // 41 -> internal, 42 -> external
-  can_enable_mask = internal_role ? 0x5U : 0x3U;    // internal: CAN1+CAN3, external: CAN1+CAN2
-} else if (mode_copy == SAFETY_ELM327) {
-  can_enable_mask = 0x7U;  // CAN1+CAN2+CAN3
+// NOTE: PANDA_CAN_CNT is a `static const` (runtime constant), not a preprocessor constant.
+uint8_t can_enable_mask = can_controller_enable_mask;
+
+// For non-car safety modes (SILENT/NOOUTPUT/ALLOUTPUT), we keep CAN init minimal to avoid
+// interrupt storms on unplugged busses. This is important for XNOR Tesla dual-harness setups.
+if (!is_car_safety_mode(mode_copy) && (mode_copy != SAFETY_ELM327)) {
+  can_enable_mask = (PANDA_CAN_CNT >= 3U) ? 0x5U : 0x1U;  // CAN1(+CAN3 if present)
+} else if (mode_copy == SAFETY_TESLA_LEGACY) {
+  // Tesla legacy XNOR harnessing:
+  //  - internal "main" panda: chassis (CAN1) + AP-side (CAN3)
+  //  - external panda: chassis (CAN1) + powertrain (CAN2) (varies by harness; CAN3 unused)
+  (void)param;
+  // This XNOR dual-harness wiring uses CAN1 + CAN3 (bus0 + bus2). CAN2 is left unused.
+  can_enable_mask = 0x5U;
 } else {
   can_enable_mask = (uint8_t)((1U << PANDA_CAN_CNT) - 1U);
 }
+
 can_set_controller_enable_mask(can_enable_mask);
 can_init_all();
 disable_unused_can_irqs(can_enable_mask);

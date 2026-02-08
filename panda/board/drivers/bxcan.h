@@ -190,52 +190,6 @@ static void CAN3_TX_IRQ_Handler(void) { process_can(2); }
 static void CAN3_RX0_IRQ_Handler(void) { can_rx(2); }
 static void CAN3_SCE_IRQ_Handler(void) { can_sce(2); }
 
-
-void can_deinit(uint8_t can_number) {
-  if (can_number == 0xFFU) {
-    return;
-  }
-
-  // Disable NVIC IRQs for this controller
-  switch (can_number) {
-    case 0U:
-      NVIC_DisableIRQ(CAN1_TX_IRQn);
-      NVIC_DisableIRQ(CAN1_RX0_IRQn);
-      NVIC_DisableIRQ(CAN1_SCE_IRQn);
-      NVIC_ClearPendingIRQ(CAN1_TX_IRQn);
-      NVIC_ClearPendingIRQ(CAN1_RX0_IRQn);
-      NVIC_ClearPendingIRQ(CAN1_SCE_IRQn);
-      break;
-    case 1U:
-      NVIC_DisableIRQ(CAN2_TX_IRQn);
-      NVIC_DisableIRQ(CAN2_RX0_IRQn);
-      NVIC_DisableIRQ(CAN2_SCE_IRQn);
-      NVIC_ClearPendingIRQ(CAN2_TX_IRQn);
-      NVIC_ClearPendingIRQ(CAN2_RX0_IRQn);
-      NVIC_ClearPendingIRQ(CAN2_SCE_IRQn);
-      break;
-    case 2U:
-      NVIC_DisableIRQ(CAN3_TX_IRQn);
-      NVIC_DisableIRQ(CAN3_RX0_IRQn);
-      NVIC_DisableIRQ(CAN3_SCE_IRQn);
-      NVIC_ClearPendingIRQ(CAN3_TX_IRQn);
-      NVIC_ClearPendingIRQ(CAN3_RX0_IRQn);
-      NVIC_ClearPendingIRQ(CAN3_SCE_IRQn);
-      break;
-    default:
-      break;
-  }
-
-  CAN_TypeDef *CANx = CANIF_FROM_CAN_NUM(can_number);
-
-  // Disable CAN interrupts
-  CANx->IER = 0U;
-
-  // Enter init mode to stop CAN activity
-  CANx->MCR |= CAN_MCR_INRQ;
-  while ((CANx->MSR & CAN_MSR_INAK) == 0U) { }
-}
-
 bool can_init(uint8_t can_number) {
   bool ret = true;
 
@@ -267,4 +221,18 @@ bool can_init(uint8_t can_number) {
     process_can(can_number);
   }
   return ret;
+}
+
+void can_deinit(uint8_t can_number) {
+  if (can_number == 0xffU) {
+    return;
+  }
+
+  CAN_TypeDef *CANx = CANIF_FROM_CAN_NUM(can_number);
+
+  // Disable all CAN interrupts at the peripheral. (NVIC lines are disabled in board/main.c)
+  register_set(&(CANx->IER), 0U, 0xFFFFFFFFU);
+
+  // Request init mode to stop normal operation cleanly.
+  register_set_bits(&(CANx->MCR), CAN_MCR_INRQ);
 }

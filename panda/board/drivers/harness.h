@@ -1,5 +1,3 @@
-#pragma once
-
 #include "harness_declarations.h"
 
 struct harness_t harness;

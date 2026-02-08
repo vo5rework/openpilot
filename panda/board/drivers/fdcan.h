@@ -248,60 +248,6 @@ static void FDCAN2_IT1_IRQ_Handler(void) { process_can(1); }
 static void FDCAN3_IT0_IRQ_Handler(void) { can_rx(2);  }
 static void FDCAN3_IT1_IRQ_Handler(void) { process_can(2); }
 
-
-// Put an FDCAN controller into INIT mode and disable its interrupts.
-// Required to truly disable a controller that was previously initialized; masking NVIC alone is insufficient.
-static inline void fdcan_enter_init(FDCAN_GlobalTypeDef *FDCANx) {
-  // Exit sleep if set
-  FDCANx->CCCR &= ~(FDCAN_CCCR_CSR);
-  while ((FDCANx->CCCR & FDCAN_CCCR_CSA) == FDCAN_CCCR_CSA) { }
-
-  // Request INIT
-  FDCANx->CCCR |= FDCAN_CCCR_INIT;
-  while ((FDCANx->CCCR & FDCAN_CCCR_INIT) == 0U) { }
-}
-
-void can_deinit(uint8_t can_number) {
-  if (can_number == 0xFFU) {
-    return;
-  }
-
-  // Disable NVIC IRQs for this controller
-  switch (can_number) {
-    case 0U:
-      NVIC_DisableIRQ(FDCAN1_IT0_IRQn);
-      NVIC_DisableIRQ(FDCAN1_IT1_IRQn);
-      NVIC_ClearPendingIRQ(FDCAN1_IT0_IRQn);
-      NVIC_ClearPendingIRQ(FDCAN1_IT1_IRQn);
-      break;
-    case 1U:
-      NVIC_DisableIRQ(FDCAN2_IT0_IRQn);
-      NVIC_DisableIRQ(FDCAN2_IT1_IRQn);
-      NVIC_ClearPendingIRQ(FDCAN2_IT0_IRQn);
-      NVIC_ClearPendingIRQ(FDCAN2_IT1_IRQn);
-      break;
-    case 2U:
-      NVIC_DisableIRQ(FDCAN3_IT0_IRQn);
-      NVIC_DisableIRQ(FDCAN3_IT1_IRQn);
-      NVIC_ClearPendingIRQ(FDCAN3_IT0_IRQn);
-      NVIC_ClearPendingIRQ(FDCAN3_IT1_IRQn);
-      break;
-    default:
-      break;
-  }
-
-  FDCAN_GlobalTypeDef *FDCANx = CANIF_FROM_CAN_NUM(can_number);
-
-  // Disable interrupt routing + sources, clear pending flags
-  FDCANx->ILE = 0U;
-  FDCANx->IE = 0U;
-  FDCANx->IR = 0xFFFFFFFFU;
-
-  // Stop RX/TX activity
-  fdcan_enter_init(FDCANx);
-}
-
-
 bool can_init(uint8_t can_number) {
   bool ret = true;
 
@@ -330,4 +276,22 @@ bool can_init(uint8_t can_number) {
     process_can(can_number);
   }
   return ret;
+}
+
+void can_deinit(uint8_t can_number) {
+  if (can_number == 0xffU) {
+    return;
+  }
+
+  FDCAN_GlobalTypeDef *FDCANx = CANIF_FROM_CAN_NUM(can_number);
+
+  // Disable all FDCAN interrupts at the peripheral. (NVIC lines are disabled in board/main.c)
+  FDCANx->ILE = 0U;
+  FDCANx->IE = 0U;
+
+  // Clear any pending interrupt flags.
+  FDCANx->IR = 0xFFFFFFFFU;
+
+  // Request init mode so it stops bus activity.
+  FDCANx->CCCR |= FDCAN_CCCR_INIT;
 }

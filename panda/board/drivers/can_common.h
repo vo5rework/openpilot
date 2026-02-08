@@ -20,7 +20,8 @@ bool can_loopback = false;
 // Default: all controllers enabled.
 uint8_t can_controller_enable_mask = (uint8_t)((1U << PANDA_CAN_CNT) - 1U);
 
-// Track whether a controller has been initialized at least once so we can deinit it when masked off.
+// Track which controllers were initialized so we can deinit them when masked off.
+// Use a bitmask to avoid VLAs at file scope (PANDA_CAN_CNT isn't always a compile-time constant).
 static uint8_t can_controller_initialized_mask = 0U;
 
 void can_set_controller_enable_mask(uint8_t mask) {
@@ -149,28 +150,23 @@ bus_config_t bus_config[BUS_CONFIG_ARRAY_SIZE] = {
 };
 
 void can_init_all(void) {
-  for (uint8_t i=0U; i < PANDA_CAN_CNT; i++) {
-    #ifndef CANFD
-      bus_config[i].can_data_speed = 0U;
-    #endif
-    can_clear(can_queues[i]);
-
-    const bool enabled = (can_controller_enable_mask & (1U << i)) != 0U;
-    const bool was_inited = (can_controller_initialized_mask & (1U << i)) != 0U;
+  for (uint8_t i = 0U; i < PANDA_CAN_CNT; i++) {
+    const uint8_t bit = 1U << i;
+    const bool enabled = (can_controller_enable_mask & bit) != 0U;
+    const bool initialized = (can_controller_initialized_mask & bit) != 0U;
 
     if (enabled) {
       (void)can_init(i);
-      can_controller_initialized_mask |= (uint8_t)(1U << i);
-    } else if (was_inited) {
-      // A previously-initialized controller must be deinitialized,
-      // otherwise it can keep generating interrupts on a floating/unwired bus.
+      can_controller_initialized_mask |= bit;
+    } else if (initialized) {
       can_deinit(i);
-      can_controller_initialized_mask &= (uint8_t)~(1U << i);
-    } else {
-      // never initialized and disabled -> nothing to do
+      can_controller_initialized_mask &= (uint8_t)(~bit);
     }
+
+    can_clear(can_queues[i]);
   }
 }
+
 
 void can_set_orientation(bool flipped) {
   bus_config[0].bus_lookup = flipped ? 2U : 0U;
