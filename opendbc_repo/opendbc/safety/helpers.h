@@ -1,3 +1,5 @@
+#pragma once
+
 #include "opendbc/safety/safety_declarations.h"
 
 static bool max_limit_check(int val, const int MAX_VAL, const int MIN_VAL) {
