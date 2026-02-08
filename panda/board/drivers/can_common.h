@@ -20,6 +20,9 @@ bool can_loopback = false;
 // Default: all controllers enabled.
 uint8_t can_controller_enable_mask = (uint8_t)((1U << PANDA_CAN_CNT) - 1U);
 
+// Track whether a controller has been initialized at least once so we can deinit it when masked off.
+static uint8_t can_controller_initialized_mask = 0U;
+
 void can_set_controller_enable_mask(uint8_t mask) {
   can_controller_enable_mask = (uint8_t)(mask & ((1U << PANDA_CAN_CNT) - 1U));
 }
@@ -153,8 +156,18 @@ void can_init_all(void) {
     can_clear(can_queues[i]);
 
     const bool enabled = (can_controller_enable_mask & (1U << i)) != 0U;
+    const bool was_inited = (can_controller_initialized_mask & (1U << i)) != 0U;
+
     if (enabled) {
       (void)can_init(i);
+      can_controller_initialized_mask |= (uint8_t)(1U << i);
+    } else if (was_inited) {
+      // A previously-initialized controller must be deinitialized,
+      // otherwise it can keep generating interrupts on a floating/unwired bus.
+      can_deinit(i);
+      can_controller_initialized_mask &= (uint8_t)~(1U << i);
+    } else {
+      // never initialized and disabled -> nothing to do
     }
   }
 }

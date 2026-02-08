@@ -46,6 +46,7 @@ void can_set_controller_enable_mask(uint8_t mask);
 
 // ******************* functions prototypes *********************
 bool can_init(uint8_t can_number);
+void can_deinit(uint8_t can_number);
 void process_can(uint8_t can_number);
 
 // ********************* instantiate queues *********************

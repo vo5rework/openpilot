@@ -41,6 +41,58 @@ void debug_ring_callback(uart_ring *ring) {
 
 // ****************************** safety mode ******************************
 
+// Hard-disable CAN NVIC IRQs for controllers that are not enabled by the current
+// controller-enable mask. Required for Tesla legacy dual-panda role switching,
+// where a controller can remain configured from a previous mode and keep firing
+// interrupts (causing FAULT_INTERRUPT_RATE_CAN_2 / 0x8) even after being masked off.
+static void disable_unused_can_irqs(uint8_t enabled_mask) {
+  for (uint8_t i = 0U; i < PANDA_CAN_CNT; i++) {
+    if ((enabled_mask & (1U << i)) == 0U) {
+#ifdef STM32H7
+      if (i == 0U) {
+        NVIC_DisableIRQ(FDCAN1_IT0_IRQn);
+        NVIC_DisableIRQ(FDCAN1_IT1_IRQn);
+        NVIC_ClearPendingIRQ(FDCAN1_IT0_IRQn);
+        NVIC_ClearPendingIRQ(FDCAN1_IT1_IRQn);
+      } else if (i == 1U) {
+        NVIC_DisableIRQ(FDCAN2_IT0_IRQn);
+        NVIC_DisableIRQ(FDCAN2_IT1_IRQn);
+        NVIC_ClearPendingIRQ(FDCAN2_IT0_IRQn);
+        NVIC_ClearPendingIRQ(FDCAN2_IT1_IRQn);
+      } else {
+        NVIC_DisableIRQ(FDCAN3_IT0_IRQn);
+        NVIC_DisableIRQ(FDCAN3_IT1_IRQn);
+        NVIC_ClearPendingIRQ(FDCAN3_IT0_IRQn);
+        NVIC_ClearPendingIRQ(FDCAN3_IT1_IRQn);
+      }
+#else
+      if (i == 0U) {
+        NVIC_DisableIRQ(CAN1_TX_IRQn);
+        NVIC_DisableIRQ(CAN1_RX0_IRQn);
+        NVIC_DisableIRQ(CAN1_SCE_IRQn);
+        NVIC_ClearPendingIRQ(CAN1_TX_IRQn);
+        NVIC_ClearPendingIRQ(CAN1_RX0_IRQn);
+        NVIC_ClearPendingIRQ(CAN1_SCE_IRQn);
+      } else if (i == 1U) {
+        NVIC_DisableIRQ(CAN2_TX_IRQn);
+        NVIC_DisableIRQ(CAN2_RX0_IRQn);
+        NVIC_DisableIRQ(CAN2_SCE_IRQn);
+        NVIC_ClearPendingIRQ(CAN2_TX_IRQn);
+        NVIC_ClearPendingIRQ(CAN2_RX0_IRQn);
+        NVIC_ClearPendingIRQ(CAN2_SCE_IRQn);
+      } else {
+        NVIC_DisableIRQ(CAN3_TX_IRQn);
+        NVIC_DisableIRQ(CAN3_RX0_IRQn);
+        NVIC_DisableIRQ(CAN3_SCE_IRQn);
+        NVIC_ClearPendingIRQ(CAN3_TX_IRQn);
+        NVIC_ClearPendingIRQ(CAN3_RX0_IRQn);
+        NVIC_ClearPendingIRQ(CAN3_SCE_IRQn);
+      }
+#endif
+    }
+  }
+}
+
 // this is the only way to leave silent mode
 void set_safety_mode(uint16_t mode, uint16_t param) {
   uint16_t mode_copy = mode;
@@ -93,15 +145,18 @@ void set_safety_mode(uint16_t mode, uint16_t param) {
 // Avoid initializing floating/unwired CAN controllers (prevents FAULT_INTERRUPT_RATE_CAN_x).
 // Tesla legacy dual-panda wiring typically uses two controllers per panda, and the mapping
 // differs by panda role encoded in safety_param (41 vs 42). These differ in the LSB.
+uint8_t can_enable_mask = (uint8_t)((1U << PANDA_CAN_CNT) - 1U);
 if (mode_copy == SAFETY_TESLA_LEGACY) {
   const bool internal_role = (param & 0x1U) != 0U;  // 41 -> internal, 42 -> external
-  can_set_controller_enable_mask(internal_role ? 0x5U : 0x3U);  // internal: CAN1+CAN3, external: CAN1+CAN2
+  can_enable_mask = internal_role ? 0x5U : 0x3U;    // internal: CAN1+CAN3, external: CAN1+CAN2
 } else if (mode_copy == SAFETY_ELM327) {
-  can_set_controller_enable_mask(0x7U);  // CAN1+CAN2+CAN3
+  can_enable_mask = 0x7U;  // CAN1+CAN2+CAN3
 } else {
-  can_set_controller_enable_mask((uint8_t)((1U << PANDA_CAN_CNT) - 1U));
+  can_enable_mask = (uint8_t)((1U << PANDA_CAN_CNT) - 1U);
 }
-  can_init_all();
+can_set_controller_enable_mask(can_enable_mask);
+can_init_all();
+disable_unused_can_irqs(can_enable_mask);
 }
 
 bool is_car_safety_mode(uint16_t mode) {
