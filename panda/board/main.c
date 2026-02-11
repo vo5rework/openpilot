@@ -123,14 +123,8 @@ void set_safety_mode(uint16_t mode, uint16_t param) {
       heartbeat_counter = 0U;
       heartbeat_lost = false;
 
-      // Clear any pending messages in the can core (i.e. sending while comma power is unplugged)
-      // TODO: rewrite using hardware queues rather than fifo to cancel specific messages
-      can_clear_send(CANIF_FROM_CAN_NUM(1), 1);
-      if (param == 0U) {
-        current_board->set_can_mode(CAN_MODE_OBD_CAN2);
-      } else {
-        current_board->set_can_mode(CAN_MODE_NORMAL);
-      }
+      // Keep CAN mode normal; OBD_CAN2 would enable the floating controller on this harness and can trip IRQ-rate faults.
+      current_board->set_can_mode(CAN_MODE_NORMAL);
       can_silent = ALL_CAN_LIVE;
       break;
     default:
@@ -151,13 +145,13 @@ if (mode_copy == SAFETY_TESLA_LEGACY) {
   // that trips 'interruptRateCan2' and then 'safetyRxChecksInvalid' -> controls mismatch.
   can_enable_mask = 0x5U;  // enable CAN1 (ctrl0/bus0) + CAN3 (ctrl2/bus2)
 } else if (mode_copy == SAFETY_ELM327) {
-  can_enable_mask = 0x7U;  // CAN1+CAN2+CAN3
+  can_enable_mask = 0x5U;  // enable CAN1 (ctrl0) + CAN3 (ctrl2)
 } else {
   can_enable_mask = (uint8_t)((1U << PANDA_CAN_CNT) - 1U);
 }
 can_set_controller_enable_mask(can_enable_mask);
-can_init_all();
 disable_unused_can_irqs(can_enable_mask);
+can_init_all();
 }
 
 bool is_car_safety_mode(uint16_t mode) {
@@ -208,8 +202,7 @@ static void tick_handler(void) {
       can_set_orientation(harness.status == HARNESS_STATUS_FLIPPED);
 
       // re-init everything that uses harness status
-      can_init_all();
-      set_safety_mode(current_safety_mode, current_safety_param);
+            set_safety_mode(current_safety_mode, current_safety_param);
       set_power_save_state(power_save_status);
     }
 

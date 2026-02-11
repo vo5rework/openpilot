@@ -2,6 +2,21 @@
 
 FDCAN_GlobalTypeDef *cans[CANS_ARRAY_SIZE] = {FDCAN1, FDCAN2, FDCAN3};
 
+static inline void fdcan_set_tfee_enabled(FDCAN_GlobalTypeDef *FDCANx, bool enabled) {
+  // TFEE is routed to INT1 in llcan_init(). Gating prevents idle IRQ storms.
+  if (enabled) {
+    FDCANx->IE |= FDCAN_IE_TFEE;
+  } else {
+    FDCANx->IE &= ~FDCAN_IE_TFEE;
+    FDCANx->IR |= FDCAN_IR_TFE;
+  }
+}
+
+static inline bool can_queue_empty(const can_ring *q) {
+  return q->w_ptr == q->r_ptr;
+}
+
+
 static bool can_set_speed(uint8_t can_number) {
   bool ret = true;
   FDCAN_GlobalTypeDef *FDCANx = CANIF_FROM_CAN_NUM(can_number);
@@ -62,9 +77,31 @@ void update_can_health_pkt(uint8_t can_number, uint32_t ir_reg) {
 
   can_health[can_number].irq0_call_rate = interrupts[can_irq_number[can_number][0]].call_rate;
   can_health[can_number].irq1_call_rate = interrupts[can_irq_number[can_number][1]].call_rate;
+  // DEBUG (H7): pack current IRQ call_counters + TX state bits into irq2_call_rate.
+  // This helps catch mid-second IRQ storms (fault triggers on call_counter, not call_rate).
+  //
+  // Packed format (uint32):
+  //   upper 16 bits: IT0 current call_counter (RX/SCE line)
+  //   lower 16 bits: IT1 current call_counter (TX line), rounded down to multiple of 16
+  //   lower 4 bits of that lower half: TX state bitmask
+  //     bit0: TFEE enabled (IE.TFEE)
+  //     bit1: TFE flag set (IR.TFE)
+  //     bit2: TX queue full (TXFQS.TFQF)
+  //     bit3: pending TX requests (TXBRP != 0)
+  uint32_t dbg = 0U;
+  if ((FDCANx->IE & FDCAN_IE_TFEE) != 0U) { dbg |= 1U; }
+  if ((FDCANx->IR & FDCAN_IR_TFE) != 0U) { dbg |= 2U; }
+  if ((FDCANx->TXFQS & FDCAN_TXFQS_TFQF) != 0U) { dbg |= 4U; }
+  if (FDCANx->TXBRP != 0U) { dbg |= 8U; }
 
+  uint32_t rx_ctr = interrupts[can_irq_number[can_number][0]].call_counter;
+  uint32_t tx_ctr = interrupts[can_irq_number[can_number][1]].call_counter;
+  if (rx_ctr > 0xFFFFU) { rx_ctr = 0xFFFFU; }
+  if (tx_ctr > 0xFFFFU) { tx_ctr = 0xFFFFU; }
 
-  if (ir_reg != 0U) {
+  uint32_t packed = ((rx_ctr & 0xFFFFU) << 16) | ((tx_ctr & 0xFFF0U) | (dbg & 0xFU));
+  can_health[can_number].irq2_call_rate = packed;
+if (ir_reg != 0U) {
     // Clear error interrupts
     FDCANx->IR |= (FDCAN_IR_PED | FDCAN_IR_PEA | FDCAN_IR_EP | FDCAN_IR_BO | FDCAN_IR_RF0L);
     can_health[can_number].total_error_cnt += 1U;
@@ -85,67 +122,80 @@ void update_can_health_pkt(uint8_t can_number, uint32_t ir_reg) {
 // ***************************** CAN *****************************
 // FDFDCANx_IT1 IRQ Handler (TX)
 void process_can(uint8_t can_number) {
-  if (can_number != 0xffU) {
-    ENTER_CRITICAL();
-
-    FDCAN_GlobalTypeDef *FDCANx = CANIF_FROM_CAN_NUM(can_number);
-    uint8_t bus_number = BUS_NUM_FROM_CAN_NUM(can_number);
-
-    FDCANx->IR |= FDCAN_IR_TFE; // Clear Tx FIFO Empty flag
-
-    if ((FDCANx->TXFQS & FDCAN_TXFQS_TFQF) == 0U) {
-      CANPacket_t to_send;
-      if (can_pop(can_queues[bus_number], &to_send)) {
-        if (can_check_checksum(&to_send)) {
-          can_health[can_number].total_tx_cnt += 1U;
-
-          uint32_t TxFIFOSA = FDCAN_START_ADDRESS + (can_number * FDCAN_OFFSET) + (FDCAN_RX_FIFO_0_EL_CNT * FDCAN_RX_FIFO_0_EL_SIZE);
-          // get the index of the next TX FIFO element (0 to FDCAN_TX_FIFO_EL_CNT - 1)
-          uint32_t tx_index = (FDCANx->TXFQS >> FDCAN_TXFQS_TFQPI_Pos) & 0x1FU;
-          // only send if we have received a packet
-          canfd_fifo *fifo;
-          fifo = (canfd_fifo *)(TxFIFOSA + (tx_index * FDCAN_TX_FIFO_EL_SIZE));
-
-          fifo->header[0] = (to_send.extended << 30) | ((to_send.extended != 0U) ? (to_send.addr) : (to_send.addr << 18));
-
-          // If canfd_auto is set, outgoing packets will be automatically sent as CAN-FD if an incoming CAN-FD packet was seen
-          bool fd = bus_config[can_number].canfd_auto ? bus_config[can_number].canfd_enabled : (bool)(to_send.fd > 0U);
-          uint32_t canfd_enabled_header = fd ? (1UL << 21) : 0UL;
-
-          uint32_t brs_enabled_header = bus_config[can_number].brs_enabled ? (1UL << 20) : 0UL;
-          fifo->header[1] = (to_send.data_len_code << 16) | canfd_enabled_header | brs_enabled_header;
-
-          uint8_t data_len_w = (dlc_to_len[to_send.data_len_code] / 4U);
-          data_len_w += ((dlc_to_len[to_send.data_len_code] % 4U) > 0U) ? 1U : 0U;
-          for (unsigned int i = 0; i < data_len_w; i++) {
-            BYTE_ARRAY_TO_WORD(fifo->data_word[i], &to_send.data[i*4U]);
-          }
-
-          FDCANx->TXBAR = (1UL << tx_index);
-
-          // Send back to USB
-          CANPacket_t to_push;
-
-          to_push.fd = fd;
-          to_push.returned = 1U;
-          to_push.rejected = 0U;
-          to_push.extended = to_send.extended;
-          to_push.addr = to_send.addr;
-          to_push.bus = bus_number;
-          to_push.data_len_code = to_send.data_len_code;
-          (void)memcpy(to_push.data, to_send.data, dlc_to_len[to_push.data_len_code]);
-          can_set_checksum(&to_push);
-
-          rx_buffer_overflow += can_push(&can_rx_q, &to_push) ? 0U : 1U;
-        } else {
-          can_health[can_number].total_tx_checksum_error_cnt += 1U;
-        }
-
-        refresh_can_tx_slots_available();
-      }
-    }
-    EXIT_CRITICAL();
+  if (can_number == 0xffU) {
+    return;
   }
+
+  ENTER_CRITICAL();
+
+  FDCAN_GlobalTypeDef *FDCANx = CANIF_FROM_CAN_NUM(can_number);
+  uint8_t bus_number = BUS_NUM_FROM_CAN_NUM(can_number);
+
+  // Clear Tx FIFO Empty flag early.
+  FDCANx->IR |= FDCAN_IR_TFE;
+
+  // Drain as much as possible per IRQ/kick to reduce IRQ rate.
+  while ((FDCANx->TXFQS & FDCAN_TXFQS_TFQF) == 0U) {
+    CANPacket_t to_send;
+    if (!can_pop(can_queues[bus_number], &to_send)) {
+      break;
+    }
+
+    if (!can_check_checksum(&to_send)) {
+      can_health[can_number].total_tx_checksum_error_cnt += 1U;
+      continue;
+    }
+
+    can_health[can_number].total_tx_cnt += 1U;
+
+    uint32_t TxFIFOSA = FDCAN_START_ADDRESS + (can_number * FDCAN_OFFSET) +
+                        (FDCAN_RX_FIFO_0_EL_CNT * FDCAN_RX_FIFO_0_EL_SIZE);
+
+    // Index of the next TX FIFO element (0..FDCAN_TX_FIFO_EL_CNT-1)
+    uint32_t tx_index = (FDCANx->TXFQS >> FDCAN_TXFQS_TFQPI_Pos) & 0x1FU;
+
+    canfd_fifo *fifo = (canfd_fifo *)(TxFIFOSA + (tx_index * FDCAN_TX_FIFO_EL_SIZE));
+
+    fifo->header[0] = (to_send.extended << 30) |
+                      ((to_send.extended != 0U) ? (to_send.addr) : (to_send.addr << 18));
+
+    // If canfd_auto is set, outgoing packets will be automatically sent as CAN-FD if an incoming CAN-FD packet was seen
+    bool fd = bus_config[can_number].canfd_auto ? bus_config[can_number].canfd_enabled : (bool)(to_send.fd > 0U);
+    uint32_t canfd_enabled_header = fd ? (1UL << 21) : 0UL;
+
+    uint32_t brs_enabled_header = bus_config[can_number].brs_enabled ? (1UL << 20) : 0UL;
+    fifo->header[1] = (to_send.data_len_code << 16) | canfd_enabled_header | brs_enabled_header;
+
+    uint8_t data_len_w = (dlc_to_len[to_send.data_len_code] / 4U);
+    data_len_w += ((dlc_to_len[to_send.data_len_code] % 4U) > 0U) ? 1U : 0U;
+    for (uint8_t i = 0U; i < data_len_w; i++) {
+      BYTE_ARRAY_TO_WORD(fifo->data_word[i], &to_send.data[i * 4U]);
+    }
+
+    FDCANx->TXBAR = (1UL << tx_index);
+
+    // Send back to USB
+    CANPacket_t to_push;
+
+    to_push.fd = fd;
+    to_push.returned = 1U;
+    to_push.rejected = 0U;
+    to_push.extended = to_send.extended;
+    to_push.addr = to_send.addr;
+    to_push.bus = bus_number;
+    to_push.data_len_code = to_send.data_len_code;
+    (void)memcpy(to_push.data, to_send.data, dlc_to_len[to_push.data_len_code]);
+    can_set_checksum(&to_push);
+
+    rx_buffer_overflow += can_push(&can_rx_q, &to_push) ? 0U : 1U;
+  }
+
+  refresh_can_tx_slots_available();
+
+  // Enable TFEE only when we have pending frames and might need an IRQ to resume draining later.
+  fdcan_set_tfee_enabled(FDCANx, !can_queue_empty(can_queues[bus_number]));
+
+  EXIT_CRITICAL();
 }
 
 // FDFDCANx_IT0 IRQ Handler (RX and errors)

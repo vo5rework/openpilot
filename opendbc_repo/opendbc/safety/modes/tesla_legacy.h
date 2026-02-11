@@ -41,72 +41,57 @@ static bool tesla_legacy_op_stalk_main_edge = false;     // bit1 (edge)
 static bool tesla_legacy_op_stalk_cancel_edge = false;   // bit0 (edge)
 
 // stock system detection on AP-side bus (bus2)
-static bool tesla_legacy_stock_lkas = false;
-static bool tesla_legacy_stock_aeb = false;
+static bool tesla_legacy_stock_lkas = false;  // from 0x488 steerControlType
+static bool tesla_legacy_stock_aeb = false;   // from 0x2BF AEB event
 
-// Unity: disable OP if stock AP features active
-static bool tesla_legacy_autopilot_enabled = false;
-static bool tesla_legacy_eac_enabled = false;
-static bool tesla_legacy_autopark_enabled = false;
+// stock AP states from DAS/AP frames
+static bool tesla_legacy_autopilot_enabled = false;  // 0x399
+static bool tesla_legacy_eac_enabled = false;        // 0x219
+static bool tesla_legacy_autopark_enabled = false;   // 0x219
 
-// EPAS driver interaction
+// hands on wheel (from 0x370)
 static bool tesla_legacy_hands_on = false;
 static uint32_t tesla_legacy_hands_on_last_signal = 0U;
 
-// HUD hiding timer
+// time tracking for HUD hiding after disengage
 static uint32_t tesla_legacy_time_op_disengaged = 0U;
+
+// --- helpers ---
 static bool tesla_legacy_controls_allowed_prev = false;
 
-// --- Unity checksum model (additive, last byte) ---
-static inline uint8_t tesla_legacy_compute_last_byte_checksum(const CANPacket_t *msg) {
-  const int len = GET_LEN(msg);
-  uint8_t checksum = (uint8_t)((msg->addr & 0xFFU) + ((msg->addr >> 8) & 0xFFU));
+static void tesla_legacy_track_controls_allowed_edge(void) {
+  if (tesla_legacy_controls_allowed_prev && !controls_allowed) {
+    tesla_legacy_time_op_disengaged = microsecond_timer_get();
+  tesla_legacy_controls_allowed_prev = false;
+  }
+  tesla_legacy_controls_allowed_prev = controls_allowed;
+}
+
+static uint8_t tesla_legacy_calc_checksum8(const CANPacket_t *msg, int len) {
+  // Unity parity: additive checksum includes addr low+high bytes.
+  // Special-case: 0x2BF uses 0x2B9 for checksum.
+  uint16_t addr = (uint16_t)msg->addr;
+  if (addr == 0x2BFU) {
+    addr = 0x2B9U;
+  }
+  uint8_t checksum = (uint8_t)(addr & 0xFFU) + (uint8_t)((addr >> 8) & 0xFFU);
   for (int i = 0; i < (len - 1); i++) {
     checksum = (uint8_t)(checksum + msg->data[i]);
   }
   return checksum;
 }
 
-static inline void tesla_legacy_set_last_byte_checksum(CANPacket_t *msg) {
+static void tesla_legacy_set_last_byte_checksum(CANPacket_t *msg) {
   const int len = GET_LEN(msg);
   if (len > 0) {
-    msg->data[len - 1] = tesla_legacy_compute_last_byte_checksum(msg);
+    msg->data[len - 1] = tesla_legacy_calc_checksum8(msg, len);
   }
-}
-
-static inline void tesla_legacy_apply_op_engage_edges(void) {
-  if (!tesla_legacy_op_stalk_enable) {
-    tesla_legacy_op_stalk_main_edge = false;
-    tesla_legacy_op_stalk_cancel_edge = false;
-    return;
-  }
-
-  if ((!tesla_legacy_has_ap_hw) || tesla_legacy_op_autopilot_disabled) {
-    if (tesla_legacy_op_stalk_main_edge) {
-      pcm_cruise_check(true);
-    }
-    if (tesla_legacy_op_stalk_cancel_edge) {
-      pcm_cruise_check(false);
-    }
-  }
-
-  tesla_legacy_op_stalk_main_edge = false;
-  tesla_legacy_op_stalk_cancel_edge = false;
-}
-
-static inline void tesla_legacy_track_controls_allowed_edge(void) {
-  if (tesla_legacy_controls_allowed_prev && !controls_allowed) {
-    tesla_legacy_time_op_disengaged = microsecond_timer_get();
-  }
-  tesla_legacy_controls_allowed_prev = controls_allowed;
 }
 
 // --- RX hook ---
 static void tesla_legacy_rx_hook(const CANPacket_t *msg) {
-  const int bus = msg->bus;
+  const int bus = GET_BUS(msg);
   const int addr = (int)msg->addr;
-
-  tesla_legacy_apply_op_engage_edges();
 
   // Chassis state (HW3 uses bus1)
   if (bus == tesla_legacy_chassis_bus) {
@@ -149,7 +134,8 @@ static void tesla_legacy_rx_hook(const CANPacket_t *msg) {
       tesla_legacy_hands_on = dt <= TESLA_LEGACY_TIME_FOR_HANDS_ON_US;
     }
 
-    const bool disengage = (hands_on_level >= 3) || ((eac_status == 0) && (eac_error_code == 9));
+    // Unity parity: do NOT disengage on hands-on escalation; only on EPAS inhibit/error.
+    const bool disengage = ((eac_status == 0) && (eac_error_code == 9));
     steering_disengage = disengage;
     if (disengage) {
       controls_allowed = false;
@@ -188,15 +174,15 @@ static void tesla_legacy_rx_hook(const CANPacket_t *msg) {
 
     if (!tesla_legacy_external_panda && tesla_legacy_has_ap_hw) {
       if (addr == 0x399) {
-        const int autopilot_status = msg->data[0] & 0x0F;
-        tesla_legacy_autopilot_enabled = (autopilot_status == 3) || (autopilot_status == 4);
-        if (tesla_legacy_autopilot_enabled || tesla_legacy_eac_enabled || tesla_legacy_autopark_enabled) {
+        const uint8_t st = (msg->data[0] >> 4) & 0x0FU;  // DAS_status
+        tesla_legacy_autopilot_enabled = (st == 3U) || (st == 4U) || (st == 6U) || (st == 7U);
+        if (tesla_legacy_autopilot_enabled) {
           controls_allowed = false;
         }
       } else if (addr == 0x219) {
-        const int psc_status = (msg->data[0] & 0xF0) >> 4;
-        const int eac_status = msg->data[1] & 0x07;
-        tesla_legacy_eac_enabled = (eac_status == 2);
+        const int eac_status = (int)((msg->data[1] >> 2) & 0x0FU);
+        const int psc_status = (int)((msg->data[0] >> 1) & 0x1FU);
+        tesla_legacy_eac_enabled = (eac_status == 2) || (eac_status == 3);
         tesla_legacy_autopark_enabled = (psc_status == 14) || ((psc_status >= 1) && (psc_status <= 8));
         if (tesla_legacy_autopilot_enabled || tesla_legacy_eac_enabled || tesla_legacy_autopark_enabled) {
           controls_allowed = false;
@@ -220,6 +206,14 @@ static bool tesla_legacy_tx_hook(const CANPacket_t *msg) {
     tesla_legacy_op_autopilot_disabled = (b5 & 0x80U) != 0U;
     tesla_legacy_op_stalk_main_edge = (b5 & 0x02U) != 0U;
     tesla_legacy_op_stalk_cancel_edge = (b5 & 0x01U) != 0U;
+        if (tesla_legacy_op_stalk_enable && (!tesla_legacy_has_ap_hw || tesla_legacy_op_autopilot_disabled)) {
+      if (tesla_legacy_op_stalk_main_edge) {
+        pcm_cruise_check(true);
+      }
+      if (tesla_legacy_op_stalk_cancel_edge) {
+        pcm_cruise_check(false);
+      }
+    }
     return false;
   }
 
@@ -287,7 +281,7 @@ static bool tesla_legacy_tx_hook(const CANPacket_t *msg) {
   // External panda (longitudinal)
   if (tesla_legacy_external_panda) {
     if (addr != 0x2BF) {
-      return true;
+      return false;
     }
 
     const int aeb_event = (int)(msg->data[2] & 0x03);
@@ -349,7 +343,7 @@ static bool tesla_legacy_fwd_msg_hook(int bus_num, CANPacket_t *to_fwd) {
     if ((bus_num == 2) && (addr == 0x2BF)) {
       return !tesla_legacy_stock_aeb;
     }
-    return false;
+    return true;
   }
 
   // Main panda: stock LKAS passthrough (bus2 -> car)
@@ -359,6 +353,14 @@ static bool tesla_legacy_fwd_msg_hook(int bus_num, CANPacket_t *to_fwd) {
 
   // Unity mods only on main panda with AP HW
   if (!tesla_legacy_has_ap_hw) {
+        if (tesla_legacy_op_stalk_enable && (!tesla_legacy_has_ap_hw || tesla_legacy_op_autopilot_disabled)) {
+      if (tesla_legacy_op_stalk_main_edge) {
+        pcm_cruise_check(true);
+      }
+      if (tesla_legacy_op_stalk_cancel_edge) {
+        pcm_cruise_check(false);
+      }
+    }
     return false;
   }
 
@@ -436,6 +438,7 @@ static safety_config tesla_legacy_init(uint16_t param) {
   tesla_legacy_hands_on_last_signal = 0U;
 
   tesla_legacy_time_op_disengaged = microsecond_timer_get();
+  tesla_legacy_controls_allowed_prev = false;
 
   cruise_engaged_prev = false;
 
@@ -456,51 +459,34 @@ static safety_config tesla_legacy_init(uint16_t param) {
   // Your canmap (split) shows:
   //  - main panda: chassis frames on bus0, AP/DAS frames on bus2
   //  - external panda: does not consistently see the AP/DAS bus; keep minimal
-    static RxCheck tesla_legacy_rx_checks_external[] = {
-    // External panda wiring is not consistent for AP/DAS frames; keep this minimal and tolerant.
-    // Allow 0x155 on bus0 OR bus2.
-    {.msg = {
-      {0x155, 0, 8, 10U, .ignore_checksum = true, .ignore_counter = true, .ignore_quality_flag = true},
-      {0x155, 2, 8, 10U, .ignore_checksum = true, .ignore_counter = true, .ignore_quality_flag = true},
-      {0},
-    }},
-  };
+  static RxCheck tesla_legacy_rx_checks_external[] = {
+  // Unity parity (powertrain / longitudinal): these are always present on the PT bus.
+  // Keep this minimal; missing frames == rx_checks_invalid == controls mismatch.
+  {.msg = {
+    {0x106, 0, 8, 100U, .ignore_checksum = true, .ignore_counter = true, .ignore_quality_flag = true},  // DI_torque1
+    {0x106, 2, 8, 100U, .ignore_checksum = true, .ignore_counter = true, .ignore_quality_flag = true},  // mirrored
+    {0},
+  }},
+  {.msg = {
+    {0x116, 0, 6, 100U, .ignore_checksum = true, .ignore_counter = true, .ignore_quality_flag = true},  // DI_torque2
+    {0x116, 2, 6, 100U, .ignore_checksum = true, .ignore_counter = true, .ignore_quality_flag = true},  // mirrored
+    {0},
+  }},
+};
 
-    static RxCheck tesla_legacy_rx_checks_main[] = {
-    // Chassis side (HW2: bus0), but some harnesses mirror onto bus2. Accept either to avoid false RX invalids.
-    {.msg = {
-      {0x155, 0, 8, 10U, .ignore_checksum = true, .ignore_counter = true, .ignore_quality_flag = true},  // speed
-      {0x155, 2, 8, 10U, .ignore_checksum = true, .ignore_counter = true, .ignore_quality_flag = true},
-      {0},
-    }},
-    {.msg = {
-      {0x370, 0, 8, 10U, .ignore_checksum = true, .ignore_counter = true, .ignore_quality_flag = true},  // EPAS status
-      {0x370, 2, 8, 10U, .ignore_checksum = true, .ignore_counter = true, .ignore_quality_flag = true},
-      {0},
-    }},
-    {.msg = {
-      {0x45,  0, 8, 5U,  .ignore_checksum = true, .ignore_counter = true, .ignore_quality_flag = true},  // stalk
-      {0x45,  2, 8, 5U,  .ignore_checksum = true, .ignore_counter = true, .ignore_quality_flag = true},
-      {0},
-    }},
-
-    // AP/DAS frames: most commonly bus2, sometimes bus1 or mirrored on bus0 depending on dual harness box.
-    {.msg = {
-      {0x219, 2, 8, 10U, .ignore_checksum = true, .ignore_counter = true, .ignore_quality_flag = true},  // EAC/autopark
-      {0x219, 1, 8, 10U, .ignore_checksum = true, .ignore_counter = true, .ignore_quality_flag = true},
-      {0x219, 0, 8, 10U, .ignore_checksum = true, .ignore_counter = true, .ignore_quality_flag = true},
-    }},
-    {.msg = {
-      {0x399, 2, 8, 1U,  .ignore_checksum = true, .ignore_counter = true, .ignore_quality_flag = true},  // DAS status
-      {0x399, 0, 8, 1U,  .ignore_checksum = true, .ignore_counter = true, .ignore_quality_flag = true},
-      {0},
-    }},
-    {.msg = {
-      {0x389, 2, 8, 1U,  .ignore_checksum = true, .ignore_counter = true, .ignore_quality_flag = true},  // DAS faults
-      {0x389, 0, 8, 1U,  .ignore_checksum = true, .ignore_counter = true, .ignore_quality_flag = true},
-      {0},
-    }},
-  };
+  static RxCheck tesla_legacy_rx_checks_main[] = {
+  // Unity parity (AP-side / lateral): torque frames are the most reliable "always present" signals.
+  {.msg = {
+    {0x108, 0, 8, 100U, .ignore_checksum = true, .ignore_counter = true, .ignore_quality_flag = true},  // DI_torque1
+    {0x108, 2, 8, 100U, .ignore_checksum = true, .ignore_counter = true, .ignore_quality_flag = true},  // mirrored
+    {0},
+  }},
+  {.msg = {
+    {0x118, 0, 6, 100U, .ignore_checksum = true, .ignore_counter = true, .ignore_quality_flag = true},  // DI_torque2
+    {0x118, 2, 6, 100U, .ignore_checksum = true, .ignore_counter = true, .ignore_quality_flag = true},  // mirrored
+    {0},
+  }},
+};
 
   safety_config ret = tesla_legacy_external_panda
     ? BUILD_SAFETY_CFG(tesla_legacy_rx_checks_external, TESLA_LEGACY_TX_MSGS_LONG)

@@ -201,9 +201,12 @@ bool llcan_init(FDCAN_GlobalTypeDef *FDCANx) {
     FDCANx->IE |= FDCAN_IE_RF0NE; // Rx FIFO 0 new message
     FDCANx->IE |= FDCAN_IE_PEDE | FDCAN_IE_PEAE | FDCAN_IE_BOE | FDCAN_IE_EPE | FDCAN_IE_RF0LE;
 
-    // Messages for INT1 (Only TFE works??)
+    // Messages for INT1 (TX)
+    // Route TX FIFO empty interrupt to INT1, but keep it disabled by default.
+    // Enable it only when the SW TX queue has pending frames to avoid idle IRQ storms.
     FDCANx->ILS |= FDCAN_ILS_TFEL;
-    FDCANx->IE |= FDCAN_IE_TFEE; // Tx FIFO empty
+    FDCANx->IE &= ~FDCAN_IE_TFEE;
+    FDCANx->IR |= FDCAN_IR_TFE;
 
     ret = fdcan_exit_init(FDCANx);
     if(!ret) {
