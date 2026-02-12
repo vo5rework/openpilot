@@ -109,7 +109,11 @@ void process_can(uint8_t can_number) {
       }
 
       if (can_pop(can_queues[bus_number], &to_send)) {
-        if (can_check_checksum(&to_send)) {
+        const bool silent = (((unsigned int)can_silent) & (1U << can_number)) != 0U;
+        if (silent) {
+          // RX-only controller: drop queued TX so we never request transmission on an un-ACKed bus.
+          can_health[can_number].total_tx_lost_cnt += 1U;
+        } else if (can_check_checksum(&to_send)) {
           can_health[can_number].total_tx_cnt += 1U;
           // only send if we have received a packet
           CANx->sTxMailBox[0].TIR = ((to_send.extended != 0U) ? (to_send.addr << 3) : (to_send.addr << 21)) | (to_send.extended << 2);

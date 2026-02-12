@@ -136,6 +136,17 @@ void set_safety_mode(uint16_t mode, uint16_t param) {
       break;
   }
 
+  // Tesla legacy: external panda must be RX-only on CAN3 to avoid un-ACKed TX storms.
+  // safety_param uses TESLA_LEGACY_FLAG_EXTERNAL_PANDA (0x02).
+  if (mode_copy == SAFETY_TESLA_LEGACY) {
+    const bool external_panda = (param & 0x02U) != 0U;
+    if (external_panda) {
+      can_silent |= (1U << 2U);  // CAN3 (ctrl2 / bus2)
+    }
+  }
+
+
+
 // Avoid initializing floating/unwired CAN controllers (prevents FAULT_INTERRUPT_RATE_CAN_x).
 // Tesla legacy dual-panda wiring typically uses two controllers per panda, and the mapping
 // differs by panda role encoded in safety_param (41 vs 42). These differ in the LSB.
