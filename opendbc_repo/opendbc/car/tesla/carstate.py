@@ -137,11 +137,11 @@ class CarState(CarStateBase):
     ret.steeringPressed = self.update_steering_pressed(abs(ret.steeringTorque) > STEER_THRESHOLD, 5)
 
     eac_status = self.can_define.dv["EPAS3S_sysStatus"]["EPAS3S_eacStatus"].get(int(epas_status["EPAS3S_eacStatus"]), None)
+    eac_error_code = self.can_define.dv["EPAS3S_sysStatus"]["EPAS3S_eacErrorCode"].get(int(epas_status["EPAS3S_eacErrorCode"]), None)
     ret.steerFaultPermanent = eac_status == "EAC_FAULT"
-    ret.steerFaultTemporary = eac_status == "EAC_INHIBITED"
+    ret.steerFaultTemporary = (eac_status == "EAC_INHIBITED") and (eac_error_code is not None) and (eac_error_code != "EAC_ERROR_IDLE")
 
     # FSD disengages using union of handsOnLevel (slow overrides) and high angle rate faults (fast overrides, high speed)
-    eac_error_code = self.can_define.dv["EPAS3S_sysStatus"]["EPAS3S_eacErrorCode"].get(int(epas_status["EPAS3S_eacErrorCode"]), None)
     ret.steeringDisengage = self.hands_on_level >= 3 or (eac_status == "EAC_INHIBITED" and
                                                          eac_error_code == "EAC_ERROR_HIGH_ANGLE_RATE_SAFETY")
 
@@ -189,11 +189,7 @@ class CarState(CarStateBase):
       self.cruise_buttons = 0
       self.turnSignalStalkState = 0
 
-    if self.autopilot_disabled:
-      if self.cruise_buttons == 2:  # MAIN
-        self.cruiseEnabled = True
-      if self.cruise_buttons == 1:  # CANCEL
-        self.cruiseEnabled = False
+    # cruiseEnabled toggling handled on MAIN/CANCEL edges (see buttonEvents below).
 
 
     # Gear
@@ -270,24 +266,39 @@ class CarState(CarStateBase):
     except Exception:
       pass
 
+    # Buttons (steering wheel stalk/buttons)
     ret.buttonEvents = []
-    try:
-      prev = int(self._prev_cruise_buttons)
-      cur = int(getattr(self, "cruise_buttons", 0))
-      def _be(t, pressed):
-        e = structs.CarState.ButtonEvent()
-        e.type = t
-        e.pressed = pressed
-        return e
-      accel_vals = (4, 16)
-      decel_vals = (8, 32)
-      if (prev in accel_vals) and (cur not in accel_vals): ret.buttonEvents.append(_be(ButtonType.accelCruise, False))
-      if (prev in decel_vals) and (cur not in decel_vals): ret.buttonEvents.append(_be(ButtonType.decelCruise, False))
-      if (prev == 1) and (cur != 1): ret.buttonEvents.append(_be(ButtonType.cancel, False))
-      if (prev == 2) and (cur != 2): ret.buttonEvents.append(_be(ButtonType.resumeCruise, False))
-      self._prev_cruise_buttons = cur
-    except Exception:
-      pass
+    prev = int(getattr(self, "_prev_cruise_buttons", 0))
+    cur = int(getattr(self, "cruise_buttons", 0))
+
+    def _be(t, pressed):
+      e = structs.CarState.ButtonEvent()
+      e.type = t
+      e.pressed = pressed
+      return e
+
+    accel_vals = (4, 16)
+    decel_vals = (8, 32)
+
+    if prev != cur:
+      # release previous
+      if prev in accel_vals: ret.buttonEvents.append(_be(ButtonType.accelCruise, False))
+      elif prev in decel_vals: ret.buttonEvents.append(_be(ButtonType.decelCruise, False))
+      elif prev == 1: ret.buttonEvents.append(_be(ButtonType.cancel, False))
+      elif prev == 2: ret.buttonEvents.append(_be(ButtonType.resumeCruise, False))
+
+      # press new
+      if cur in accel_vals: ret.buttonEvents.append(_be(ButtonType.accelCruise, True))
+      elif cur in decel_vals: ret.buttonEvents.append(_be(ButtonType.decelCruise, True))
+      elif cur == 1: ret.buttonEvents.append(_be(ButtonType.cancel, True))
+      elif cur == 2: ret.buttonEvents.append(_be(ButtonType.resumeCruise, True))
+
+      # Virtual cruise toggle when Tesla Autopilot is disabled (unity behavior)
+      if self.autopilot_disabled:
+        if cur == 2: self.cruiseEnabled = True
+        elif cur == 1: self.cruiseEnabled = False
+
+    self._prev_cruise_buttons = cur
 
 
     return ret

@@ -5,6 +5,7 @@ export NO_PREBUILT=1
 DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" >/dev/null && pwd )"
 
 source "$DIR/launch_env.sh"
+python3 -u system/tools/ensure_vision.py
 
 function agnos_init {
   # TODO: move this to agnos
