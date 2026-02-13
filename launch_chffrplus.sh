@@ -70,6 +70,45 @@ function launch {
   # handle pythonpath
   ln -sfn $(pwd) /data/pythonpath
   export PYTHONPATH="$PWD"
+  # --- SSH key provisioning (no UI/ADB) ---
+  # If system/manager/github_user exists, fetch https://github.com/<user>.keys and enable SSH via Params.
+  # A successful application renames github_user -> github_user.applied to avoid re-running.
+  if [ -f "$DIR/system/manager/github_user" ] && [ ! -f "$DIR/system/manager/github_user.applied" ]; then
+    GH_USER="$(head -n1 "$DIR/system/manager/github_user" | tr -d ' \t\r\n')"
+    if [[ "$GH_USER" =~ ^[A-Za-z0-9]([A-Za-z0-9-]{0,37}[A-Za-z0-9])?$ ]]; then
+      echo "Provisioning SSH keys for GitHub user: $GH_USER"
+      if python3 "$DIR/tools/scripts/setup_ssh_keys.py" "$GH_USER"; then
+        mv -f "$DIR/system/manager/github_user" "$DIR/system/manager/github_user.applied"
+      else
+        echo "SSH key provisioning failed (will retry next boot)"
+      fi
+    else
+      echo "Invalid GitHub username in system/manager/github_user: '$GH_USER'"
+    fi
+  fi
+
+  # Optional offline provisioning: place public keys in system/manager/authorized_keys (one key per line).
+  if [ -f "$DIR/system/manager/authorized_keys" ] && [ ! -f "$DIR/system/manager/authorized_keys.applied" ]; then
+    echo "Provisioning SSH keys from system/manager/authorized_keys"
+    if python3 - <<'PY'
+from openpilot.common.params import Params
+import pathlib
+p = pathlib.Path("system/manager/authorized_keys")
+txt = p.read_text(encoding="utf-8", errors="ignore").strip()
+if not txt:
+  raise SystemExit(1)
+Params().put_bool("SshEnabled", True)
+Params().put("GithubSshKeys", txt)
+Params().put("GithubUsername", "seed")
+print("Set up ssh keys successfully (offline seed)")
+PY
+    then
+      mv -f "$DIR/system/manager/authorized_keys" "$DIR/system/manager/authorized_keys.applied"
+    else
+      echo "Offline SSH key provisioning failed (will retry next boot)"
+    fi
+  fi
+
 
   # hardware specific init
   if [ -f /AGNOS ]; then
