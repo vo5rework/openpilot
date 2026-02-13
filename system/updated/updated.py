@@ -390,7 +390,7 @@ class Updater:
     cmds = [
       ["git", "checkout", "--force", "--no-recurse-submodules", "-B", branch, "FETCH_HEAD"],
       ["git", "reset", "--hard"],
-      ["git", "clean", "-xdff"],
+      ["git", "clean", "-xdff", "-e", "msgq/visionipc/visionipc_pyx.so", "-e", "msgq/visionipc/visionipc_pyx*.so"],
       ["git", "submodule", "sync"],
       ["git", "submodule", "update", "--init", "--recursive"],
       ["git", "submodule", "foreach", "--recursive", "git", "reset", "--hard"],
