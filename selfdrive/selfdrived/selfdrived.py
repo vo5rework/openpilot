@@ -92,6 +92,7 @@ class SelfdriveD:
     self.is_metric = self.params.get_bool("IsMetric")
     self.is_ldw_enabled = self.params.get_bool("IsLdwEnabled")
     self.disengage_on_accelerator = self.params.get_bool("DisengageOnAccelerator")
+    self.disable_disengage_on_brake = self.params.get_bool("DisableDisengageOnBrake")
 
     car_recognized = self.CP.brand != 'mock'
 
@@ -197,11 +198,21 @@ class SelfdriveD:
           # body always wants to enable
           self.events.add(EventName.pcmEnable)
 
-      # Disable on rising edge of accelerator or brake. Also disable on brake when speed > 0
-      if (CS.gasPressed and not self.CS_prev.gasPressed and self.disengage_on_accelerator) or \
-        (CS.brakePressed and (not self.CS_prev.brakePressed or not CS.standstill)) or \
-        (CS.regenBraking and (not self.CS_prev.regenBraking or not CS.standstill)):
-        self.events.add(EventName.pedalPressed)
+# Disable on rising edge of accelerator (optional). Brake/regen can override longitudinal only.
+keep_lat_on_brake = (self.CP.brand == 'tesla') or bool(getattr(self, "disable_disengage_on_brake", False))
+
+if (CS.gasPressed and not self.CS_prev.gasPressed and self.disengage_on_accelerator):
+  self.events.add(EventName.pedalPressed)
+
+if keep_lat_on_brake:
+  # Unity-style: while brake/regen is held, suppress longitudinal only (lateral can stay enabled).
+  if CS.brakePressed or CS.regenBraking:
+    self.events.add(EventName.gasPressedOverride)
+else:
+  # Stock: disable on brake press (or brake while moving)
+  if (CS.brakePressed and (not self.CS_prev.brakePressed or not CS.standstill)) or \
+     (CS.regenBraking and (not self.CS_prev.regenBraking or not CS.standstill)):
+    self.events.add(EventName.pedalPressed)
 
     # Create events for temperature, disk space, and memory
     if self.sm['deviceState'].thermalStatus >= ThermalStatus.red:
