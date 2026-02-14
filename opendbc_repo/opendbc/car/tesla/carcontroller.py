@@ -16,6 +16,7 @@ except ImportError:
 from opendbc.car.tesla.values import CarControllerParams, CANBUS, LEGACY_CARS, CAR
 from opendbc.car.common.conversions import Conversions as CV
 from openpilot.common.params import Params
+from openpilot.selfdrive.car.modules.ACC_module import ACCController
 
 try:
   from opendbc.car.tesla.teslacan import create_fake_das_msg as create_fake_das
@@ -47,6 +48,7 @@ class CarController(CarControllerBase):
 
     self._op659_prev_btn = 0
     self.apply_angle_last = 0.0
+    self.acc_controller = ACCController()
 
     if CP.carFingerprint in LEGACY_CARS:
       if CP.carFingerprint in (CAR.TESLA_MODEL_S_HW1, CAR.TESLA_MODEL_X_HW1):
@@ -98,10 +100,23 @@ class CarController(CarControllerBase):
     # Lateral can only be active when AP is disabled (Unity parity)
     lat_active = bool(CC.latActive) and autopilot_disabled and (not CS.out.cruiseState.standstill)
 
+    # HSO (Unity parity): allow driver to steer without disengaging by pausing steering output.
+    human_control = bool(getattr(CS, 'human_control', False))
+    if human_control:
+      lat_active = False
+
+    # ACC stage 1: sync Tesla cruise set speed to speed limit target using stalk emulation.
+    try:
+      send_btn, btn = self.acc_controller.update(CS, lat_active=bool(CC.latActive) and autopilot_disabled)
+      if send_btn and hasattr(self.tesla_can, 'create_action_request'):
+        can_sends.append(self.tesla_can.create_action_request(CANBUS.party, getattr(CS, 'msg_stw_actn_req', None), int(btn)))
+    except Exception:
+      pass
+
     # Steering at 50Hz (every 2 frames at 100Hz control loop)
     if self.frame % 2 == 0:
       self.apply_angle_last = float(apply_std_steer_angle_limits(
-        float(actuators.steeringAngleDeg),
+        float(CS.out.steeringAngleDeg if human_control else actuators.steeringAngleDeg),
         float(self.apply_angle_last),
         float(getattr(CS.out, "vEgoRaw", CS.out.vEgo)),
         float(CS.out.steeringAngleDeg),

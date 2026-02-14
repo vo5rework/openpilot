@@ -5,12 +5,39 @@ from opendbc.car.tesla.carstate import CarState
 from opendbc.car.tesla.values import TeslaSafetyFlags, CAR, TeslaLegacyParams, LEGACY_CARS
 from opendbc.car.tesla.radar_interface import RadarInterface
 from openpilot.common.params import Params
+import cereal.messaging as messaging
 
 
 class CarInterface(CarInterfaceBase):
   CarState = CarState
   CarController = CarController
   RadarInterface = RadarInterface
+
+  def __init__(self, CP: structs.CarParams):
+    super().__init__(CP)
+    self._model_v2_sock = messaging.sub_sock('modelV2', conflate=True)
+
+  def post_update(self, c: structs.CarControl, ret: structs.CarState) -> None:
+    # HSO (Unity parity)
+    try:
+      self.CS.human_control = bool(self.CS.hso_controller.update_stat(self.CS, bool(getattr(c, 'latActive', False)), c.actuators, int(self.CS._param_frame)))
+    except Exception:
+      self.CS.human_control = False
+
+    # ALC: update model lane change state and inject sign-correct torque for tap-only ALC
+    if not getattr(self.CS, 'enableALC', False):
+      return
+    model_msg = messaging.recv_one_or_none(self._model_v2_sock)
+    try:
+      self.CS.alca_controller.update(bool(getattr(c, 'latActive', False)), self.CS, int(self.CS._param_frame), model_msg)
+    except Exception:
+      return
+    if getattr(self.CS, 'alca_need_engagement', False):
+      ret.steeringPressed = True
+      if int(getattr(self.CS, 'alca_direction', 0)) == 1:
+        ret.steeringTorque = 2.0
+      elif int(getattr(self.CS, 'alca_direction', 0)) == 2:
+        ret.steeringTorque = -2.0
 
   @staticmethod
   def _get_params(ret: structs.CarParams, candidate, fingerprint, car_fw, alpha_long, is_release, docs) -> structs.CarParams:
