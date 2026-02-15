@@ -177,7 +177,11 @@ class CarState(CarStateBase):
 
     # FSD disengages using union of handsOnLevel (slow overrides) and high angle rate faults (fast overrides, high speed)
     eac_error_code = self.can_define.dv["EPAS3S_sysStatus"]["EPAS3S_eacErrorCode"].get(int(epas_status["EPAS3S_eacErrorCode"]), None)
-    ret.steeringDisengage = self.hands_on_level >= 3 or (eac_status == "EAC_INHIBITED" and
+    if self.enableHSO:
+      ret.steeringDisengage = (eac_status == "EAC_INHIBITED" and
+                                                         eac_error_code == "EAC_ERROR_HIGH_ANGLE_RATE_SAFETY")
+    else:
+      ret.steeringDisengage = self.hands_on_level >= 3 or (eac_status == "EAC_INHIBITED" and
                                                          eac_error_code == "EAC_ERROR_HIGH_ANGLE_RATE_SAFETY")
 
     # Cruise state
@@ -288,6 +292,9 @@ class CarState(CarStateBase):
       try:
         self._reload_tinkla_params()
         self.autopilot_disabled = bool(self._tinkla.autopilot_disabled)
+        self.enableHSO = bool(getattr(self._tinkla, 'enable_hso', True))
+        self.hsoNumbPeriod = float(getattr(self._tinkla, 'hso_numb_period', 1.5) or 1.5)
+        self.handsOnLimit = float(getattr(self._tinkla, 'hands_on_level', 2.0) or 2.0)
       except Exception:
         pass
     self._param_frame += 1
@@ -381,7 +388,11 @@ class CarState(CarStateBase):
 
     # FSD disengages using union of handsOnLevel (slow overrides) and high angle rate faults (fast overrides, high speed)
     eac_error_code = self.can_defines["EPAS_sysStatus"]["EPAS_eacErrorCode"].get(int(epas_status["EPAS_eacErrorCode"]), None)
-    ret.steeringDisengage = self.hands_on_level >= 3 or (eac_status == "EAC_INHIBITED" and
+    if self.enableHSO:
+      ret.steeringDisengage = (eac_status == "EAC_INHIBITED" and
+                                                         eac_error_code == "EAC_ERROR_HIGH_ANGLE_RATE_SAFETY")
+    else:
+      ret.steeringDisengage = self.hands_on_level >= 3 or (eac_status == "EAC_INHIBITED" and
                                                          eac_error_code == "EAC_ERROR_HIGH_ANGLE_RATE_SAFETY")
 
     # Cruise state
@@ -468,6 +479,9 @@ class CarState(CarStateBase):
       try:
         self._reload_tinkla_params()
         self.autopilot_disabled = bool(self._tinkla.autopilot_disabled)
+        self.enableHSO = bool(getattr(self._tinkla, 'enable_hso', True))
+        self.hsoNumbPeriod = float(getattr(self._tinkla, 'hso_numb_period', 1.5) or 1.5)
+        self.handsOnLimit = float(getattr(self._tinkla, 'hands_on_level', 2.0) or 2.0)
       except Exception:
         pass
     self._param_frame += 1

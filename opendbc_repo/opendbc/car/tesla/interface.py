@@ -5,6 +5,7 @@ from opendbc.car.tesla.carstate import CarState
 from opendbc.car.tesla.values import TeslaSafetyFlags, CAR, TeslaLegacyParams, LEGACY_CARS
 from opendbc.car.tesla.radar_interface import RadarInterface
 from openpilot.common.params import Params
+from openpilot.selfdrive.car.modules.HSO_module import HSOController
 import cereal.messaging as messaging
 
 

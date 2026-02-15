@@ -98,7 +98,7 @@ class CarController(CarControllerBase):
     autopilot_disabled = self._cached_autopilot_disabled
 
     # Lateral can only be active when AP is disabled (Unity parity)
-    lat_active = bool(CC.latActive) and autopilot_disabled and (not CS.out.cruiseState.standstill)
+    lat_active = bool(CC.latActive) and autopilot_disabled and (not CS.out.cruiseState.standstill) and (not human_control)
 
     # HSO (Unity parity): allow driver to steer without disengaging by pausing steering output.
     human_control = bool(getattr(CS, 'human_control', False))
