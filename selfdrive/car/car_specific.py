@@ -165,7 +165,9 @@ class CarSpecificEvents:
     if CS.steeringPressed:
       events.add(EventName.steerOverride)
     if CS.steeringDisengage and not CS_prev.steeringDisengage:
-      events.add(EventName.steerDisengage)
+      # Unity parity (HSO): don't hard-disengage on steering override
+      if not bool(getattr(CS, 'enableHSO', False)):
+        events.add(EventName.steerDisengage)
     if CS.brakePressed and CS.standstill:
       events.add(EventName.preEnableStandstill)
     if CS.gasPressed:
