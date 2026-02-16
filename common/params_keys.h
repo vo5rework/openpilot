@@ -145,7 +145,6 @@ inline static std::unordered_map<std::string, ParamKeyAttributes> keys = {
     {"TinklaSpeedLimitUseRelative", {PERSISTENT, BOOL, "0"}},
     {"TinklaSpeedLimitOffset", {PERSISTENT, FLOAT, "0.0"}},
     {"TinklaEnableALC", {PERSISTENT, BOOL, "1"}},
-    {"TinklaALCDelay", {PERSISTENT, FLOAT, "1"}},
     {"TinklaAlcDelay", {PERSISTENT, FLOAT, "1"}},
     {"TinklaSpeedLimitOffset", {PERSISTENT, FLOAT, "0.0"}},
     {"TinklaEnableHSO", {PERSISTENT, BOOL, "1"}},
