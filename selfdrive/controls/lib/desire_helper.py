@@ -69,8 +69,12 @@ class DesireHelper:
       self._tinkla_enable_alc = False
 
     try:
-      v = self._params.get("TinklaAlcDelay", encoding="utf8")
-      self._tinkla_alc_delay_s = float(v) if v is not None and v != "" else 2.0
+      raw = self._params.get("TinklaAlcDelay")
+      if raw is None:
+        raw = self._params.get("TinklaALCDelay")
+      if isinstance(raw, (bytes, bytearray)):
+        raw = raw.decode("utf-8", errors="ignore")
+      self._tinkla_alc_delay_s = float(raw) if raw not in (None, "") else 2.0
     except (UnknownKeyName, ValueError, TypeError):
       self._tinkla_alc_delay_s = 2.0
 

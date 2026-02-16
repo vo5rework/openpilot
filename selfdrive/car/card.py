@@ -22,6 +22,61 @@ from openpilot.selfdrive.car.cruise import VCruiseHelper
 from openpilot.selfdrive.car.car_specific import MockCarState
 
 from openpilot.selfdrive.tesla_0x659 import Tesla659Carrier
+# XNOR_TESLA_SPEEDLIMIT_RAW_V1: decode Tesla speed limit from UI/DAS CAN without DBC/capnp fields.
+class _TeslaSpeedLimitRaw:
+  UI_GPS_ID = 0x2F8      # UI_gpsVehicleSpeed
+  UI_SIGN_ID = 0x238     # UI_driverAssistRoadSign
+  DAS_STATUS_ID = 0x399  # DAS_status
+
+  KPH_TO_MS = 1000.0 / 3600.0
+  MPH_TO_MS = 1609.344 / 3600.0
+
+  def __init__(self) -> None:
+    self.units = "MPH"
+    self.mpp_ms = 0.0
+    self.base_mps = 0.0
+    self.mux = 0
+    self.fused_ms = 0.0
+
+  def update(self, can_list) -> None:
+    for m in can_list:
+      try:
+        addr = int(m.address)
+        dat = bytes(m.dat)
+        if len(dat) < 8:
+          continue
+
+        if addr == self.UI_GPS_ID:
+          units_bit = (dat[5] >> 6) & 0x1
+          self.units = "KPH" if int(units_bit) == 1 else "MPH"
+          raw = dat[6] & 0x1F
+          val = float(raw) * 5.0
+          ms = val * (self.KPH_TO_MS if self.units == "KPH" else self.MPH_TO_MS)
+          if ms > 0.0:
+            self.mpp_ms = ms
+
+        elif addr == self.UI_SIGN_ID:
+          self.mux = int(dat[0])
+          if self.mux == 3:
+            base = float(dat[1]) * 0.25
+            if base > 0.0:
+              self.base_mps = base
+
+        elif addr == self.DAS_STATUS_ID:
+          raw = dat[1] & 0x1F
+          val = float(raw) * 5.0
+          ms = val * (self.KPH_TO_MS if self.units == "KPH" else self.MPH_TO_MS)
+          if ms > 0.0:
+            self.fused_ms = ms
+      except Exception:
+        continue
+
+  def chosen_ms(self) -> float:
+    use_base = self.base_mps > 0.0 and (self.mux != 0x1F or self.base_mps >= 5.56)
+    chosen = self.base_mps if use_base else self.mpp_ms
+    if chosen <= 0.0 and self.fused_ms > 0.0:
+      chosen = self.fused_ms
+    return float(chosen)
 
 
 REPLAY = "REPLAY" in os.environ
@@ -105,6 +160,7 @@ class Car:
 
     # TESLA_0x659_CARRIER: single source of truth, NO extra sendcan publisher
     self._tesla_659 = Tesla659Carrier() if getattr(self.CP, "carName", "") == "tesla" else None
+    self._tesla_sl_raw = _TeslaSpeedLimitRaw() if getattr(self.CP, "carName", "") == "tesla" else None
 
     self.CP.alternativeExperience = 0
     openpilot_enabled_toggle = self.params.get_bool("OpenpilotEnabledToggle")
@@ -163,6 +219,19 @@ class Car:
         self.pm.sock['sendcan'].send(can_list_to_can_capnp(extra, msgtype='sendcan'))
 
     CS = self.CI.update(can_list)
+    # XNOR_TESLA_SPEEDLIMIT_APPLY_V1
+    if getattr(self, "_tesla_sl_raw", None) is not None:
+      try:
+        self._tesla_sl_raw.update(can_list)
+        units = str(getattr(self._tesla_sl_raw, "units", "MPH"))
+        chosen = float(self._tesla_sl_raw.chosen_ms())
+        fused = float(getattr(self._tesla_sl_raw, "fused_ms", 0.0))
+        # Interface-state only (NOT capnp)
+        self.CI.CS.speed_units = units
+        self.CI.CS.speed_limit_ms = chosen
+        self.CI.CS.speed_limit_ms_das = fused
+      except Exception:
+        pass
 
     if self.CP.brand == 'mock':
       CS = self.mock_carstate.update(CS)
