@@ -1,4 +1,3 @@
-# /data/openpilot/opendbc/car/tesla/carstate.py
 import copy
 from dataclasses import dataclass
 
@@ -33,6 +32,9 @@ class CarState(CarStateBase):
   def __init__(self, CP):
     super().__init__(CP)
     self.msg_stw_actn_req = None
+    self.stw_actn_bus = CANBUS.party  # physical bus where STW_ACTN_RQ is observed
+    self.stock_cruise_enabled = False
+    self.stock_cruise_set_speed_ms = 0.0
     self.can_define = CANDefine(DBC[CP.carFingerprint][Bus.party])
 
     if self.CP.carFingerprint in LEGACY_CARS:
@@ -72,8 +74,6 @@ class CarState(CarStateBase):
     self.speed_units = "MPH"
     self.speed_limit_ms = 0.0
     self.speed_limit_ms_das = 0.0
-    self.stock_cruise_enabled = False
-    self.stock_cruise_set_speed_ms = 0.0
     self.leftBlinkerLamp = False
     self.rightBlinkerLamp = False
     # ALC/BLNK/HSO/ACC (Unity parity)
@@ -195,20 +195,20 @@ class CarState(CarStateBase):
 
     autopark_state = self.can_define.dv["DI_state"]["DI_autoparkState"].get(int(cp_party.vl["DI_state"]["DI_autoparkState"]), None)
     cruise_enabled = cruise_state in ("ENABLED", "STANDSTILL", "OVERRIDE", "PRE_FAULT", "PRE_CANCEL")
-    self.update_autopark_state(autopark_state, cruise_enabled)
 
-    # Unity parity: real Tesla cruise setpoint (used for speed-limit sync)
+    # Tesla cruise setpoint (Unity parity for speed-limit sync)
     self.stock_cruise_enabled = bool(cruise_enabled)
     try:
-      cruise_set_uom = float(cp_party.vl["DI_state"].get("DI_cruiseSet", 0.0))
+      csu = float(cp_party.vl["DI_state"].get("DI_cruiseSet", 0.0))
       if speed_units == "KPH":
-        self.stock_cruise_set_speed_ms = max(0.0, cruise_set_uom * CV.KPH_TO_MS)
+        self.stock_cruise_set_speed_ms = csu * CV.KPH_TO_MS
       elif speed_units == "MPH":
-        self.stock_cruise_set_speed_ms = max(0.0, cruise_set_uom * CV.MPH_TO_MS)
+        self.stock_cruise_set_speed_ms = csu * CV.MPH_TO_MS
       else:
         self.stock_cruise_set_speed_ms = 0.0
     except Exception:
       self.stock_cruise_set_speed_ms = 0.0
+    self.update_autopark_state(autopark_state, cruise_enabled)
 
     # Match panda safety cruise engaged logic
     if speed_units == "KPH":
@@ -230,20 +230,24 @@ class CarState(CarStateBase):
     self.speed_units = speed_units if speed_units in ("KPH", "MPH") else "MPH"
 
     stw = None
+    stw_bus = CANBUS.party
     for _cp in (can_parsers.get(Bus.party), can_parsers.get(Bus.chassis), can_parsers.get(Bus.pt)):
       if _cp is None:
         continue
       try:
         stw = _cp.vl["STW_ACTN_RQ"]
+        stw_bus = int(getattr(_cp, "bus", CANBUS.party))
         break
       except KeyError:
         continue
     if stw is not None:
+      self.stw_actn_bus = int(stw_bus)
       self.msg_stw_actn_req = copy.copy(stw)
       self.cruise_buttons = int(stw.get("SpdCtrlLvr_Stat", 0))
       raw_ts = int(stw.get("TurnIndLvr_Stat", 0))
       self.turnSignalStalkState = 0 if raw_ts == 3 else raw_ts
     else:
+      self.stw_actn_bus = CANBUS.party
       self.cruise_buttons = 0
       self.turnSignalStalkState = 0
       self.tap_direction = 0
@@ -297,55 +301,9 @@ class CarState(CarStateBase):
     # Seatbelt
     ret.seatbeltUnlatched = cp_party.vl["UI_warning"]["buckleStatus"] != 1
 
-    # Blindspot (Unity parity): only block on WARNING_LEVEL_1/2, not any non-zero.
-    park_left = False
-    park_right = False
-    try:
-      if "PARK_status2" in cp_party.vl:
-        park_right = self.can_define.dv["PARK_status2"]["PARK_sdiBlindSpotRight"].get(int(cp_party.vl["PARK_status2"]["PARK_sdiBlindSpotRight"])) == "WARNING"
-        park_left = self.can_define.dv["PARK_status2"]["PARK_sdiBlindSpotLeft"].get(int(cp_party.vl["PARK_status2"]["PARK_sdiBlindSpotLeft"])) == "WARNING"
-    except Exception:
-      pass
-
-    try:
-      das_right = self.can_define.dv["DAS_status"]["DAS_blindSpotRearRight"].get(int(cp_ap_party.vl["DAS_status"]["DAS_blindSpotRearRight"])) in ("WARNING_LEVEL_2", "WARNING_LEVEL_1")
-      das_left = self.can_define.dv["DAS_status"]["DAS_blindSpotRearLeft"].get(int(cp_ap_party.vl["DAS_status"]["DAS_blindSpotRearLeft"])) in ("WARNING_LEVEL_2", "WARNING_LEVEL_1")
-    except Exception:
-      das_right = int(cp_ap_party.vl["DAS_status"]["DAS_blindSpotRearRight"]) in (1, 2)
-      das_left = int(cp_ap_party.vl["DAS_status"]["DAS_blindSpotRearLeft"]) in (1, 2)
-
-    ret.rightBlindspot = bool(park_right or das_right)
-    ret.leftBlindspot = bool(park_left or das_left)
-
-    # Speed limit best-effort (Unity parity): uses Tesla map units + DAS fused.
-    try:
-      cp_map = can_parsers.get(Bus.party)
-      if cp_map is None or "UI_gpsVehicleSpeed" not in getattr(cp_map, "vl", {}):
-        cp_map = can_parsers.get(Bus.chassis)
-      gps = cp_map.vl.get("UI_gpsVehicleSpeed", {}) if cp_map is not None else {}
-      msu = int(gps.get("UI_mapSpeedLimitUnits", 0) or 0)
-      map_uom_to_ms = CV.KPH_TO_MS if msu == 1 else CV.MPH_TO_MS
-      map_ms_to_uom = CV.MS_TO_KPH if msu == 1 else CV.MS_TO_MPH
-
-      rd = cp_map.vl.get("UI_driverAssistRoadSign", {}) if cp_map is not None else {}
-      if int(rd.get("UI_roadSign", 0) or 0) == 3:
-        base = float(rd.get("UI_baseMapSpeedLimitMPS", 0.0) or 0.0)
-        base = int(base * map_ms_to_uom + 0.99) / map_ms_to_uom
-        self.speed_limit_ms = base
-      if float(getattr(self, "speed_limit_ms", 0.0) or 0.0) <= 0.0:
-        self.speed_limit_ms = float(gps.get("UI_mppSpeedLimit", 0.0) or 0.0) * map_uom_to_ms
-
-      ds = cp_ap_party.vl.get("DAS_status", {}) if cp_ap_party is not None else {}
-      fused = float(ds.get("DAS_fusedSpeedLimit", 0.0) or 0.0)
-      if fused >= 150.0:
-        self.speed_limit_ms_das = 150.0 / map_ms_to_uom
-      else:
-        self.speed_limit_ms_das = fused / map_ms_to_uom
-
-      if float(getattr(self, "speed_limit_ms_das", 0.0) or 0.0) > 0.0 and float(getattr(self, "speed_limit_ms", 0.0) or 0.0) > 0.0:
-        self.speed_limit_ms = min(self.speed_limit_ms, self.speed_limit_ms_das)
-    except Exception:
-      pass
+    # Blindspot
+    ret.leftBlindspot = cp_ap_party.vl["DAS_status"]["DAS_blindSpotRearLeft"] != 0
+    ret.rightBlindspot = cp_ap_party.vl["DAS_status"]["DAS_blindSpotRearRight"] != 0
 
     # AEB
     ret.stockAeb = cp_ap_party.vl["DAS_control"]["DAS_aebEvent"] == 1
@@ -397,22 +355,11 @@ class CarState(CarStateBase):
       pass
 
     try:
-      gps = can_parsers[Bus.party].vl.get("UI_gpsVehicleSpeed", {})
-      msu = int(gps.get("UI_mapSpeedLimitUnits", 0) or 0)
-      map_ms_to_uom = CV.MS_TO_KPH if msu == 1 else CV.MS_TO_MPH
-
       ds = can_parsers.get(Bus.ap_party).vl.get("DAS_status", {}) if can_parsers.get(Bus.ap_party) is not None else {}
-      fused = float(ds.get("DAS_fusedSpeedLimit", 0.0) or 0.0)
-      if fused >= 150.0:
-        self.speed_limit_ms_das = 150.0 / map_ms_to_uom
-      else:
-        self.speed_limit_ms_das = fused / map_ms_to_uom
-
-      if float(getattr(self, "speed_limit_ms_das", 0.0) or 0.0) > 0.0 and float(getattr(self, "speed_limit_ms", 0.0) or 0.0) > 0.0:
-        self.speed_limit_ms = min(self.speed_limit_ms, self.speed_limit_ms_das)
+      if "DAS_fusedSpeedLimit" in ds:
+        self.speed_limit_ms_das = float(ds.get("DAS_fusedSpeedLimit", 0.0)) / (CV.MS_TO_KPH if self.speed_units == "KPH" else CV.MS_TO_MPH)
     except Exception:
       pass
-
 
     ret.buttonEvents = []
     try:
@@ -488,14 +435,14 @@ class CarState(CarStateBase):
 
     cruise_enabled = cruise_state in ("ENABLED", "STANDSTILL", "OVERRIDE", "PRE_FAULT", "PRE_CANCEL")
 
-    # Unity parity: real Tesla cruise setpoint (used for speed-limit sync)
+    # Tesla cruise setpoint (Unity parity for speed-limit sync)
     self.stock_cruise_enabled = bool(cruise_enabled)
     try:
-      cruise_set_uom = float(cp_chassis.vl["DI_state"].get("DI_cruiseSet", 0.0))
+      csu = float(cp_chassis.vl["DI_state"].get("DI_cruiseSet", 0.0))
       if speed_units == "KPH":
-        self.stock_cruise_set_speed_ms = max(0.0, cruise_set_uom * CV.KPH_TO_MS)
+        self.stock_cruise_set_speed_ms = csu * CV.KPH_TO_MS
       elif speed_units == "MPH":
-        self.stock_cruise_set_speed_ms = max(0.0, cruise_set_uom * CV.MPH_TO_MS)
+        self.stock_cruise_set_speed_ms = csu * CV.MPH_TO_MS
       else:
         self.stock_cruise_set_speed_ms = 0.0
     except Exception:
@@ -511,25 +458,25 @@ class CarState(CarStateBase):
     ret.cruiseState.standstill = False  # This needs to be false, since we can resume from stop without sending anything special
     ret.standstill = cruise_state == "STANDSTILL"
     ret.accFaulted = cruise_state == "FAULT"
-
-    # Unity parity: store last STW_ACTN_RQ for virtual stalk + tap-to-ALC
-    self.speed_units = speed_units if speed_units in ("KPH", "MPH") else "MPH"
-
     stw = None
+    stw_bus = CANBUS.party
     for _cp in (can_parsers.get(Bus.party), can_parsers.get(Bus.chassis), can_parsers.get(Bus.pt)):
       if _cp is None:
         continue
       try:
         stw = _cp.vl["STW_ACTN_RQ"]
+        stw_bus = int(getattr(_cp, "bus", CANBUS.party))
         break
       except KeyError:
         continue
     if stw is not None:
+      self.stw_actn_bus = int(stw_bus)
       self.msg_stw_actn_req = copy.copy(stw)
       self.cruise_buttons = int(stw.get("SpdCtrlLvr_Stat", 0))
       raw_ts = int(stw.get("TurnIndLvr_Stat", 0))
       self.turnSignalStalkState = 0 if raw_ts == 3 else raw_ts
     else:
+      self.stw_actn_bus = CANBUS.party
       self.cruise_buttons = 0
       self.turnSignalStalkState = 0
       self.tap_direction = 0
