@@ -1,7 +1,11 @@
+# /data/openpilot/opendbc/car/tesla/carstate.py
 import copy
 from dataclasses import dataclass
 
 from openpilot.selfdrive.car.modules.CFG_module import load_bool_param, load_float_param
+from openpilot.selfdrive.car.modules.BLNK_module import BLNKController
+from openpilot.selfdrive.car.modules.ALC_module import ALCController
+from openpilot.selfdrive.car.modules.HSO_module import HSOController
 from opendbc.can import CANDefine, CANParser
 from opendbc.car import Bus, structs
 from opendbc.car.common.conversions import Conversions as CV
@@ -20,6 +24,9 @@ class _TinklaConfig:
   speed_limit_use_relative: bool = False
   enable_alc: bool = True
   alc_delay: float = 0.75
+  enable_hso: bool = True
+  hso_numb_period: float = 1.5
+  enable_acc: bool = False
 
 
 class CarState(CarStateBase):
@@ -65,12 +72,33 @@ class CarState(CarStateBase):
     self.speed_units = "MPH"
     self.speed_limit_ms = 0.0
     self.speed_limit_ms_das = 0.0
+    self.stock_cruise_enabled = False
+    self.stock_cruise_set_speed_ms = 0.0
     self.leftBlinkerLamp = False
     self.rightBlinkerLamp = False
-    # ALC comfort-blinker latch (tap indicators)
-    self._blinker_latch_dir = 0  # 0 none, 1 left, 2 right
-    self._blinker_last_on = 0
-    self._blinker_latch_until = 0
+    # ALC/BLNK/HSO/ACC (Unity parity)
+    self.enableALC = bool(self._tinkla.enable_alc)
+    self.autoStartAlcaDelay = float(self._tinkla.alc_delay)
+    self.enableHSO = bool(self._tinkla.enable_hso)
+    self.hsoNumbPeriod = float(self._tinkla.hso_numb_period)
+    self.enableACC = bool(self._tinkla.enable_acc)
+
+    self.tap_direction = 0
+    self._alc_tap_latch_dir = 0
+    self._alc_tap_latch_until = 0
+    self.alca_direction = 0  # 0-none, 1-left, 2-right
+    self.alca_pre_engage = False
+    self.prev_alca_pre_engage = False
+    self.alca_engaged = False
+    self.alca_done = False
+    self.alca_need_engagement = False
+
+    self.HSOSteeringPressed = False
+    self.human_control = False
+
+    self.blinker_controller = BLNKController()
+    self.alca_controller = ALCController()
+    self.hso_controller = HSOController()
     try:
       self._reload_tinkla_params()
       self.autopilot_disabled = bool(self._tinkla.autopilot_disabled)
@@ -81,11 +109,19 @@ class CarState(CarStateBase):
   def _reload_tinkla_params(self) -> None:
     self._tinkla.autopilot_disabled = load_bool_param("TinklaAutopilotDisabled", False)
     self._tinkla.hands_on_level = load_float_param("TinklaHandsOnLevel", 2.0)
-    self._tinkla.adjust_acc_with_speed_limit = load_bool_param("TinklaAdjustAccWithSpeedLimit", True)
+    self._tinkla.adjust_acc_with_speed_limit = load_bool_param("TinklaAdjustAccWithSpeedLimit", False)
     self._tinkla.speed_limit_offset = load_float_param("TinklaSpeedLimitOffset", 0.0)
     self._tinkla.speed_limit_use_relative = load_bool_param("TinklaSpeedLimitUseRelative", False)
     self._tinkla.enable_alc = load_bool_param("TinklaEnableALC", True)
     self._tinkla.alc_delay = load_float_param("TinklaAlcDelay", 0.75)
+    self._tinkla.enable_hso = load_bool_param("TinklaEnableHSO", True)
+    self._tinkla.hso_numb_period = load_float_param("TinklaHsoNumbPeriod", 1.5)
+    self._tinkla.enable_acc = load_bool_param("TinklaEnableACC", False)
+    self.enableALC = bool(self._tinkla.enable_alc)
+    self.autoStartAlcaDelay = float(self._tinkla.alc_delay)
+    self.enableHSO = bool(self._tinkla.enable_hso)
+    self.hsoNumbPeriod = float(self._tinkla.hso_numb_period)
+    self.enableACC = bool(self._tinkla.enable_acc)
 
 
   def _calc_speed_limit_target_ms(self, speed_units: str) -> float:
@@ -100,32 +136,6 @@ class CarState(CarStateBase):
     if speed_units == "KPH":
       return max(0.0, limit_ms + off * CV.KPH_TO_MS)
     return max(0.0, limit_ms + off * CV.MPH_TO_MS)
-
-def _update_blinker_latch(self, left_lamp: bool, right_lamp: bool, stalk: int, frame: int) -> tuple[bool, bool]:
-  """Latch tap-indicators so auto lane change can start without wheel nudge."""
-  new_dir = 0
-  if left_lamp and not right_lamp:
-    new_dir = 1
-  elif right_lamp and not left_lamp:
-    new_dir = 2
-  elif int(stalk) == 1:
-    new_dir = 1
-  elif int(stalk) == 2:
-    new_dir = 2
-
-  if new_dir:
-    self._blinker_latch_dir = int(new_dir)
-    self._blinker_last_on = int(frame)
-    self._blinker_latch_until = int(frame) + 300  # ~3s at 100Hz
-  elif (int(frame) - int(getattr(self, "_blinker_last_on", 0))) > 150:
-    self._blinker_latch_dir = 0
-    self._blinker_latch_until = 0
-
-  active = int(frame) < int(getattr(self, "_blinker_latch_until", 0))
-  left_active = active and int(getattr(self, "_blinker_latch_dir", 0)) == 1
-  right_active = active and int(getattr(self, "_blinker_latch_dir", 0)) == 2
-  return left_active, right_active
-
 
   def update_autopark_state(self, autopark_state: str, cruise_enabled: bool):
     autopark_now = autopark_state in ("ACTIVE", "COMPLETE", "SELFPARK_STARTED")
@@ -172,7 +182,11 @@ def _update_blinker_latch(self, left_lamp: bool, right_lamp: bool, stalk: int, f
 
     # FSD disengages using union of handsOnLevel (slow overrides) and high angle rate faults (fast overrides, high speed)
     eac_error_code = self.can_define.dv["EPAS3S_sysStatus"]["EPAS3S_eacErrorCode"].get(int(epas_status["EPAS3S_eacErrorCode"]), None)
-    ret.steeringDisengage = self.hands_on_level >= 3 or (eac_status == "EAC_INHIBITED" and
+    if self.enableHSO:
+      ret.steeringDisengage = (eac_status == "EAC_INHIBITED" and
+                                                         eac_error_code == "EAC_ERROR_HIGH_ANGLE_RATE_SAFETY")
+    else:
+      ret.steeringDisengage = self.hands_on_level >= 3 or (eac_status == "EAC_INHIBITED" and
                                                          eac_error_code == "EAC_ERROR_HIGH_ANGLE_RATE_SAFETY")
 
     # Cruise state
@@ -183,12 +197,24 @@ def _update_blinker_latch(self, left_lamp: bool, right_lamp: bool, stalk: int, f
     cruise_enabled = cruise_state in ("ENABLED", "STANDSTILL", "OVERRIDE", "PRE_FAULT", "PRE_CANCEL")
     self.update_autopark_state(autopark_state, cruise_enabled)
 
-    # Cruise set speed (DI_cruiseSet); required for speed-limit stalk sync
-    cruise_set = float(cp_party.vl["DI_state"].get("DI_cruiseSet", 0.0) or 0.0)
-    if cruise_set > 0.0:
-      ret.cruiseState.speed = float(cruise_set) * (CV.KPH_TO_MS if speed_units == "KPH" else CV.MPH_TO_MS)
-    else:
-      ret.cruiseState.speed = max(float(ret.vEgo), 1e-3)
+    # Unity parity: real Tesla cruise setpoint (used for speed-limit sync)
+    self.stock_cruise_enabled = bool(cruise_enabled)
+    try:
+      cruise_set_uom = float(cp_party.vl["DI_state"].get("DI_cruiseSet", 0.0))
+      if speed_units == "KPH":
+        self.stock_cruise_set_speed_ms = max(0.0, cruise_set_uom * CV.KPH_TO_MS)
+      elif speed_units == "MPH":
+        self.stock_cruise_set_speed_ms = max(0.0, cruise_set_uom * CV.MPH_TO_MS)
+      else:
+        self.stock_cruise_set_speed_ms = 0.0
+    except Exception:
+      self.stock_cruise_set_speed_ms = 0.0
+
+    # Match panda safety cruise engaged logic
+    if speed_units == "KPH":
+      ret.cruiseState.speed = max(cp_party.vl["DI_state"]["DI_digitalSpeed"] * CV.KPH_TO_MS, 1e-3)
+    elif speed_units == "MPH":
+      ret.cruiseState.speed = max(cp_party.vl["DI_state"]["DI_digitalSpeed"] * CV.MPH_TO_MS, 1e-3)
     if self.autopilot_disabled:
       # Unity parity: allow engagement without Tesla cruise (low-speed lateral only)
       ret.cruiseState.available = True
@@ -215,10 +241,13 @@ def _update_blinker_latch(self, left_lamp: bool, right_lamp: bool, stalk: int, f
     if stw is not None:
       self.msg_stw_actn_req = copy.copy(stw)
       self.cruise_buttons = int(stw.get("SpdCtrlLvr_Stat", 0))
-      self.turnSignalStalkState = int(stw.get("TurnIndLvr_Stat", 0))
+      raw_ts = int(stw.get("TurnIndLvr_Stat", 0))
+      self.turnSignalStalkState = 0 if raw_ts == 3 else raw_ts
     else:
       self.cruise_buttons = 0
       self.turnSignalStalkState = 0
+      self.tap_direction = 0
+      self.blinker_controller.tap_direction = 0
 
     if self.autopilot_disabled:
       if self.cruise_buttons == 2:  # MAIN
@@ -238,24 +267,85 @@ def _update_blinker_latch(self, left_lamp: bool, right_lamp: bool, stalk: int, f
     # Unity ALC uses tap-to-change; expose only "tap/comfort" blink to DesireHelper
     self.leftBlinkerLamp = cp_party.vl["UI_warning"]["leftBlinkerBlinking"] != 0
     self.rightBlinkerLamp = cp_party.vl["UI_warning"]["rightBlinkerBlinking"] != 0
-    left_b, right_b = self._update_blinker_latch(bool(self.leftBlinkerLamp), bool(self.rightBlinkerLamp), int(getattr(self, "turnSignalStalkState", 0)), int(self._param_frame))
-    ret.leftBlinker = bool(left_b)
-    ret.rightBlinker = bool(right_b)
+
+    self.blinker_controller.update_state(self, self._param_frame)
+    self.tap_direction = int(self.blinker_controller.tap_direction)
+
+    # Unity parity: latch tap/comfort blinkers so DesireHelper sees continuous one_blinker during auto-start delay
+    if self.enableALC and (self.turnSignalStalkState == 0):
+      one = (self.leftBlinkerLamp != self.rightBlinkerLamp)
+      if one and int(getattr(self, '_alc_tap_latch_until', 0)) <= self._param_frame:
+        self._alc_tap_latch_dir = 1 if self.leftBlinkerLamp else 2
+        dur_s = max(2.5, float(self.autoStartAlcaDelay) + 0.5)
+        self._alc_tap_latch_until = int(self._param_frame + dur_s * 100)
+      if int(getattr(self, '_alc_tap_latch_until', 0)) > self._param_frame:
+        ret.leftBlinker = (self._alc_tap_latch_dir == 1)
+        ret.rightBlinker = (self._alc_tap_latch_dir == 2)
+      else:
+        ret.leftBlinker = False
+        ret.rightBlinker = False
+    else:
+      # stock behavior (incl. full stalk)
+      ret.leftBlinker = self.leftBlinkerLamp
+      ret.rightBlinker = self.rightBlinkerLamp
+
+    # HSO (Unity parity): use handsOnLevel for steeringPressed when enabled, but never during blinkers (preserve ALC)
+    self.HSOSteeringPressed = bool(getattr(self, "hands_on_level", 0.0) >= float(self._tinkla.hands_on_level))
+    if self.enableHSO and not (ret.leftBlinker or ret.rightBlinker):
+      ret.steeringPressed = self.HSOSteeringPressed
 
     # Seatbelt
     ret.seatbeltUnlatched = cp_party.vl["UI_warning"]["buckleStatus"] != 1
-    # Blindspot (Unity parity): only block on WARNING levels, not "no object"
+
+    # Blindspot (Unity parity): only block on WARNING_LEVEL_1/2, not any non-zero.
+    park_left = False
+    park_right = False
     try:
-      dv = self.can_define.dv.get("DAS_status", {})
-      v_l = int(cp_ap_party.vl["DAS_status"]["DAS_blindSpotRearLeft"])
-      v_r = int(cp_ap_party.vl["DAS_status"]["DAS_blindSpotRearRight"])
-      s_l = dv.get("DAS_blindSpotRearLeft", {}).get(v_l) if isinstance(dv.get("DAS_blindSpotRearLeft", {}), dict) else None
-      s_r = dv.get("DAS_blindSpotRearRight", {}).get(v_r) if isinstance(dv.get("DAS_blindSpotRearRight", {}), dict) else None
-      ret.leftBlindspot = (str(s_l) in ("WARNING_LEVEL_1", "WARNING_LEVEL_2", "WARNING")) if s_l is not None else (v_l in (2, 3))
-      ret.rightBlindspot = (str(s_r) in ("WARNING_LEVEL_1", "WARNING_LEVEL_2", "WARNING")) if s_r is not None else (v_r in (2, 3))
+      if "PARK_status2" in cp_party.vl:
+        park_right = self.can_define.dv["PARK_status2"]["PARK_sdiBlindSpotRight"].get(int(cp_party.vl["PARK_status2"]["PARK_sdiBlindSpotRight"])) == "WARNING"
+        park_left = self.can_define.dv["PARK_status2"]["PARK_sdiBlindSpotLeft"].get(int(cp_party.vl["PARK_status2"]["PARK_sdiBlindSpotLeft"])) == "WARNING"
     except Exception:
-      ret.leftBlindspot = False
-      ret.rightBlindspot = False
+      pass
+
+    try:
+      das_right = self.can_define.dv["DAS_status"]["DAS_blindSpotRearRight"].get(int(cp_ap_party.vl["DAS_status"]["DAS_blindSpotRearRight"])) in ("WARNING_LEVEL_2", "WARNING_LEVEL_1")
+      das_left = self.can_define.dv["DAS_status"]["DAS_blindSpotRearLeft"].get(int(cp_ap_party.vl["DAS_status"]["DAS_blindSpotRearLeft"])) in ("WARNING_LEVEL_2", "WARNING_LEVEL_1")
+    except Exception:
+      das_right = int(cp_ap_party.vl["DAS_status"]["DAS_blindSpotRearRight"]) in (1, 2)
+      das_left = int(cp_ap_party.vl["DAS_status"]["DAS_blindSpotRearLeft"]) in (1, 2)
+
+    ret.rightBlindspot = bool(park_right or das_right)
+    ret.leftBlindspot = bool(park_left or das_left)
+
+    # Speed limit best-effort (Unity parity): uses Tesla map units + DAS fused.
+    try:
+      cp_map = can_parsers.get(Bus.party)
+      if cp_map is None or "UI_gpsVehicleSpeed" not in getattr(cp_map, "vl", {}):
+        cp_map = can_parsers.get(Bus.chassis)
+      gps = cp_map.vl.get("UI_gpsVehicleSpeed", {}) if cp_map is not None else {}
+      msu = int(gps.get("UI_mapSpeedLimitUnits", 0) or 0)
+      map_uom_to_ms = CV.KPH_TO_MS if msu == 1 else CV.MPH_TO_MS
+      map_ms_to_uom = CV.MS_TO_KPH if msu == 1 else CV.MS_TO_MPH
+
+      rd = cp_map.vl.get("UI_driverAssistRoadSign", {}) if cp_map is not None else {}
+      if int(rd.get("UI_roadSign", 0) or 0) == 3:
+        base = float(rd.get("UI_baseMapSpeedLimitMPS", 0.0) or 0.0)
+        base = int(base * map_ms_to_uom + 0.99) / map_ms_to_uom
+        self.speed_limit_ms = base
+      if float(getattr(self, "speed_limit_ms", 0.0) or 0.0) <= 0.0:
+        self.speed_limit_ms = float(gps.get("UI_mppSpeedLimit", 0.0) or 0.0) * map_uom_to_ms
+
+      ds = cp_ap_party.vl.get("DAS_status", {}) if cp_ap_party is not None else {}
+      fused = float(ds.get("DAS_fusedSpeedLimit", 0.0) or 0.0)
+      if fused >= 150.0:
+        self.speed_limit_ms_das = 150.0 / map_ms_to_uom
+      else:
+        self.speed_limit_ms_das = fused / map_ms_to_uom
+
+      if float(getattr(self, "speed_limit_ms_das", 0.0) or 0.0) > 0.0 and float(getattr(self, "speed_limit_ms", 0.0) or 0.0) > 0.0:
+        self.speed_limit_ms = min(self.speed_limit_ms, self.speed_limit_ms_das)
+    except Exception:
+      pass
 
     # AEB
     ret.stockAeb = cp_ap_party.vl["DAS_control"]["DAS_aebEvent"] == 1
@@ -278,6 +368,9 @@ def _update_blinker_latch(self, left_lamp: bool, right_lamp: bool, stalk: int, f
       try:
         self._reload_tinkla_params()
         self.autopilot_disabled = bool(self._tinkla.autopilot_disabled)
+        self.enableHSO = bool(getattr(self._tinkla, 'enable_hso', True))
+        self.hsoNumbPeriod = float(getattr(self._tinkla, 'hso_numb_period', 1.5) or 1.5)
+        self.handsOnLimit = float(getattr(self._tinkla, 'hands_on_level', 2.0) or 2.0)
       except Exception:
         pass
     self._param_frame += 1
@@ -304,11 +397,22 @@ def _update_blinker_latch(self, left_lamp: bool, right_lamp: bool, stalk: int, f
       pass
 
     try:
+      gps = can_parsers[Bus.party].vl.get("UI_gpsVehicleSpeed", {})
+      msu = int(gps.get("UI_mapSpeedLimitUnits", 0) or 0)
+      map_ms_to_uom = CV.MS_TO_KPH if msu == 1 else CV.MS_TO_MPH
+
       ds = can_parsers.get(Bus.ap_party).vl.get("DAS_status", {}) if can_parsers.get(Bus.ap_party) is not None else {}
-      if "DAS_fusedSpeedLimit" in ds:
-        self.speed_limit_ms_das = float(ds.get("DAS_fusedSpeedLimit", 0.0)) / (CV.MS_TO_KPH if self.speed_units == "KPH" else CV.MS_TO_MPH)
+      fused = float(ds.get("DAS_fusedSpeedLimit", 0.0) or 0.0)
+      if fused >= 150.0:
+        self.speed_limit_ms_das = 150.0 / map_ms_to_uom
+      else:
+        self.speed_limit_ms_das = fused / map_ms_to_uom
+
+      if float(getattr(self, "speed_limit_ms_das", 0.0) or 0.0) > 0.0 and float(getattr(self, "speed_limit_ms", 0.0) or 0.0) > 0.0:
+        self.speed_limit_ms = min(self.speed_limit_ms, self.speed_limit_ms_das)
     except Exception:
       pass
+
 
     ret.buttonEvents = []
     try:
@@ -371,7 +475,11 @@ def _update_blinker_latch(self, left_lamp: bool, right_lamp: bool, stalk: int, f
 
     # FSD disengages using union of handsOnLevel (slow overrides) and high angle rate faults (fast overrides, high speed)
     eac_error_code = self.can_defines["EPAS_sysStatus"]["EPAS_eacErrorCode"].get(int(epas_status["EPAS_eacErrorCode"]), None)
-    ret.steeringDisengage = self.hands_on_level >= 3 or (eac_status == "EAC_INHIBITED" and
+    if self.enableHSO:
+      ret.steeringDisengage = (eac_status == "EAC_INHIBITED" and
+                                                         eac_error_code == "EAC_ERROR_HIGH_ANGLE_RATE_SAFETY")
+    else:
+      ret.steeringDisengage = self.hands_on_level >= 3 or (eac_status == "EAC_INHIBITED" and
                                                          eac_error_code == "EAC_ERROR_HIGH_ANGLE_RATE_SAFETY")
 
     # Cruise state
@@ -379,6 +487,19 @@ def _update_blinker_latch(self, left_lamp: bool, right_lamp: bool, stalk: int, f
     speed_units = self.can_defines["DI_state"]["DI_speedUnits"].get(int(cp_chassis.vl["DI_state"]["DI_speedUnits"]), None)
 
     cruise_enabled = cruise_state in ("ENABLED", "STANDSTILL", "OVERRIDE", "PRE_FAULT", "PRE_CANCEL")
+
+    # Unity parity: real Tesla cruise setpoint (used for speed-limit sync)
+    self.stock_cruise_enabled = bool(cruise_enabled)
+    try:
+      cruise_set_uom = float(cp_chassis.vl["DI_state"].get("DI_cruiseSet", 0.0))
+      if speed_units == "KPH":
+        self.stock_cruise_set_speed_ms = max(0.0, cruise_set_uom * CV.KPH_TO_MS)
+      elif speed_units == "MPH":
+        self.stock_cruise_set_speed_ms = max(0.0, cruise_set_uom * CV.MPH_TO_MS)
+      else:
+        self.stock_cruise_set_speed_ms = 0.0
+    except Exception:
+      self.stock_cruise_set_speed_ms = 0.0
 
     # Match panda safety cruise engaged logic
     ret.cruiseState.enabled = cruise_enabled
@@ -406,10 +527,13 @@ def _update_blinker_latch(self, left_lamp: bool, right_lamp: bool, stalk: int, f
     if stw is not None:
       self.msg_stw_actn_req = copy.copy(stw)
       self.cruise_buttons = int(stw.get("SpdCtrlLvr_Stat", 0))
-      self.turnSignalStalkState = int(stw.get("TurnIndLvr_Stat", 0))
+      raw_ts = int(stw.get("TurnIndLvr_Stat", 0))
+      self.turnSignalStalkState = 0 if raw_ts == 3 else raw_ts
     else:
       self.cruise_buttons = 0
       self.turnSignalStalkState = 0
+      self.tap_direction = 0
+      self.blinker_controller.tap_direction = 0
 
 
     if self.autopilot_disabled:
@@ -429,9 +553,32 @@ def _update_blinker_latch(self, left_lamp: bool, right_lamp: bool, stalk: int, f
     # Blinkers
     self.leftBlinkerLamp = cp_chassis.vl["GTW_carState"]["BC_indicatorLStatus"] == 1
     self.rightBlinkerLamp = cp_chassis.vl["GTW_carState"]["BC_indicatorRStatus"] == 1
-    left_b, right_b = self._update_blinker_latch(bool(self.leftBlinkerLamp), bool(self.rightBlinkerLamp), int(getattr(self, "turnSignalStalkState", 0)), int(self._param_frame))
-    ret.leftBlinker = bool(left_b)
-    ret.rightBlinker = bool(right_b)
+
+    self.blinker_controller.update_state(self, self._param_frame)
+    self.tap_direction = int(self.blinker_controller.tap_direction)
+
+    # Unity parity: latch tap/comfort blinkers so DesireHelper sees continuous one_blinker during auto-start delay
+    if self.enableALC and (self.turnSignalStalkState == 0):
+      one = (self.leftBlinkerLamp != self.rightBlinkerLamp)
+      if one and int(getattr(self, '_alc_tap_latch_until', 0)) <= self._param_frame:
+        self._alc_tap_latch_dir = 1 if self.leftBlinkerLamp else 2
+        dur_s = max(2.5, float(self.autoStartAlcaDelay) + 0.5)
+        self._alc_tap_latch_until = int(self._param_frame + dur_s * 100)
+      if int(getattr(self, '_alc_tap_latch_until', 0)) > self._param_frame:
+        ret.leftBlinker = (self._alc_tap_latch_dir == 1)
+        ret.rightBlinker = (self._alc_tap_latch_dir == 2)
+      else:
+        ret.leftBlinker = False
+        ret.rightBlinker = False
+    else:
+      # stock behavior (incl. full stalk)
+      ret.leftBlinker = self.leftBlinkerLamp
+      ret.rightBlinker = self.rightBlinkerLamp
+
+    # HSO (Unity parity): use handsOnLevel for steeringPressed when enabled, but never during blinkers (preserve ALC)
+    self.HSOSteeringPressed = bool(getattr(self, "hands_on_level", 0.0) >= float(self._tinkla.hands_on_level))
+    if self.enableHSO and not (ret.leftBlinker or ret.rightBlinker):
+      ret.steeringPressed = self.HSOSteeringPressed
 
     # Seatbelt
     if self.CP.flags & TeslaLegacyParams.NO_SDM1:
@@ -444,6 +591,9 @@ def _update_blinker_latch(self, left_lamp: bool, right_lamp: bool, stalk: int, f
       try:
         self._reload_tinkla_params()
         self.autopilot_disabled = bool(self._tinkla.autopilot_disabled)
+        self.enableHSO = bool(getattr(self._tinkla, 'enable_hso', True))
+        self.hsoNumbPeriod = float(getattr(self._tinkla, 'hso_numb_period', 1.5) or 1.5)
+        self.handsOnLimit = float(getattr(self._tinkla, 'hands_on_level', 2.0) or 2.0)
       except Exception:
         pass
     self._param_frame += 1
