@@ -1,6 +1,7 @@
 import copy
 from dataclasses import dataclass
 
+from openpilot.common.swaglog import cloudlog
 from openpilot.selfdrive.car.modules.CFG_module import load_bool_param, load_float_param
 from openpilot.selfdrive.car.modules.BLNK_module import BLNKController
 from openpilot.selfdrive.car.modules.ALC_module import ALCController
@@ -32,9 +33,6 @@ class CarState(CarStateBase):
   def __init__(self, CP):
     super().__init__(CP)
     self.msg_stw_actn_req = None
-    self.stw_actn_bus = CANBUS.party  # physical bus where STW_ACTN_RQ is observed
-    self.stock_cruise_enabled = False
-    self.stock_cruise_set_speed_ms = 0.0
     self.can_define = CANDefine(DBC[CP.carFingerprint][Bus.party])
 
     if self.CP.carFingerprint in LEGACY_CARS:
@@ -74,6 +72,8 @@ class CarState(CarStateBase):
     self.speed_units = "MPH"
     self.speed_limit_ms = 0.0
     self.speed_limit_ms_das = 0.0
+    self.stock_cruise_enabled = False
+    self.stock_cruise_set_speed_ms = 0.0
     self.leftBlinkerLamp = False
     self.rightBlinkerLamp = False
     # ALC/BLNK/HSO/ACC (Unity parity)
@@ -195,26 +195,17 @@ class CarState(CarStateBase):
 
     autopark_state = self.can_define.dv["DI_state"]["DI_autoparkState"].get(int(cp_party.vl["DI_state"]["DI_autoparkState"]), None)
     cruise_enabled = cruise_state in ("ENABLED", "STANDSTILL", "OVERRIDE", "PRE_FAULT", "PRE_CANCEL")
-
-    # Tesla cruise setpoint (Unity parity for speed-limit sync)
-    self.stock_cruise_enabled = bool(cruise_enabled)
-    try:
-      csu = float(cp_party.vl["DI_state"].get("DI_cruiseSet", 0.0))
-      if speed_units == "KPH":
-        self.stock_cruise_set_speed_ms = csu * CV.KPH_TO_MS
-      elif speed_units == "MPH":
-        self.stock_cruise_set_speed_ms = csu * CV.MPH_TO_MS
-      else:
-        self.stock_cruise_set_speed_ms = 0.0
-    except Exception:
-      self.stock_cruise_set_speed_ms = 0.0
     self.update_autopark_state(autopark_state, cruise_enabled)
 
-    # Match panda safety cruise engaged logic
-    if speed_units == "KPH":
-      ret.cruiseState.speed = max(cp_party.vl["DI_state"]["DI_digitalSpeed"] * CV.KPH_TO_MS, 1e-3)
-    elif speed_units == "MPH":
-      ret.cruiseState.speed = max(cp_party.vl["DI_state"]["DI_digitalSpeed"] * CV.MPH_TO_MS, 1e-3)
+    # Cruise set speed (DI_cruiseSet); required for speed-limit stalk sync
+    cruise_set = float(cp_party.vl["DI_state"].get("DI_cruiseSet", 0.0) or 0.0)
+    self.stock_cruise_enabled = bool(cruise_enabled)
+    if cruise_set > 0.0:
+      self.stock_cruise_set_speed_ms = float(cruise_set) * (CV.KPH_TO_MS if speed_units == "KPH" else CV.MPH_TO_MS)
+      ret.cruiseState.speed = max(float(self.stock_cruise_set_speed_ms), 1e-3)
+    else:
+      self.stock_cruise_set_speed_ms = 0.0
+      ret.cruiseState.speed = max(float(ret.vEgo), 1e-3)
     if self.autopilot_disabled:
       # Unity parity: allow engagement without Tesla cruise (low-speed lateral only)
       ret.cruiseState.available = True
@@ -230,24 +221,20 @@ class CarState(CarStateBase):
     self.speed_units = speed_units if speed_units in ("KPH", "MPH") else "MPH"
 
     stw = None
-    stw_bus = CANBUS.party
     for _cp in (can_parsers.get(Bus.party), can_parsers.get(Bus.chassis), can_parsers.get(Bus.pt)):
       if _cp is None:
         continue
       try:
         stw = _cp.vl["STW_ACTN_RQ"]
-        stw_bus = int(getattr(_cp, "bus", CANBUS.party))
         break
       except KeyError:
         continue
     if stw is not None:
-      self.stw_actn_bus = int(stw_bus)
       self.msg_stw_actn_req = copy.copy(stw)
       self.cruise_buttons = int(stw.get("SpdCtrlLvr_Stat", 0))
       raw_ts = int(stw.get("TurnIndLvr_Stat", 0))
       self.turnSignalStalkState = 0 if raw_ts == 3 else raw_ts
     else:
-      self.stw_actn_bus = CANBUS.party
       self.cruise_buttons = 0
       self.turnSignalStalkState = 0
       self.tap_direction = 0
@@ -354,6 +341,17 @@ class CarState(CarStateBase):
     except Exception:
       pass
 
+    if self._tinkla.adjust_acc_with_speed_limit and (self._param_frame % 100 == 0):
+      try:
+        uom = str(self.speed_units)
+        conv = 2.2369362920544 if uom == 'MPH' else 3.6
+        cloudlog.info(
+          f"[XNOR_CS] uom={uom} cruiseSet={float(self.stock_cruise_set_speed_ms)*conv:.1f} "
+          f"stockCruise={bool(self.stock_cruise_enabled)} speedLimit={float(self.speed_limit_ms)*conv:.1f}"
+        )
+      except Exception:
+        pass
+
     try:
       ds = can_parsers.get(Bus.ap_party).vl.get("DAS_status", {}) if can_parsers.get(Bus.ap_party) is not None else {}
       if "DAS_fusedSpeedLimit" in ds:
@@ -435,48 +433,39 @@ class CarState(CarStateBase):
 
     cruise_enabled = cruise_state in ("ENABLED", "STANDSTILL", "OVERRIDE", "PRE_FAULT", "PRE_CANCEL")
 
-    # Tesla cruise setpoint (Unity parity for speed-limit sync)
-    self.stock_cruise_enabled = bool(cruise_enabled)
-    try:
-      csu = float(cp_chassis.vl["DI_state"].get("DI_cruiseSet", 0.0))
-      if speed_units == "KPH":
-        self.stock_cruise_set_speed_ms = csu * CV.KPH_TO_MS
-      elif speed_units == "MPH":
-        self.stock_cruise_set_speed_ms = csu * CV.MPH_TO_MS
-      else:
-        self.stock_cruise_set_speed_ms = 0.0
-    except Exception:
-      self.stock_cruise_set_speed_ms = 0.0
-
-    # Match panda safety cruise engaged logic
+    # Cruise set speed (DI_cruiseSet); required for speed-limit stalk sync
     ret.cruiseState.enabled = cruise_enabled
-    if speed_units == "KPH":
-      ret.cruiseState.speed = max(cp_chassis.vl["DI_state"]["DI_digitalSpeed"] * CV.KPH_TO_MS, 1e-3)
-    elif speed_units == "MPH":
-      ret.cruiseState.speed = max(cp_chassis.vl["DI_state"]["DI_digitalSpeed"] * CV.MPH_TO_MS, 1e-3)
+    cruise_set = float(cp_chassis.vl["DI_state"].get("DI_cruiseSet", 0.0) or 0.0)
+    self.stock_cruise_enabled = bool(cruise_enabled)
+    if cruise_set > 0.0:
+      self.stock_cruise_set_speed_ms = float(cruise_set) * (CV.KPH_TO_MS if speed_units == "KPH" else CV.MPH_TO_MS)
+      ret.cruiseState.speed = max(float(self.stock_cruise_set_speed_ms), 1e-3)
+    else:
+      self.stock_cruise_set_speed_ms = 0.0
+      ret.cruiseState.speed = max(float(ret.vEgo), 1e-3)
     ret.cruiseState.available = cruise_state == "STANDBY" or ret.cruiseState.enabled
     ret.cruiseState.standstill = False  # This needs to be false, since we can resume from stop without sending anything special
     ret.standstill = cruise_state == "STANDSTILL"
     ret.accFaulted = cruise_state == "FAULT"
+
+    # Unity parity: store last STW_ACTN_RQ for virtual stalk + tap-to-ALC
+    self.speed_units = speed_units if speed_units in ("KPH", "MPH") else "MPH"
+
     stw = None
-    stw_bus = CANBUS.party
     for _cp in (can_parsers.get(Bus.party), can_parsers.get(Bus.chassis), can_parsers.get(Bus.pt)):
       if _cp is None:
         continue
       try:
         stw = _cp.vl["STW_ACTN_RQ"]
-        stw_bus = int(getattr(_cp, "bus", CANBUS.party))
         break
       except KeyError:
         continue
     if stw is not None:
-      self.stw_actn_bus = int(stw_bus)
       self.msg_stw_actn_req = copy.copy(stw)
       self.cruise_buttons = int(stw.get("SpdCtrlLvr_Stat", 0))
       raw_ts = int(stw.get("TurnIndLvr_Stat", 0))
       self.turnSignalStalkState = 0 if raw_ts == 3 else raw_ts
     else:
-      self.stw_actn_bus = CANBUS.party
       self.cruise_buttons = 0
       self.turnSignalStalkState = 0
       self.tap_direction = 0
