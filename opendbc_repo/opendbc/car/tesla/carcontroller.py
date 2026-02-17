@@ -1,272 +1,315 @@
 # /data/openpilot/opendbc/car/tesla/carcontroller.py
+"""Tesla CarController (xnor C3)
+
+This file adds two Unity-parity behaviors while keeping steering logic minimal/stable:
+
+1) ALC blinker hold:
+   - When ALC is starting/engaged (or during the internal tap latch window),
+     keep Tesla blinker ON by overriding TurnIndLvr_Stat via STW_ACTN_RQ.
+   - Cancel the blinker when ALC reports done.
+
+2) ACC speed-limit sync:
+   - When enabled and Tesla cruise is engaged, match Tesla cruise set speed to
+     Tesla map speed limit by emulating cruise stalk up/down via STW_ACTN_RQ.
+
+Both features use TeslaCAN.create_action_request(), which computes the correct
+counter + CRC8 (Unity parity).
+"""
+
+from __future__ import annotations
+
+import time
 import numpy as np
+
+from openpilot.common.params import Params
 
 from opendbc.can import CANPacker
 from opendbc.car import Bus
-from opendbc.car.common.conversions import Conversions as CV
 from opendbc.car.interfaces import CarControllerBase
 from opendbc.car.lateral import apply_std_steer_angle_limits
 
 from opendbc.car.tesla.teslacan import TeslaCAN
 try:
-  from opendbc.car.tesla.teslacan_legacy import TeslaCANLegacy
-except ImportError:  # pragma: no cover
-  TeslaCANLegacy = None  # type: ignore
+  from opendbc.car.tesla.teslacan_legacy import TeslaCANLegacy as TeslaCANLegacy
+except ImportError:
+  from opendbc.car.tesla.teslacan_legacy import TeslaCANRaven as TeslaCANLegacy
 
-from opendbc.car.tesla.values import CANBUS, CAR, LEGACY_CARS, CarControllerParams, CruiseButtons
-from openpilot.common.params import Params
-from openpilot.common.swaglog import cloudlog
+from opendbc.car.tesla.values import CarControllerParams, CANBUS, LEGACY_CARS
+
+
+# Unity button values (SpdCtrlLvr_Stat)
+BTN_IDLE = 0
+BTN_CANCEL = 1
+BTN_MAIN = 2
+BTN_UP2 = 4
+BTN_DOWN2 = 8
+BTN_UP1 = 16
+BTN_DOWN1 = 32
+
+# TurnIndLvr_Stat (Tesla)
+TURN_NONE = 3
+TURN_LEFT = 1
+TURN_RIGHT = 2
+
+
+class _CachedParams:
+  def __init__(self) -> None:
+    self._p = Params()
+    self._last_read_frame = -100000
+    self.autopilot_disabled = False
+    self.pedal_enabled = False
+    self.adjust_acc_with_speed_limit = False
+    self.speed_limit_offset_uom = 0.0
+    self.speed_limit_use_relative = False
+
+  def refresh(self, frame: int) -> None:
+    if (frame - self._last_read_frame) < 50:
+      return
+    self._last_read_frame = int(frame)
+    self.autopilot_disabled = bool(self._p.get_bool("TinklaAutopilotDisabled"))
+    self.pedal_enabled = bool(self._p.get_bool("TinklaPedalEnabled") or self._p.get_bool("PedalEnabled"))
+    self.adjust_acc_with_speed_limit = bool(self._p.get_bool("TinklaAdjustAccWithSpeedLimit"))
+    try:
+      self.speed_limit_offset_uom = float(self._p.get("TinklaSpeedLimitOffset", encoding="utf-8") or "0")
+    except Exception:
+      self.speed_limit_offset_uom = 0.0
+    self.speed_limit_use_relative = bool(self._p.get_bool("TinklaSpeedLimitUseRelative"))
 
 
 class CarController(CarControllerBase):
-  def __init__(self, dbc_name, CP, VM):
-    super().__init__(dbc_name, CP, VM)
-    self.CCP = CarControllerParams(CP)
-    self.packer = CANPacker(dbc_name)
+  def __init__(self, dbc_names, CP, VM=None):
+    super().__init__(dbc_names, CP)
 
-    self.params = Params()
+    self.CP = CP
     self.frame = 0
+    self._params = _CachedParams()
 
+    self._op659_prev_btn = 0
     self.apply_angle_last = 0.0
-    self._cached_pedal_enabled = False
-    self._cached_autopilot_disabled = False
-    self._cached_adjust_speed_limit = False
-    self._cached_enable_alc = False
 
+    # For STW_ACTN_RQ injection we always use TeslaCAN (CRC + counter)
+    # even on legacy cars (steering still uses TeslaCANLegacy).
     if CP.carFingerprint in LEGACY_CARS:
       self.packers = {
-        CANBUS.party: CANPacker(dbc_name),
-        CANBUS.radar: CANPacker("tesla_powertrain"),
-        CANBUS.autopilot_party: CANPacker(dbc_name),
+        CANBUS.party: CANPacker(dbc_names[Bus.party]),
+        CANBUS.powertrain: CANPacker(dbc_names[Bus.pt]),
       }
-      self.tesla_can = TeslaCANLegacy(self.packers)  # type: ignore[misc]
-      # TeslaCANLegacy doesn't implement STW_ACTN_RQ button injection; use TeslaCAN for that.
-      self.action_can = TeslaCAN(self.packers[CANBUS.party])
-      self._action_buses = (CANBUS.party, CANBUS.autopilot_party)
+      self.tesla_can = TeslaCANLegacy(self.packers)
+      self._stw_can = TeslaCAN(self.packers[CANBUS.party])
     else:
+      self.packer = CANPacker(dbc_names[Bus.party])
       self.tesla_can = TeslaCAN(self.packer)
-      self.action_can = self.tesla_can
-      self._action_buses = (CANBUS.party,)
+      self._stw_can = self.tesla_can
 
-    # Virtual stalk injection state (Unity parity)
-    self._stw_queue: list[tuple[int, int | None]] = []
-    self._speed_sync_last_frame = -1_000_000
-    self._last_human_cruise_action_frame = -1_000_000
+    # pacing / debouncing
+    self._last_human_stalk_frame = -100000
+    self._last_speed_sync_frame = -100000
+    self._last_turn_hold_frame = -100000
+    self._turn_cancel_until_frame = -1
 
-    # ALC blinker hold (Unity parity behavior requested)
-    self._blinker_hold_dir = 0  # 1-left, 2-right
-    self._blinker_cancel_until_frame = 0
-    self._prev_in_lane_change = False
+  def _emit_internal_0x659(self, CS, can_sends):
+    stalk_btn = int(getattr(CS, "cruise_buttons", 0) or 0)
+    prev_btn = int(self._op659_prev_btn)
 
-  def _refresh_cached_params(self) -> None:
-    # Params are expensive; refresh at 2Hz.
-    if (self.frame % 50) != 0:
-      return
-    try:
-      self._cached_pedal_enabled = bool(self.params.get_bool("TinklaEnableACC"))
-      self._cached_autopilot_disabled = bool(self.params.get_bool("TinklaAutopilotDisabled"))
-      self._cached_adjust_speed_limit = bool(self.params.get_bool("TinklaAdjustAccWithSpeedLimit"))
-      self._cached_enable_alc = bool(self.params.get_bool("TinklaEnableALC"))
-    except Exception:
-      pass
+    main_edge = (stalk_btn == BTN_MAIN) and (prev_btn != BTN_MAIN)
+    cancel_edge = (stalk_btn == BTN_CANCEL) and (prev_btn != BTN_CANCEL)
 
-  def _emit_internal_0x659(self, CS, can_sends: list) -> None:
-    # Internal openpilot->panda msg (0x659). Safety consumes + blocks it from the car.
-    if not self._cached_autopilot_disabled:
-      return
-    if (self.frame % 10) != 0:
-      return
-    can_sends.append(
-      self.action_can.create_fake_das_msg(
-        pedalEnabled=bool(self._cached_pedal_enabled),
-        autopilot_disabled=bool(self._cached_autopilot_disabled),
-        bus=CANBUS.party,
-      )
-    )
-    # Legacy safety expects this also on bus+4.
-    can_sends.append(
-      self.action_can.create_fake_das_msg(
-        pedalEnabled=bool(self._cached_pedal_enabled),
-        autopilot_disabled=bool(self._cached_autopilot_disabled),
-        bus=CANBUS.party + 4,
-      )
-    )
+    self._op659_prev_btn = stalk_btn
 
-  def _enqueue_stw(self, cruise_button: int, *, turn_signal: int | None = None) -> None:
-    # turn_signal: 1=left, 2=right, 3=neutral; None leaves current state unchanged.
-    self._stw_queue.append((int(cruise_button), int(turn_signal) if turn_signal is not None else None))
+    if (self.frame % 10 == 0) or main_edge or cancel_edge:
+      for bus in (CANBUS.party, CANBUS.party + 4):
+        can_sends.append(self._stw_can.create_fake_das_msg(
+          pedalEnabled=self._params.pedal_enabled,
+          autopilot_disabled=self._params.autopilot_disabled,
+          bus=bus,
+          stalk_main=main_edge,
+          stalk_cancel=cancel_edge,
+        ))
 
-  def _pulse_cruise_button(self, cruise_button: int) -> None:
-    self._enqueue_stw(cruise_button)
-    self._enqueue_stw(CruiseButtons.IDLE)
+  def _stw_buses(self) -> list[int]:
+    buses = [CANBUS.party]
+    # Unity parity: AP1/AP2 cars also require the message on the autopilot bus.
+    if self.CP.carFingerprint in LEGACY_CARS:
+      buses.append(CANBUS.autopilot_party)
+    return buses
 
-  def _send_one_stw(self, CS, can_sends: list) -> None:
-    if not self._stw_queue:
-      return
-    if getattr(CS, "msg_stw_actn_req", None) is None:
-      self._stw_queue.clear()
+  def _send_stw_actn(self, can_sends, CS, cruise_btn: int, turn: int | None) -> None:
+    msg = getattr(CS, "msg_stw_actn_req", None)
+    if msg is None:
       return
 
-    cruise_btn, turn_sig = self._stw_queue.pop(0)
-    msg = dict(CS.msg_stw_actn_req or {})
-    if turn_sig is not None:
-      msg["TurnIndLvr_Stat"] = int(turn_sig)
+    values = dict(msg)
+    if turn is not None:
+      values["TurnIndLvr_Stat"] = int(turn)
 
-    for bus in self._action_buses:
-      can_sends.append(self.action_can.create_action_request(bus, msg, cruise_btn))
+    for bus in self._stw_buses():
+      # insert first to win race vs real stalk frames
+      can_sends.insert(0, self._stw_can.create_action_request(bus, values, int(cruise_btn)))
 
-  def _update_alc_blinker_hold(self, CC, CS) -> None:
-    if not (self._cached_enable_alc and bool(getattr(CS, "enableALC", False))):
-      self._blinker_hold_dir = 0
-      self._blinker_cancel_until_frame = 0
-      self._prev_in_lane_change = False
-      return
+  def _speed_limit_offset_ms(self, CS, speed_limit_ms: float) -> float:
+    if not self._params.adjust_acc_with_speed_limit:
+      return 0.0
 
-    lat_active = bool(getattr(CC, "latActive", False))
-    if not lat_active:
-      # Still allow a short neutral push to cancel after a completed lane change.
-      if self._blinker_cancel_until_frame > 0 and (self.frame % 10) == 0:
-        self._enqueue_stw(CruiseButtons.IDLE, turn_signal=3)
-      if self._blinker_cancel_until_frame and self.frame >= self._blinker_cancel_until_frame:
-        self._blinker_cancel_until_frame = 0
-        self._blinker_hold_dir = 0
-      self._prev_in_lane_change = False
-      return
+    offset_uom = float(self._params.speed_limit_offset_uom or 0.0)
+    if offset_uom == 0.0:
+      return 0.0
 
-    # Never override when the driver is physically holding the stalk.
-    if int(getattr(CS, "turnSignalStalkState", 0) or 0) in (1, 2):
-      self._blinker_hold_dir = 0
-      self._blinker_cancel_until_frame = 0
-      self._prev_in_lane_change = False
-      return
+    if self._params.speed_limit_use_relative:
+      return speed_limit_ms * offset_uom / 100.0
 
-    in_lc = bool(
-      getattr(CS, "alca_pre_engage", False)
-      or getattr(CS, "alca_engaged", False)
-      or getattr(CS, "alca_need_engagement", False)
-    )
+    # Unity parity: offset is in car speed units
+    su = str(getattr(CS, "speed_units", "MPH"))
+    if su == "KPH":
+      return offset_uom * (1000.0 / 3600.0)
+    return offset_uom * (1609.344 / 3600.0)
 
-    if in_lc and not self._prev_in_lane_change:
-      dir_ = int(getattr(CS, "alca_direction", 0) or 0)
-      if dir_ not in (1, 2):
-        if bool(getattr(CS, "leftBlinkerLamp", False)):
-          dir_ = 1
-        elif bool(getattr(CS, "rightBlinkerLamp", False)):
-          dir_ = 2
-        else:
-          dir_ = int(getattr(CS, "tap_direction", 0) or 0)
-      self._blinker_hold_dir = dir_ if dir_ in (1, 2) else 0
-      self._blinker_cancel_until_frame = 0
+  def _choose_speed_sync_button(self, CS, target_ms: float, current_ms: float) -> int | None:
+    # if no valid target/current
+    if target_ms <= 0.1 or current_ms <= 0.1:
+      return None
 
-    # Falling edge / completion: force stalk back to neutral briefly.
-    if (not in_lc and self._prev_in_lane_change) or bool(getattr(CS, "alca_done", False)):
-      if self._blinker_hold_dir in (1, 2):
-        self._blinker_cancel_until_frame = self.frame + 30  # ~0.3s
-      self._prev_in_lane_change = False
-    else:
-      self._prev_in_lane_change = in_lc
+    diff_ms = float(target_ms - current_ms)
+    su = str(getattr(CS, "speed_units", "MPH"))
+    diff_uom = diff_ms * (3.6 if su == "KPH" else 2.2369362920544)
 
-    if in_lc and self._blinker_hold_dir in (1, 2):
-      if (self.frame % 10) == 0:  # 10Hz keepalive
-        self._enqueue_stw(CruiseButtons.IDLE, turn_signal=self._blinker_hold_dir)
-    elif self._blinker_cancel_until_frame > 0:
-      if (self.frame % 10) == 0:
-        self._enqueue_stw(CruiseButtons.IDLE, turn_signal=3)
-      if self.frame >= self._blinker_cancel_until_frame:
-        self._blinker_cancel_until_frame = 0
-        self._blinker_hold_dir = 0
+    # deadband
+    if abs(diff_uom) < 0.6:
+      return None
 
-  def _update_speed_limit_sync(self, CC, CS) -> None:
-    if not self._cached_adjust_speed_limit:
-      return
-    if not bool(getattr(CC, "enabled", False)):
-      return
-    if not bool(getattr(CS, "stock_cruise_enabled", False)):
-      return
+    # emulate Unity's half/ full press thresholds
+    half_press = 1.0  # ~1 unit
+    full_press = 5.0  # ~5 units
+    if diff_uom >= full_press:
+      return BTN_UP2
+    if diff_uom >= half_press:
+      return BTN_UP1
+    if diff_uom <= -full_press:
+      return BTN_DOWN2
+    if diff_uom <= -half_press:
+      return BTN_DOWN1
+    return None
 
-    # Respect recent human adjustments.
-    human_btn = int(getattr(CS, "cruise_buttons", 0) or 0)
-    if human_btn in (CruiseButtons.RES_ACCEL, CruiseButtons.RES_ACCEL_2ND, CruiseButtons.DECEL_SET, CruiseButtons.DECEL_2ND):
-      self._last_human_cruise_action_frame = self.frame
-    if (self.frame - self._last_human_cruise_action_frame) < 300:  # 3s
-      return
+  def _compute_turn_hold(self, CS) -> int | None:
+    # Do not override when driver is holding the stalk (full signal)
+    if int(getattr(CS, "turnSignalStalkState", 0) or 0) != 0:
+      return None
 
-    target_ms = 0.0
-    try:
-      target_ms = float(CS._calc_speed_limit_target_ms(getattr(CS, "speed_units", "MPH")))
-    except Exception:
-      target_ms = 0.0
-    if target_ms <= 0.1:
-      return
+    # If we recently requested a cancel, keep forcing neutral for a short time
+    if self._turn_cancel_until_frame >= self.frame:
+      return TURN_NONE
 
-    current_ms = float(getattr(CS, "stock_cruise_set_speed_ms", 0.0) or 0.0)
-    if current_ms <= 0.1:
-      return
+    # Prefer explicit ALC direction when available
+    alca_active = bool(getattr(CS, "alca_pre_engage", False) or getattr(CS, "alca_engaged", False))
+    if alca_active:
+      d = int(getattr(CS, "alca_direction", 0) or 0)
+      if d == 1:
+        return TURN_LEFT
+      if d == 2:
+        return TURN_RIGHT
 
-    units = getattr(CS, "speed_units", "MPH")
-    ms_to_uom = CV.MS_TO_KPH if units == "KPH" else CV.MS_TO_MPH
-    diff_uom = (target_ms - current_ms) * ms_to_uom
+    # During the tap latch window, keep the requested direction
+    latch_until = int(getattr(CS, "_alc_tap_latch_until", 0) or 0)
+    if latch_until > self.frame:
+      d = int(getattr(CS, "_alc_tap_latch_dir", 0) or 0)
+      if d == 1:
+        return TURN_LEFT
+      if d == 2:
+        return TURN_RIGHT
 
-    # Match Unity ACC_module thresholds (0.9x of half-press, 0.6x of full-press).
-    half_press = 1.0
-    full_press = 5.0
+    # If lane change just finished, request cancel once
+    if bool(getattr(CS, "alca_done", False)):
+      self._turn_cancel_until_frame = int(self.frame + 50)  # ~0.5s @ 100Hz
+      return TURN_NONE
 
-    if abs(diff_uom) < 0.9 * half_press:
-      return
-    if (self.frame - self._speed_sync_last_frame) < 20:  # 5Hz max
-      return
-    self._speed_sync_last_frame = self.frame
-
-    if diff_uom > 0:
-      btn = CruiseButtons.RES_ACCEL_2ND if diff_uom >= 0.6 * full_press else CruiseButtons.RES_ACCEL
-    else:
-      btn = CruiseButtons.DECEL_2ND if diff_uom <= -0.6 * full_press else CruiseButtons.DECEL_SET
-
-    self._pulse_cruise_button(btn)
-    cloudlog.info(
-      f"[CRUISE SYNC] target={target_ms*ms_to_uom:.1f} {units} current={current_ms*ms_to_uom:.1f} {units} btn={btn}"
-    )
+    return None
 
   def update(self, CC, CS, now_nanos):
     actuators = CC.actuators
-    can_sends: list = []
+    can_sends = []
 
-    # Safety + param refresh
-    self._refresh_cached_params()
+    self._params.refresh(self.frame)
     self._emit_internal_0x659(CS, can_sends)
 
-    # Stalk injection (requires last STW_ACTN_RQ snapshot)
-    if self._cached_autopilot_disabled and getattr(CS, "msg_stw_actn_req", None) is not None:
-      self._update_alc_blinker_hold(CC, CS)
-      self._update_speed_limit_sync(CC, CS)
-      # Send at most one STW frame per cycle to avoid racing the real stalk.
-      self._send_one_stw(CS, can_sends)
-    else:
-      self._stw_queue.clear()
-      self._blinker_hold_dir = 0
-      self._blinker_cancel_until_frame = 0
-      self._prev_in_lane_change = False
+    autopilot_disabled = bool(self._params.autopilot_disabled)
+    human_control = bool(getattr(CS, "human_control", False))
 
-    # Steering control (unchanged)
-    lat_active = bool(CC.latActive)
-    if (self.frame % self.CCP.STEER_STEP == 0) and (lat_active or (self.CP.carFingerprint == CAR.TESLA_MODEL_S_HW1)):
-      apply_angle = apply_std_steer_angle_limits(
-        actuators.steeringAngleDeg,
-        self.apply_angle_last,
-        CS.out.vEgo,
-        self.CCP,
-      )
-      apply_angle = np.clip(apply_angle, CS.out.steeringAngleDeg - 20.0, CS.out.steeringAngleDeg + 20.0)
+    lat_active = (
+      bool(CC.latActive) and
+      autopilot_disabled and
+      (not CS.out.cruiseState.standstill) and
+      (not human_control)
+    )
+
+    # Steering (50Hz)
+    if self.frame % 2 == 0:
+      if human_control:
+        self.apply_angle_last = float(CS.out.steeringAngleDeg)
+      else:
+        self.apply_angle_last = float(apply_std_steer_angle_limits(
+          float(actuators.steeringAngleDeg),
+          float(self.apply_angle_last),
+          float(getattr(CS.out, "vEgoRaw", CS.out.vEgo)),
+          float(CS.out.steeringAngleDeg),
+          lat_active,
+          CarControllerParams.ANGLE_LIMITS,
+        ))
+
+      if self.CP.carFingerprint in LEGACY_CARS:
+        counter = (self.frame // 2) % 16
+        can_sends.append(self.tesla_can.create_steering_control(counter, self.apply_angle_last, lat_active))
+      else:
+        can_sends.append(self.tesla_can.create_steering_control(self.apply_angle_last, lat_active))
+
+    # EPS allow (legacy)
+    if (self.CP.carFingerprint in LEGACY_CARS) and (self.frame % 10 == 0):
+      counter = (self.frame // 10) % 16
+      can_sends.append(self.tesla_can.create_steering_allowed(counter))
+
+    # --- Unity parity: STW_ACTN_RQ injection (only when OP is controlling steering)
+    if autopilot_disabled and bool(getattr(CC, "enabled", False) or CC.latActive):
+      # If user touched the cruise stalk, back off briefly.
+      if int(getattr(CS, "cruise_buttons", 0) or 0) != 0:
+        self._last_human_stalk_frame = int(self.frame)
+
+      allow_inject = (self.frame - self._last_human_stalk_frame) > 100  # ~1s
+
+      turn_hold = self._compute_turn_hold(CS)
+
+      # Speed-limit sync at 5Hz (Unity does frame % 20)
+      cruise_btn = None
+      if allow_inject and self._params.adjust_acc_with_speed_limit:
+        if (self.frame - self._last_speed_sync_frame) >= 20:
+          if bool(getattr(CS, "stock_cruise_enabled", False)):
+            speed_limit_ms = float(getattr(CS, "speed_limit_ms", 0.0) or 0.0)
+            offset_ms = float(self._speed_limit_offset_ms(CS, speed_limit_ms))
+            target_ms = speed_limit_ms + offset_ms
+            current_ms = float(getattr(CS, "stock_cruise_set_speed_ms", 0.0) or 0.0)
+            cruise_btn = self._choose_speed_sync_button(CS, target_ms, current_ms)
+
+      if cruise_btn is not None:
+        self._last_speed_sync_frame = int(self.frame)
+        self._send_stw_actn(can_sends, CS, cruise_btn, turn_hold)
+      else:
+        # Turn hold at 10Hz while active
+        if turn_hold is not None and (self.frame - self._last_turn_hold_frame) >= 10:
+          self._last_turn_hold_frame = int(self.frame)
+          self._send_stw_actn(can_sends, CS, BTN_IDLE, turn_hold)
+
+    # Longitudinal (optional)
+    if self.CP.openpilotLongitudinalControl and (self.frame % 4 == 0):
+      state = 13 if CC.cruiseControl.cancel else 4
+      accel = float(np.clip(float(actuators.accel), CarControllerParams.ACCEL_MIN, CarControllerParams.ACCEL_MAX))
+      counter = (self.frame // 4) % 8
+      long_active = bool(CC.longActive) and (not autopilot_disabled)
+
       can_sends.append(
-        self.tesla_can.create_steering_control(
-          apply_angle,
-          lat_active and (not CS.human_control) and (not CS.out.cruiseState.standstill),
-          0,
-          CANBUS.party,
-          1,
+        self.tesla_can.create_longitudinal_command(
+          state, accel, counter, float(CS.out.vEgo), long_active
         )
       )
-      self.apply_angle_last = apply_angle
+
+    new_actuators = actuators.as_builder()
+    new_actuators.steeringAngleDeg = float(self.apply_angle_last)
 
     self.frame += 1
-    return can_sends
+    return new_actuators, can_sends

@@ -22,11 +22,13 @@ from openpilot.selfdrive.car.cruise import VCruiseHelper
 from openpilot.selfdrive.car.car_specific import MockCarState
 
 from openpilot.selfdrive.tesla_0x659 import Tesla659Carrier
-# XNOR_TESLA_SPEEDLIMIT_RAW_V1: decode Tesla speed limit from UI/DAS CAN without DBC/capnp fields.
+
+
+# XNOR_TESLA_SL_RAW_V1: raw Tesla speed limit decoder (no DBC dependency)
 class _TeslaSpeedLimitRaw:
-  UI_GPS_ID = 0x2F8      # UI_gpsVehicleSpeed
-  UI_SIGN_ID = 0x238     # UI_driverAssistRoadSign
-  DAS_STATUS_ID = 0x399  # DAS_status
+  UI_GPS_ID = 0x2F8
+  UI_SIGN_ID = 0x238
+  DAS_STATUS_ID = 0x399
 
   KPH_TO_MS = 1000.0 / 3600.0
   MPH_TO_MS = 1609.344 / 3600.0
@@ -77,6 +79,7 @@ class _TeslaSpeedLimitRaw:
     if chosen <= 0.0 and self.fused_ms > 0.0:
       chosen = self.fused_ms
     return float(chosen)
+
 
 
 REPLAY = "REPLAY" in os.environ
@@ -218,20 +221,31 @@ class Car:
       if extra:
         self.pm.sock['sendcan'].send(can_list_to_can_capnp(extra, msgtype='sendcan'))
 
-    CS = self.CI.update(can_list)
-    # XNOR_TESLA_SPEEDLIMIT_APPLY_V1
+    
+    # XNOR_TESLA_SL_APPLY_V1
     if getattr(self, "_tesla_sl_raw", None) is not None:
       try:
         self._tesla_sl_raw.update(can_list)
-        units = str(getattr(self._tesla_sl_raw, "units", "MPH"))
-        chosen = float(self._tesla_sl_raw.chosen_ms())
-        fused = float(getattr(self._tesla_sl_raw, "fused_ms", 0.0))
-        # Interface-state only (NOT capnp)
-        self.CI.CS.speed_units = units
-        self.CI.CS.speed_limit_ms = chosen
-        self.CI.CS.speed_limit_ms_das = fused
       except Exception:
         pass
+
+    CS = self.CI.update(can_list)
+
+
+    if getattr(self, "_tesla_sl_raw", None) is not None:
+      try:
+        chosen = float(self._tesla_sl_raw.chosen_ms())
+        fused = float(getattr(self._tesla_sl_raw, "fused_ms", 0.0))
+        units = str(getattr(self._tesla_sl_raw, "units", "MPH"))
+        try:
+          self.CI.CS.speed_units = units
+          self.CI.CS.speed_limit_ms = chosen
+          self.CI.CS.speed_limit_ms_das = fused
+        except Exception:
+          pass
+      except Exception:
+        pass
+
 
     if self.CP.brand == 'mock':
       CS = self.mock_carstate.update(CS)
