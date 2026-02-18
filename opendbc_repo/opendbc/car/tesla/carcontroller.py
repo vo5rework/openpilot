@@ -124,7 +124,7 @@ class CarController(CarControllerBase):
     self._op659_prev_btn = stalk_btn
 
     if (self.frame % 10 == 0) or main_edge or cancel_edge:
-      for bus in (CANBUS.party,):
+      for bus in (CANBUS.party, CANBUS.party + 4):
         can_sends.append(create_fake_das(
           self._cached_pedal_enabled,
           self._cached_autopilot_disabled,
@@ -152,10 +152,9 @@ class CarController(CarControllerBase):
     return max(0.0, limit_ms + (off * (CV.KPH_TO_MS if uom == "KPH" else CV.MPH_TO_MS)))
 
   def _stw_bus(self, CS) -> int:
-    try:
-      return int(getattr(CS, "stw_actn_bus", CANBUS.party))
-    except Exception:
-      return int(CANBUS.party)
+    # Safety: sending STW_ACTN_RQ on the wrong bus can trigger Tesla HUD faults.
+    # On this platform, STW_ACTN_RQ is mirrored on CANBUS.party, so always inject there.
+    return int(CANBUS.party)
 
   def _action_can_for_bus(self, bus: int):
     return (
@@ -242,7 +241,7 @@ class CarController(CarControllerBase):
       if (self.frame % 200) == 0:
         cloudlog.info(
           f"[XNOR_CRUISE_SYNC] gated: target_ms={target_ms:.2f} current_ms={current_ms:.2f} "
-          f"speedLimit_ms={float(getattr(CS, 'speed_limit_ms', 0.0) or 0.0):.2f}"
+          f"speedLimit_ms={float(getattr(CS, 'speed_limit_ms', 0.0) or 0.0):.2f} das={float(getattr(CS, 'speed_limit_ms_das', 0.0) or 0.0):.2f}"
         )
       return
 
@@ -288,9 +287,9 @@ class CarController(CarControllerBase):
           (float(getattr(CS.out, "vEgo", 0.0)) >= (18.0 * CV.MPH_TO_MS)) and
           (not bool(getattr(CS, "stock_cruise_enabled", False))) and
           (not bool(self._stw_sequence))):
-        # Unity parity: legacy cars often require MAIN + SET on engage
-        self._stw_sequence = [(int(self.frame), BTN_MAIN), (int(self.frame) + 10, BTN_DOWN1)]
-        cloudlog.info("[XNOR_CRUISE_SYNC] legacy engage: queued MAIN+SET")
+        # Unity parity: legacy cars often require MAIN + RESUME on engage
+        self._stw_sequence = [(int(self.frame), BTN_MAIN), (int(self.frame) + 10, BTN_UP1)]
+        cloudlog.info("[XNOR_CRUISE_SYNC] legacy engage: queued MAIN+RESUME")
     self._op_enabled_prev = bool(op_enabled)
 
     self._process_stalk_actions(CS, can_sends)
