@@ -40,7 +40,6 @@ class CarState(CarStateBase):
     # Calibrate once on rising edge of stock cruise enable.
     self._prev_stock_cruise_enabled = False
     self._cruise_set_scale = 1.0
-    self._cruise_set_calib_frames = 0
     self._cruise_set_src = 'DI_cruiseSet'
 
 
@@ -150,9 +149,8 @@ class CarState(CarStateBase):
     """Return stock cruise set speed in vehicle units (MPH/KPH).
 
     Tesla's DI_state.DI_cruiseSet is half-scale on some platforms/wirings.
-    Some cars also report DI_cruiseSet=0 on the first enabled frame, so we
-    allow a short calibration window to lock 1x vs 2x scale once a valid
-    cruiseSet arrives (Unity parity behavior).
+    Detect on the rising edge of stock cruise enable (set ~= current), then
+    apply a persistent scale factor while stock cruise stays enabled.
     """
     try:
       cruise_set_u = float(di_state.get("DI_cruiseSet", 0.0) or 0.0)
@@ -166,30 +164,24 @@ class CarState(CarStateBase):
     if not cruise_enabled:
       self._prev_stock_cruise_enabled = False
       self._cruise_set_scale = 1.0
-      self._cruise_set_calib_frames = 0
       self._cruise_set_src = "DI_cruiseSet"
       return cruise_set_u, "DI_cruiseSet"
 
     ms_to_u = CV.MS_TO_KPH if uom == "KPH" else CV.MS_TO_MPH
     v_u = float(v_ego_ms) * ms_to_u
 
-    if not bool(self._prev_stock_cruise_enabled):
-      self._cruise_set_calib_frames = 0
-    self._cruise_set_calib_frames = int(getattr(self, "_cruise_set_calib_frames", 0)) + 1
-
-    if (self._cruise_set_scale == 1.0) and (self._cruise_set_calib_frames <= 50) and cruise_set_u > 0.0 and v_u > 1.0:
+    if (not bool(self._prev_stock_cruise_enabled)) and cruise_set_u > 0.0 and v_u > 1.0:
       err_1x = abs(cruise_set_u - v_u)
       err_2x = abs((2.0 * cruise_set_u) - v_u)
-      if (err_2x + 0.75) < err_1x:
-        self._cruise_set_scale = 2.0
+      self._cruise_set_scale = 2.0 if (err_2x + 0.75) < err_1x else 1.0
 
     self._prev_stock_cruise_enabled = True
 
     base_u = cruise_set_u if cruise_set_u > 0.0 else digital_u
-    scaled_u = float(base_u) * float(getattr(self, "_cruise_set_scale", 1.0))
+    scaled_u = float(base_u) * float(self._cruise_set_scale)
 
     src = "DI_cruiseSet" if cruise_set_u > 0.0 else "DI_digitalSpeed"
-    if float(getattr(self, "_cruise_set_scale", 1.0)) != 1.0:
+    if self._cruise_set_scale != 1.0:
       src = f"{src}*{int(self._cruise_set_scale)}"
     self._cruise_set_src = src
     return scaled_u, src
@@ -220,16 +212,16 @@ class CarState(CarStateBase):
 
     # Map / road-sign
     try:
-      gps = _msg("UI_gpsVehicleSpeed", (Bus.party, Bus.ap_party, Bus.cam, Bus.chassis, Bus.pt, Bus.ap_pt))
+      gps = _msg("UI_gpsVehicleSpeed", (Bus.ap_party, Bus.party, Bus.cam, Bus.chassis, Bus.pt, Bus.ap_pt))
       if isinstance(gps, dict) and gps:
         msu = int(gps.get("UI_mapSpeedLimitUnits", 0))
         map_uom_to_ms = CV.KPH_TO_MS if msu == 1 else CV.MPH_TO_MS
         map_ms_to_uom = CV.MS_TO_KPH if msu == 1 else CV.MS_TO_MPH
 
-        map_data = _msg("UI_driverAssistMapData", (Bus.party, Bus.ap_party, Bus.cam))
+        map_data = _msg("UI_driverAssistMapData", (Bus.cam, Bus.ap_party, Bus.party))
         speed_limit_type = int(map_data.get("UI_mapSpeedLimit", 0)) if isinstance(map_data, dict) else 0
 
-        rd = _msg("UI_driverAssistRoadSign", (Bus.party, Bus.ap_party, Bus.cam))
+        rd = _msg("UI_driverAssistRoadSign", (Bus.cam, Bus.ap_party, Bus.party))
         base_map = 0.0
         if isinstance(rd, dict) and int(rd.get("UI_roadSign", 0)) == 3:
           base_map = float(rd.get("UI_baseMapSpeedLimitMPS", 0.0))
@@ -248,7 +240,7 @@ class CarState(CarStateBase):
       if isinstance(ds2, dict) and "DAS_accSpeedLimit" in ds2:
         speed_limit_ms_das = float(ds2.get("DAS_accSpeedLimit", 0.0)) * CV.MPH_TO_MS
       else:
-        ds = _msg("DAS_status", (Bus.party, Bus.ap_party, Bus.cam))
+        ds = _msg("DAS_status", (Bus.cam, Bus.ap_party, Bus.party))
         if isinstance(ds, dict) and "DAS_fusedSpeedLimit" in ds:
           das_u = float(ds.get("DAS_fusedSpeedLimit", 0.0))
           if das_u >= 150.0:
@@ -710,3 +702,4 @@ class CarState(CarStateBase):
       Bus.cam: CANParser(DBC[CP.carFingerprint][Bus.party], [], CANBUS.party + 4),
       Bus.ap_party: CANParser(DBC[CP.carFingerprint][Bus.party], [], CANBUS.autopilot_party),
     }
+
