@@ -1,4 +1,5 @@
 import copy
+import math
 from dataclasses import dataclass
 
 from openpilot.common.swaglog import cloudlog
@@ -33,6 +34,7 @@ class CarState(CarStateBase):
   def __init__(self, CP):
     super().__init__(CP)
     self.msg_stw_actn_req = None
+    self.stw_actn_bus = int(CANBUS.party)
     self.can_define = CANDefine(DBC[CP.carFingerprint][Bus.party])
 
     if self.CP.carFingerprint in LEGACY_CARS:
@@ -137,6 +139,145 @@ class CarState(CarStateBase):
       return max(0.0, limit_ms + off * CV.KPH_TO_MS)
     return max(0.0, limit_ms + off * CV.MPH_TO_MS)
 
+
+
+  def _pick_stock_cruise_set_u(self, di_state: dict, v_ego_ms: float, cruise_enabled: bool, speed_units: str) -> tuple[float, str]:
+    """Pick Tesla cruise setpoint in MPH/KPH without changing the DBC.
+
+    - If stock cruise is disabled (XNOR lateral-only), DI_cruiseSet may look like ~0.5*vEgo.
+      Prefer DI_digitalSpeed to keep the Comma UI sane.
+    - If stock cruise is enabled, choose between DI_cruiseSet, DI_digitalSpeed, and DI_cruiseSet*2
+      using plausibility + stability.
+    """
+    try:
+      a = float(di_state.get("DI_cruiseSet", 0.0) or 0.0)
+    except Exception:
+      a = 0.0
+    try:
+      b = float(di_state.get("DI_digitalSpeed", 0.0) or 0.0)
+    except Exception:
+      b = 0.0
+
+    uom = "KPH" if speed_units == "KPH" else "MPH"
+    ms_to_u = CV.MS_TO_KPH if uom == "KPH" else CV.MS_TO_MPH
+    v_u = float(v_ego_ms) * ms_to_u
+
+    if not bool(cruise_enabled):
+      if b > 0.0:
+        return float(b), "DI_digitalSpeed"
+      if a > 0.0:
+        return float(a), "DI_cruiseSet"
+      return 0.0, "none"
+
+    last_u = float(getattr(self, "stock_cruise_set_speed_ms", 0.0) or 0.0) * ms_to_u
+
+    candidates: list[tuple[float, str]] = []
+    if a > 0.0:
+      candidates.append((a, "DI_cruiseSet"))
+    if b > 0.0:
+      candidates.append((b, "DI_digitalSpeed"))
+
+    if a > 0.0:
+      thr = max(2.5, 0.10 * max(v_u, 1.0))
+      if (abs((2.0 * a) - v_u) <= thr) or (b > 0.0 and abs((2.0 * a) - b) <= thr):
+        candidates.append((2.0 * a, "DI_cruiseSet_x2"))
+
+    if not candidates:
+      return 0.0, "none"
+    if len(candidates) == 1:
+      return float(candidates[0][0]), str(candidates[0][1])
+
+    def _integerish_penalty(x: float) -> float:
+      frac = abs(x - round(x))
+      return 1.0 if frac > 0.05 else 0.0
+
+    def _half_speed_penalty(x: float) -> float:
+      thr = max(2.5, 0.10 * max(v_u, 1.0))
+      return 6.0 if abs(x - (0.5 * v_u)) <= thr else 0.0
+
+    def _stability_penalty(x: float) -> float:
+      if last_u <= 1.0:
+        return 0.0
+      return min(abs(x - last_u) / 4.0, 3.0)
+
+    def score(x: float) -> float:
+      if x <= 0.0 or math.isnan(x) or math.isinf(x):
+        return 1e9
+      return _integerish_penalty(x) + _half_speed_penalty(x) + _stability_penalty(x)
+
+    best_val, best_src, best_s = 0.0, "none", 1e9
+    for val, src in candidates:
+      s = score(float(val))
+      if s < best_s:
+        best_val, best_src, best_s = float(val), str(src), float(s)
+
+    return best_val, best_src
+
+
+  def _update_speed_limit(self, can_parsers) -> None:
+    """Unity-parity speed limit parsing (map/sign + DAS fallback) into m/s."""
+    speed_limit_ms = 0.0
+    speed_limit_ms_das = 0.0
+
+    def _msg(name: str):
+      for bk in (Bus.party, Bus.ap_party, Bus.cam, Bus.chassis, Bus.pt, Bus.ap_pt):
+        cp = can_parsers.get(bk)
+        if cp is None:
+          continue
+        try:
+          return cp.vl[name]
+        except KeyError:
+          continue
+      return None
+
+    try:
+      gps = _msg("UI_gpsVehicleSpeed")
+      if gps is not None:
+        msu = int(gps.get("UI_mapSpeedLimitUnits", 0))
+        map_uom_to_ms = CV.KPH_TO_MS if msu == 1 else CV.MPH_TO_MS
+        map_ms_to_uom = CV.MS_TO_KPH if msu == 1 else CV.MS_TO_MPH
+
+        map_data = _msg("UI_driverAssistMapData") or {}
+        speed_limit_type = int(map_data.get("UI_mapSpeedLimitType", map_data.get("UI_mapSpeedLimitType", map_data.get("UI_mapSpeedLimit", 0))) or 0)
+
+        rd = _msg("UI_driverAssistRoadSign") or {}
+        base_map = 0.0
+        if int(rd.get("UI_roadSign", 0)) == 3:
+          base_map = float(rd.get("UI_baseMapSpeedLimitMPS", 0.0) or 0.0)
+          base_map = int(base_map * map_ms_to_uom + 0.99) / map_ms_to_uom
+
+        if base_map > 0.0 and (speed_limit_type != 0x1F or base_map >= 5.56):
+          speed_limit_ms = base_map
+        else:
+          speed_limit_ms = float(gps.get("UI_mppSpeedLimit", 0.0) or 0.0) * map_uom_to_ms
+    except Exception:
+      pass
+
+    try:
+      ds2 = _msg("DAS_status2") or {}
+      if isinstance(ds2, dict) and "DAS_accSpeedLimit" in ds2:
+        speed_limit_ms_das = float(ds2.get("DAS_accSpeedLimit", 0.0) or 0.0) * CV.MPH_TO_MS
+    except Exception:
+      pass
+
+    self.speed_limit_ms_das = float(speed_limit_ms_das)
+    if speed_limit_ms_das > 0.0 and speed_limit_ms > 0.0:
+      speed_limit_ms = min(speed_limit_ms, speed_limit_ms_das)
+    self.speed_limit_ms = float(speed_limit_ms)
+
+    if self._tinkla.adjust_acc_with_speed_limit and (self._param_frame % 100 == 0):
+      try:
+        uom = str(getattr(self, "speed_units", "MPH"))
+        conv = 2.2369362920544 if uom == "MPH" else 3.6
+        cloudlog.info(
+          f"[XNOR_CS] uom={uom} src={getattr(self, '_cruise_set_src', 'none')} "
+          f"cruiseSet={float(getattr(self, 'stock_cruise_set_speed_ms', 0.0))*conv:.1f} "
+          f"stockCruise={bool(getattr(self, 'stock_cruise_enabled', False))} "
+          f"speedLimit={float(getattr(self, 'speed_limit_ms', 0.0))*conv:.1f}"
+        )
+      except Exception:
+        pass
+
   def update_autopark_state(self, autopark_state: str, cruise_enabled: bool):
     autopark_now = autopark_state in ("ACTIVE", "COMPLETE", "SELFPARK_STARTED")
     if autopark_now and not self.autopark_prev and not self.cruise_enabled_prev:
@@ -196,16 +337,17 @@ class CarState(CarStateBase):
     autopark_state = self.can_define.dv["DI_state"]["DI_autoparkState"].get(int(cp_party.vl["DI_state"]["DI_autoparkState"]), None)
     cruise_enabled = cruise_state in ("ENABLED", "STANDSTILL", "OVERRIDE", "PRE_FAULT", "PRE_CANCEL")
     self.update_autopark_state(autopark_state, cruise_enabled)
-
-    # Cruise set speed (DI_cruiseSet); required for speed-limit stalk sync
-    cruise_set = float(cp_party.vl["DI_state"].get("DI_cruiseSet", 0.0) or 0.0)
+    # Cruise set speed (DI_state): pick correct decoded field without changing the DBC
+    uom = speed_units if speed_units in ("KPH", "MPH") else "MPH"
+    cruise_set_u, src = self._pick_stock_cruise_set_u(cp_party.vl["DI_state"], float(ret.vEgo), bool(cruise_enabled), uom)
     self.stock_cruise_enabled = bool(cruise_enabled)
-    if cruise_set > 0.0:
-      self.stock_cruise_set_speed_ms = float(cruise_set) * (CV.KPH_TO_MS if speed_units == "KPH" else CV.MPH_TO_MS)
+    if cruise_set_u > 0.0:
+      self.stock_cruise_set_speed_ms = float(cruise_set_u) * (CV.KPH_TO_MS if uom == "KPH" else CV.MPH_TO_MS)
       ret.cruiseState.speed = max(float(self.stock_cruise_set_speed_ms), 1e-3)
     else:
       self.stock_cruise_set_speed_ms = 0.0
       ret.cruiseState.speed = max(float(ret.vEgo), 1e-3)
+    self._cruise_set_src = str(src)
     if self.autopilot_disabled:
       # Unity parity: allow engagement without Tesla cruise (low-speed lateral only)
       ret.cruiseState.available = True
@@ -221,16 +363,21 @@ class CarState(CarStateBase):
     self.speed_units = speed_units if speed_units in ("KPH", "MPH") else "MPH"
 
     stw = None
-    for _cp in (can_parsers.get(Bus.party), can_parsers.get(Bus.chassis), can_parsers.get(Bus.pt)):
+    stw_bus = None
+    for bk in (Bus.party, Bus.chassis, Bus.pt, Bus.ap_party, Bus.ap_pt):
+      _cp = can_parsers.get(bk)
       if _cp is None:
         continue
       try:
         stw = _cp.vl["STW_ACTN_RQ"]
+        stw_bus = int(getattr(_cp, "bus", CANBUS.party))
         break
       except KeyError:
         continue
     if stw is not None:
       self.msg_stw_actn_req = copy.copy(stw)
+      if stw_bus is not None:
+        self.stw_actn_bus = int(stw_bus)
       self.cruise_buttons = int(stw.get("SpdCtrlLvr_Stat", 0))
       raw_ts = int(stw.get("TurnIndLvr_Stat", 0))
       self.turnSignalStalkState = 0 if raw_ts == 3 else raw_ts
@@ -292,6 +439,10 @@ class CarState(CarStateBase):
     ret.leftBlindspot = cp_ap_party.vl["DAS_status"]["DAS_blindSpotRearLeft"] != 0
     ret.rightBlindspot = cp_ap_party.vl["DAS_status"]["DAS_blindSpotRearRight"] != 0
 
+    # Speed limit best-effort (needed for speed-limit matching)
+    self._update_speed_limit(can_parsers)
+
+
     # AEB
     ret.stockAeb = cp_ap_party.vl["DAS_control"]["DAS_aebEvent"] == 1
 
@@ -326,20 +477,53 @@ class CarState(CarStateBase):
       self.cruiseEnabled = bool(ret.cruiseState.enabled)
 
     # Speed limit best-effort (needed for speed-limit matching)
+    msu = 0
+    speed_limit_ms = 0.0
+    speed_limit_ms_das = 0.0
     try:
-      msu = can_parsers[Bus.party].vl.get("UI_gpsVehicleSpeed", {}).get("UI_mapSpeedLimitUnits", 0)
-      map_uom_to_ms = CV.KPH_TO_MS if int(msu) == 1 else CV.MPH_TO_MS
-      map_ms_to_uom = CV.MS_TO_KPH if int(msu) == 1 else CV.MS_TO_MPH
-      rd = can_parsers[Bus.party].vl.get("UI_driverAssistRoadSign", {})
+      gps = can_parsers[Bus.party].vl["UI_gpsVehicleSpeed"]
+      msu = int(gps.get("UI_mapSpeedLimitUnits", 0))
+      map_uom_to_ms = CV.KPH_TO_MS if msu == 1 else CV.MPH_TO_MS
+      map_ms_to_uom = CV.MS_TO_KPH if msu == 1 else CV.MS_TO_MPH
+
+      try:
+        map_data = can_parsers[Bus.party].vl["UI_driverAssistMapData"]
+      except Exception:
+        map_data = {}
+      speed_limit_type = int(getattr(map_data, "get", lambda *_a, **_k: 0)("UI_mapSpeedLimit", 0))
+
+      try:
+        rd = can_parsers[Bus.party].vl["UI_driverAssistRoadSign"]
+      except Exception:
+        rd = {}
+      base_map = 0.0
       if int(rd.get("UI_roadSign", 0)) == 3:
-        base = float(rd.get("UI_baseMapSpeedLimitMPS", 0.0))
-        base = int(base * map_ms_to_uom + 0.99) / map_ms_to_uom
-        self.speed_limit_ms = base
-      gps = can_parsers[Bus.party].vl.get("UI_gpsVehicleSpeed", {})
-      if self.speed_limit_ms <= 0.0:
-        self.speed_limit_ms = float(gps.get("UI_mppSpeedLimit", 0.0)) * map_uom_to_ms
+        base_map = float(rd.get("UI_baseMapSpeedLimitMPS", 0.0))
+        # Round in map units (no sign limits like 79.2 kph)
+        base_map = int(base_map * map_ms_to_uom + 0.99) / map_ms_to_uom
+
+      if base_map > 0.0 and (speed_limit_type != 0x1F or base_map >= 5.56):
+        speed_limit_ms = base_map
+      else:
+        speed_limit_ms = float(gps.get("UI_mppSpeedLimit", 0.0)) * map_uom_to_ms
     except Exception:
       pass
+
+    try:
+      ds = can_parsers.get(Bus.ap_party).vl["DAS_status"] if can_parsers.get(Bus.ap_party) is not None else {}
+      if isinstance(ds, dict) and "DAS_fusedSpeedLimit" in ds:
+        das_u = float(ds.get("DAS_fusedSpeedLimit", 0.0))
+        if das_u >= 150.0:
+          das_u = 150.0
+        map_ms_to_uom = CV.MS_TO_KPH if msu == 1 else CV.MS_TO_MPH
+        speed_limit_ms_das = das_u / map_ms_to_uom
+    except Exception:
+      pass
+
+    self.speed_limit_ms_das = float(speed_limit_ms_das)
+    if speed_limit_ms_das > 0.0 and speed_limit_ms > 0.0:
+      speed_limit_ms = min(speed_limit_ms, speed_limit_ms_das)
+    self.speed_limit_ms = float(speed_limit_ms)
 
     if self._tinkla.adjust_acc_with_speed_limit and (self._param_frame % 100 == 0):
       try:
@@ -351,13 +535,6 @@ class CarState(CarStateBase):
         )
       except Exception:
         pass
-
-    try:
-      ds = can_parsers.get(Bus.ap_party).vl.get("DAS_status", {}) if can_parsers.get(Bus.ap_party) is not None else {}
-      if "DAS_fusedSpeedLimit" in ds:
-        self.speed_limit_ms_das = float(ds.get("DAS_fusedSpeedLimit", 0.0)) / (CV.MS_TO_KPH if self.speed_units == "KPH" else CV.MS_TO_MPH)
-    except Exception:
-      pass
 
     ret.buttonEvents = []
     try:
@@ -432,17 +609,18 @@ class CarState(CarStateBase):
     speed_units = self.can_defines["DI_state"]["DI_speedUnits"].get(int(cp_chassis.vl["DI_state"]["DI_speedUnits"]), None)
 
     cruise_enabled = cruise_state in ("ENABLED", "STANDSTILL", "OVERRIDE", "PRE_FAULT", "PRE_CANCEL")
-
-    # Cruise set speed (DI_cruiseSet); required for speed-limit stalk sync
+    # Cruise set speed (DI_state): pick correct decoded field without changing the DBC
     ret.cruiseState.enabled = cruise_enabled
-    cruise_set = float(cp_chassis.vl["DI_state"].get("DI_cruiseSet", 0.0) or 0.0)
+    uom = speed_units if speed_units in ("KPH", "MPH") else "MPH"
+    cruise_set_u, src = self._pick_stock_cruise_set_u(cp_chassis.vl["DI_state"], float(ret.vEgo), bool(cruise_enabled), uom)
     self.stock_cruise_enabled = bool(cruise_enabled)
-    if cruise_set > 0.0:
-      self.stock_cruise_set_speed_ms = float(cruise_set) * (CV.KPH_TO_MS if speed_units == "KPH" else CV.MPH_TO_MS)
+    if cruise_set_u > 0.0:
+      self.stock_cruise_set_speed_ms = float(cruise_set_u) * (CV.KPH_TO_MS if uom == "KPH" else CV.MPH_TO_MS)
       ret.cruiseState.speed = max(float(self.stock_cruise_set_speed_ms), 1e-3)
     else:
       self.stock_cruise_set_speed_ms = 0.0
       ret.cruiseState.speed = max(float(ret.vEgo), 1e-3)
+    self._cruise_set_src = str(src)
     ret.cruiseState.available = cruise_state == "STANDBY" or ret.cruiseState.enabled
     ret.cruiseState.standstill = False  # This needs to be false, since we can resume from stop without sending anything special
     ret.standstill = cruise_state == "STANDSTILL"
@@ -452,16 +630,21 @@ class CarState(CarStateBase):
     self.speed_units = speed_units if speed_units in ("KPH", "MPH") else "MPH"
 
     stw = None
-    for _cp in (can_parsers.get(Bus.party), can_parsers.get(Bus.chassis), can_parsers.get(Bus.pt)):
+    stw_bus = None
+    for bk in (Bus.party, Bus.chassis, Bus.pt, Bus.ap_party, Bus.ap_pt):
+      _cp = can_parsers.get(bk)
       if _cp is None:
         continue
       try:
         stw = _cp.vl["STW_ACTN_RQ"]
+        stw_bus = int(getattr(_cp, "bus", CANBUS.party))
         break
       except KeyError:
         continue
     if stw is not None:
       self.msg_stw_actn_req = copy.copy(stw)
+      if stw_bus is not None:
+        self.stw_actn_bus = int(stw_bus)
       self.cruise_buttons = int(stw.get("SpdCtrlLvr_Stat", 0))
       raw_ts = int(stw.get("TurnIndLvr_Stat", 0))
       self.turnSignalStalkState = 0 if raw_ts == 3 else raw_ts
@@ -522,7 +705,6 @@ class CarState(CarStateBase):
     else:
       ret.seatbeltUnlatched = cp_chassis.vl["SDM1"]["SDM_bcklDrivStatus"] != 1
 
-    # Unity parity tail
     if (self._param_frame % 100) == 0:
       try:
         self._reload_tinkla_params()
@@ -566,9 +748,11 @@ class CarState(CarStateBase):
         Bus.pt: CANParser(DBC[CP.carFingerprint][Bus.pt], [], CANBUS.powertrain),
         Bus.ap_pt: CANParser(DBC[CP.carFingerprint][Bus.pt], [], CANBUS.autopilot_powertrain),
         Bus.chassis: CANParser(DBC[CP.carFingerprint][Bus.chassis], [], CANBUS.chassis if CP.carFingerprint == CAR.TESLA_MODEL_S_HW3 else CANBUS.party),
+        Bus.cam: CANParser(DBC[CP.carFingerprint][Bus.party], [], CANBUS.party + 4),
       }
 
     return {
       Bus.party: CANParser(DBC[CP.carFingerprint][Bus.party], [], CANBUS.party),
-      Bus.ap_party: CANParser(DBC[CP.carFingerprint][Bus.party], [], CANBUS.autopilot_party)
+      Bus.ap_party: CANParser(DBC[CP.carFingerprint][Bus.party], [], CANBUS.autopilot_party),
+      Bus.cam: CANParser(DBC[CP.carFingerprint][Bus.party], [], CANBUS.party + 4),
     }
