@@ -79,7 +79,6 @@ class CarController(CarControllerBase):
     self._stw_sequence = []  # list[(frame:int, btn:int)]
     self._op_enabled_prev = False
 
-    self._cruise_engage_last_frame = -100000
     if CP.carFingerprint in LEGACY_CARS:
       if CP.carFingerprint in (CAR.TESLA_MODEL_S_HW1, CAR.TESLA_MODEL_X_HW1):
         CANBUS.powertrain = CANBUS.party
@@ -153,9 +152,10 @@ class CarController(CarControllerBase):
     return max(0.0, limit_ms + (off * (CV.KPH_TO_MS if uom == "KPH" else CV.MPH_TO_MS)))
 
   def _stw_bus(self, CS) -> int:
-    # Safety: sending STW_ACTN_RQ on the wrong bus can trigger Tesla HUD faults.
-    # On this platform, STW_ACTN_RQ is mirrored on CANBUS.party, so always inject there.
-    return int(CANBUS.party)
+    try:
+      return int(getattr(CS, "stw_actn_bus", CANBUS.party))
+    except Exception:
+      return int(CANBUS.party)
 
   def _action_can_for_bus(self, bus: int):
     return (
@@ -242,7 +242,7 @@ class CarController(CarControllerBase):
       if (self.frame % 200) == 0:
         cloudlog.info(
           f"[XNOR_CRUISE_SYNC] gated: target_ms={target_ms:.2f} current_ms={current_ms:.2f} "
-          f"speedLimit_ms={float(getattr(CS, 'speed_limit_ms', 0.0) or 0.0):.2f} das={float(getattr(CS, 'speed_limit_ms_das', 0.0) or 0.0):.2f}"
+          f"speedLimit_ms={float(getattr(CS, 'speed_limit_ms', 0.0) or 0.0):.2f}"
         )
       return
 
@@ -283,58 +283,14 @@ class CarController(CarControllerBase):
     human_control = bool(getattr(CS, "human_control", False))
 
     op_enabled = bool(getattr(CC, "enabled", False) or getattr(CC, "latActive", False))
-
-
-    # Unity parity: auto-enable stock Tesla cruise above 18mph so long control is available.
-
-    # This is required for speed-limit stalk sync; it will not run while stock_cruise_enabled is False.
-
-    if op_enabled and (not getattr(self, "_op_enabled_prev", False)):
-
-      try:
-
-        v_ego = float(getattr(getattr(CS, "out", None), "vEgo", 0.0) or 0.0)
-
-      except Exception:
-
-        v_ego = 0.0
-
-      want_long = bool(getattr(self, "_cached_autopilot_disabled", False))
-
-      stock_cruise = bool(getattr(CS, "stock_cruise_enabled", False))
-
-      if want_long and (v_ego > (18.0 * CV.MPH_TO_MS)) and (not stock_cruise):
-
-        # Avoid spamming attempts (5s cooldown) and don't interrupt an ongoing stalk sequence.
-
-        cooldown_ok = (int(self.frame) - int(getattr(self, "_cruise_engage_last_frame", -100000))) > 500
-
-        seq_busy = bool(getattr(self, "_stw_sequence", [])) or (int(getattr(self, "_stw_release_frame", -1)) >= 0)
-
-        if cooldown_ok and (not seq_busy) and hasattr(self, "_queue_stalk_pulse"):
-
-          if self._queue_stalk_pulse(CS, can_sends, BTN_MAIN):
-
-            try:
-
-              getattr(self, "_stw_sequence").append((int(self.frame) + 6, BTN_DOWN1))
-
-            except Exception:
-
-              pass
-
-            self._cruise_engage_last_frame = int(self.frame)
-
-            cloudlog.info("[XNOR_CRUISE_ENGAGE] queued MAIN->SET (vEgo_mph={v_ego * CV.MS_TO_MPH:.1f})")
-
     if op_enabled and (not bool(self._op_enabled_prev)):
       if (autopilot_disabled and (self.CP.carFingerprint in LEGACY_CARS) and
           (float(getattr(CS.out, "vEgo", 0.0)) >= (18.0 * CV.MPH_TO_MS)) and
           (not bool(getattr(CS, "stock_cruise_enabled", False))) and
           (not bool(self._stw_sequence))):
-        # Unity parity: legacy cars often require MAIN + RESUME on engage
-        self._stw_sequence = [(int(self.frame), BTN_MAIN), (int(self.frame) + 10, BTN_UP1)]
-        cloudlog.info("[XNOR_CRUISE_SYNC] legacy engage: queued MAIN+RESUME")
+        # Unity parity: legacy cars often require MAIN + SET on engage
+        self._stw_sequence = [(int(self.frame), BTN_MAIN), (int(self.frame) + 10, BTN_DOWN1)]
+        cloudlog.info("[XNOR_CRUISE_SYNC] legacy engage: queued MAIN+SET")
     self._op_enabled_prev = bool(op_enabled)
 
     self._process_stalk_actions(CS, can_sends)
