@@ -71,14 +71,6 @@ class CarController(CarControllerBase):
 
     self._speed_sync_last_frame = -100000
 
-    self._stw_seed = None
-    self._stw_seed_bus = int(CANBUS.party)
-    self._stw_last_send_frame = -100000
-    self._stw_release_frame = -1
-    self._stw_release_bus = int(CANBUS.party)
-    self._stw_sequence = []  # list[(frame:int, btn:int)]
-    self._op_enabled_prev = False
-
     if CP.carFingerprint in LEGACY_CARS:
       if CP.carFingerprint in (CAR.TESLA_MODEL_S_HW1, CAR.TESLA_MODEL_X_HW1):
         CANBUS.powertrain = CANBUS.party
@@ -91,11 +83,11 @@ class CarController(CarControllerBase):
       self.tesla_can = TeslaCANLegacy(self.packers)
 
       # STW_ACTN_RQ needs CRC/counter; legacy helper doesn't implement it.
-      self._action_can_by_bus = {int(bus): TeslaCAN(pkr) for bus, pkr in self.packers.items()}
+      self._action_can = TeslaCAN(self.packers[CANBUS.party])
     else:
       self.packer = CANPacker(dbc_names[Bus.party])
       self.tesla_can = TeslaCAN(self.packer)
-      self._action_can_by_bus = {int(CANBUS.party): self.tesla_can}
+      self._action_can = self.tesla_can
 
   def _refresh_cached_params(self) -> None:
     if (self.frame - self._params_last_read_frame) < 50:
@@ -151,63 +143,21 @@ class CarController(CarControllerBase):
     uom = str(getattr(CS, "speed_units", "MPH"))
     return max(0.0, limit_ms + (off * (CV.KPH_TO_MS if uom == "KPH" else CV.MPH_TO_MS)))
 
-  def _stw_bus(self, CS) -> int:
-    # Safety: sending STW_ACTN_RQ on the wrong bus can trigger Tesla HUD faults.
-    # On this platform, STW_ACTN_RQ is mirrored on CANBUS.party, so always inject there.
-    return int(CANBUS.party)
-
-  def _action_can_for_bus(self, bus: int):
-    return (
-      self._action_can_by_bus.get(int(bus)) or
-      self._action_can_by_bus.get(int(CANBUS.party)) or
-      next(iter(self._action_can_by_bus.values()))
-    )
-
-  def _send_stw(self, CS, can_sends, btn: int, *, bus: int | None = None) -> bool:
+  def _queue_stalk_pulse(self, CS, can_sends, btn: int) -> bool:
     msg = getattr(CS, "msg_stw_actn_req", None)
     if msg is None:
       return False
 
-    b = int(bus if bus is not None else self._stw_bus(CS))
+    values = dict(msg)
 
-    # Resync seed from the car when idle; preserve our counter across press/release.
-    if (self._stw_seed is None) or (int(self._stw_seed_bus) != b) or ((self.frame - int(self._stw_last_send_frame)) > 20):
-      self._stw_seed = dict(msg)
-      self._stw_seed_bus = int(b)
+    if self.CP.carFingerprint in LEGACY_CARS:
+      buses = (CANBUS.party, CANBUS.autopilot_party)
+    else:
+      buses = (CANBUS.party,)
 
-    mc = int(self._stw_seed.get("MC_STW_ACTN_RQ", 0) or 0)
-    used_counter = (mc + 1) % 16
-
-    can_sends.append(self._action_can_for_bus(b).create_action_request(int(b), self._stw_seed, int(btn)))
-
-    self._stw_seed["MC_STW_ACTN_RQ"] = int(used_counter)
-    self._stw_last_send_frame = int(self.frame)
+    for bus in buses:
+      can_sends.append(self._action_can.create_action_request(int(bus), values, int(btn)))
     return True
-
-  def _queue_stalk_pulse(self, CS, can_sends, btn: int) -> bool:
-    # Unity-like pulse: press now, release next frame.
-    if int(self._stw_release_frame) > int(self.frame):
-      return False
-
-    if not self._send_stw(CS, can_sends, btn):
-      return False
-
-    self._stw_release_frame = int(self.frame) + 1
-    self._stw_release_bus = int(self._stw_seed_bus)
-    return True
-
-  def _process_stalk_actions(self, CS, can_sends) -> None:
-    # Release pending pulse
-    if int(self._stw_release_frame) == int(self.frame):
-      self._send_stw(CS, can_sends, BTN_IDLE, bus=int(self._stw_release_bus))
-      self._stw_release_frame = -1
-
-    # Run queued press sequence (e.g. legacy MAIN+RESUME on engage)
-    if (int(self._stw_release_frame) < 0) and self._stw_sequence:
-      due_frame, btn = self._stw_sequence[0]
-      if int(self.frame) >= int(due_frame):
-        if self._queue_stalk_pulse(CS, can_sends, int(btn)):
-          self._stw_sequence.pop(0)
 
   def _speed_limit_sync(self, CC, CS, can_sends) -> None:
     # Only when OP is engaged (steering control) and user enabled this feature.
@@ -219,10 +169,6 @@ class CarController(CarControllerBase):
       return
 
     if not self._cached_adjust_acc_with_speed_limit:
-      return
-
-    # Don't overlap with press/release sequencing
-    if (int(self._stw_release_frame) >= 0) or bool(self._stw_sequence):
       return
 
     # Rate limit: 0.5s (Unity parity-ish)
@@ -241,7 +187,7 @@ class CarController(CarControllerBase):
       if (self.frame % 200) == 0:
         cloudlog.info(
           f"[XNOR_CRUISE_SYNC] gated: target_ms={target_ms:.2f} current_ms={current_ms:.2f} "
-          f"speedLimit_ms={float(getattr(CS, 'speed_limit_ms', 0.0) or 0.0):.2f} das={float(getattr(CS, 'speed_limit_ms_das', 0.0) or 0.0):.2f}"
+          f"speedLimit_ms={float(getattr(CS, 'speed_limit_ms', 0.0) or 0.0):.2f}"
         )
       return
 
@@ -280,19 +226,6 @@ class CarController(CarControllerBase):
 
     # Always define before use
     human_control = bool(getattr(CS, "human_control", False))
-
-    op_enabled = bool(getattr(CC, "enabled", False) or getattr(CC, "latActive", False))
-    if op_enabled and (not bool(self._op_enabled_prev)):
-      if (autopilot_disabled and (self.CP.carFingerprint in LEGACY_CARS) and
-          (float(getattr(CS.out, "vEgo", 0.0)) >= (18.0 * CV.MPH_TO_MS)) and
-          (not bool(getattr(CS, "stock_cruise_enabled", False))) and
-          (not bool(self._stw_sequence))):
-        # Unity parity: legacy cars often require MAIN + RESUME on engage
-        self._stw_sequence = [(int(self.frame), BTN_MAIN), (int(self.frame) + 10, BTN_UP1)]
-        cloudlog.info("[XNOR_CRUISE_SYNC] legacy engage: queued MAIN+RESUME")
-    self._op_enabled_prev = bool(op_enabled)
-
-    self._process_stalk_actions(CS, can_sends)
 
     self._speed_limit_sync(CC, CS, can_sends)
 
