@@ -30,7 +30,7 @@ try:
 except ImportError:
   from opendbc.car.tesla.teslacan_legacy import TeslaCANRaven as TeslaCANLegacy
 
-from opendbc.car.tesla.values import CarControllerParams, CANBUS, LEGACY_CARS, CAR
+from opendbc.car.tesla.values import CarControllerParams, CANBUS, LEGACY_CARS, CAR, DBC
 
 try:
   from opendbc.car.tesla.teslacan import create_fake_das_msg as create_fake_das
@@ -46,28 +46,6 @@ BTN_UP2 = 4
 BTN_DOWN2 = 8
 BTN_UP1 = 16
 BTN_DOWN1 = 32
-
-
-
-def _resolve_dbc_name(dbc_names, CP, bus: Bus) -> str:
-  """Resolve a DBC name for a given Bus key.
-
-  XNOR note: CP.dbc may not include every Bus enum used by Tesla code (e.g. 'party').
-  Prefer dbc_names when populated, otherwise fall back to opendbc Tesla values.DBC.
-  """
-  if isinstance(dbc_names, dict) and bus in dbc_names and dbc_names[bus]:
-    return dbc_names[bus]
-  try:
-    dbc_map = DBC[CP.carFingerprint]
-    if bus in dbc_map and dbc_map[bus]:
-      return dbc_map[bus]
-    # last resort: pick any DBC name from the mapping
-    return next(iter(dbc_map.values()))
-  except Exception:
-    # ultimate fallback: try any value from dbc_names
-    if isinstance(dbc_names, dict) and len(dbc_names):
-      return next(iter(dbc_names.values()))
-    raise
 
 
 class CarController(CarControllerBase):
@@ -107,15 +85,15 @@ class CarController(CarControllerBase):
         CANBUS.autopilot_powertrain = CANBUS.autopilot_party
 
       self.packers = {
-        CANBUS.party: CANPacker(_resolve_dbc_name(dbc_names, CP, Bus.party)),
-        CANBUS.powertrain: CANPacker(_resolve_dbc_name(dbc_names, CP, Bus.pt)),
+        CANBUS.party: CANPacker(dbc_names[Bus.party]),
+        CANBUS.powertrain: CANPacker(dbc_names[Bus.pt]),
       }
       self.tesla_can = TeslaCANLegacy(self.packers)
 
       # STW_ACTN_RQ needs CRC/counter; legacy helper doesn't implement it.
       self._action_can_by_bus = {int(bus): TeslaCAN(pkr) for bus, pkr in self.packers.items()}
     else:
-      self.packer = CANPacker(_resolve_dbc_name(dbc_names, CP, Bus.party))
+      self.packer = CANPacker(dbc_names[Bus.party])
       self.tesla_can = TeslaCAN(self.packer)
       self._action_can_by_bus = {int(CANBUS.party): self.tesla_can}
 
