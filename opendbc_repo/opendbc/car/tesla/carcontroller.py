@@ -48,6 +48,25 @@ BTN_UP1 = 16
 BTN_DOWN1 = 32
 
 
+def _dbc_for(dbc_names, primary: Bus, *fallbacks: Bus) -> tuple[str, str]:
+  """Return (dbc_name, used_key_str) for a given bus key.
+
+  XNOR passes CP.dbc (DbcDict) into CarController. Some builds omit certain bus keys
+  (e.g. 'party') while reusing the same DBC under another key (often 'chassis').
+  This helper prevents hard-crashes on missing keys while keeping behavior explicit.
+  """
+  if not isinstance(dbc_names, dict) or not dbc_names:
+    raise ValueError(f"dbc_names must be a non-empty dict, got: {type(dbc_names)}")
+  for k in (primary, *fallbacks):
+    if k in dbc_names:
+      return dbc_names[k], str(k)
+    ks = str(k)
+    if ks in dbc_names:
+      return dbc_names[ks], ks
+  k0 = next(iter(dbc_names.keys()))
+  return dbc_names[k0], str(k0)
+
+
 class CarController(CarControllerBase):
   def __init__(self, dbc_names, CP, VM=None):
     try:
@@ -84,16 +103,30 @@ class CarController(CarControllerBase):
         CANBUS.powertrain = CANBUS.party
         CANBUS.autopilot_powertrain = CANBUS.autopilot_party
 
+      party_dbc, party_key = _dbc_for(dbc_names, Bus.party, Bus.chassis, Bus.main, Bus.pt)
+      pt_dbc, pt_key = _dbc_for(dbc_names, Bus.pt, Bus.party, Bus.chassis, Bus.main)
+
+      if party_key != str(Bus.party):
+        cloudlog.warning("dbc_names missing %s; using %s -> %s (keys=%s)",
+                         str(Bus.party), party_key, party_dbc, list(dbc_names.keys()))
+      if pt_key != str(Bus.pt):
+        cloudlog.warning("dbc_names missing %s; using %s -> %s (keys=%s)",
+                         str(Bus.pt), pt_key, pt_dbc, list(dbc_names.keys()))
+
       self.packers = {
-        CANBUS.party: CANPacker(dbc_names[Bus.party]),
-        CANBUS.powertrain: CANPacker(dbc_names[Bus.pt]),
+        CANBUS.party: CANPacker(party_dbc),
+        CANBUS.powertrain: CANPacker(pt_dbc),
       }
       self.tesla_can = TeslaCANLegacy(self.packers)
 
       # STW_ACTN_RQ needs CRC/counter; legacy helper doesn't implement it.
       self._action_can_by_bus = {int(bus): TeslaCAN(pkr) for bus, pkr in self.packers.items()}
     else:
-      self.packer = CANPacker(dbc_names[Bus.party])
+      party_dbc, party_key = _dbc_for(dbc_names, Bus.party, Bus.chassis, Bus.main, Bus.pt)
+      if party_key != str(Bus.party):
+        cloudlog.warning("dbc_names missing %s; using %s -> %s (keys=%s)",
+                         str(Bus.party), party_key, party_dbc, list(dbc_names.keys()))
+      self.packer = CANPacker(party_dbc)
       self.tesla_can = TeslaCAN(self.packer)
       self._action_can_by_bus = {int(CANBUS.party): self.tesla_can}
 
