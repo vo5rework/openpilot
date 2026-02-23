@@ -319,15 +319,22 @@ class CarState(CarStateBase):
                                                          eac_error_code == "EAC_ERROR_HIGH_ANGLE_RATE_SAFETY")
 
     # Cruise state
-    cruise_state = self.can_define.dv["DI_state"]["DI_cruiseState"].get(int(cp_party.vl["DI_state"]["DI_cruiseState"]), None)
-    speed_units = self.can_define.dv["DI_state"]["DI_speedUnits"].get(int(cp_party.vl["DI_state"]["DI_speedUnits"]), None)
+    # HW2/C3: DI_state differs across buses; powertrain bus (Bus.pt / rx_src=4) is authoritative for cruise/ACC.
+    di_cruise = cp_pt.vl["DI_state"]
+    dv_di = (self.can_defines.get("DI_state") if hasattr(self, "can_defines") else None) or self.can_define.dv.get("DI_state", {})
+    raw_cruise_state = int(di_cruise.get("DI_cruiseState", 0))
+    cruise_state = (dv_di.get("DI_cruiseState", {}) or {}).get(raw_cruise_state, None)
+    if (cruise_state is None) and (raw_cruise_state == 15):
+      # Observed on HW2/C3 captures: raw=15 with nonzero DI_cruiseSet behaves as ENABLED.
+      cruise_state = "ENABLED"
+    speed_units = (dv_di.get("DI_speedUnits", {}) or {}).get(int(di_cruise.get("DI_speedUnits", 0)), None)
 
-    autopark_state = self.can_define.dv["DI_state"]["DI_autoparkState"].get(int(cp_party.vl["DI_state"]["DI_autoparkState"]), None)
+    autopark_state = (dv_di.get("DI_autoparkState", {}) or {}).get(int(di_cruise.get("DI_autoparkState", 0)), None)
     cruise_enabled = cruise_state in ("ENABLED", "STANDSTILL", "OVERRIDE", "PRE_FAULT", "PRE_CANCEL")
     self.update_autopark_state(autopark_state, cruise_enabled)
     # Cruise set speed (DI_state): pick correct decoded field without changing the DBC
     uom = speed_units if speed_units in ("KPH", "MPH") else "MPH"
-    cruise_set_u, src = self._pick_stock_cruise_set_u(cp_party.vl["DI_state"], float(ret.vEgo), bool(cruise_enabled), uom)
+    cruise_set_u, src = self._pick_stock_cruise_set_u(di_cruise, float(ret.vEgo), bool(cruise_enabled), uom)
     self.stock_cruise_enabled = bool(cruise_enabled)
     if cruise_set_u > 0.0:
       self.stock_cruise_set_speed_ms = float(cruise_set_u) * (CV.KPH_TO_MS if uom == "KPH" else CV.MPH_TO_MS)
