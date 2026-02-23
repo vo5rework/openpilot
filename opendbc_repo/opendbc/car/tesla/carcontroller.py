@@ -30,7 +30,7 @@ try:
 except ImportError:
   from opendbc.car.tesla.teslacan_legacy import TeslaCANRaven as TeslaCANLegacy
 
-from opendbc.car.tesla.values import CarControllerParams, CANBUS, LEGACY_CARS, CAR, DBC
+from opendbc.car.tesla.values import CarControllerParams, CANBUS, LEGACY_CARS, CAR
 
 try:
   from opendbc.car.tesla.teslacan import create_fake_das_msg as create_fake_das
@@ -46,6 +46,28 @@ BTN_UP2 = 4
 BTN_DOWN2 = 8
 BTN_UP1 = 16
 BTN_DOWN1 = 32
+
+
+
+def _resolve_dbc_name(dbc_names, CP, bus: Bus) -> str:
+  """Resolve a DBC name for a given Bus key.
+
+  XNOR note: CP.dbc may not include every Bus enum used by Tesla code (e.g. 'party').
+  Prefer dbc_names when populated, otherwise fall back to opendbc Tesla values.DBC.
+  """
+  if isinstance(dbc_names, dict) and bus in dbc_names and dbc_names[bus]:
+    return dbc_names[bus]
+  try:
+    dbc_map = DBC[CP.carFingerprint]
+    if bus in dbc_map and dbc_map[bus]:
+      return dbc_map[bus]
+    # last resort: pick any DBC name from the mapping
+    return next(iter(dbc_map.values()))
+  except Exception:
+    # ultimate fallback: try any value from dbc_names
+    if isinstance(dbc_names, dict) and len(dbc_names):
+      return next(iter(dbc_names.values()))
+    raise
 
 
 class CarController(CarControllerBase):
@@ -79,44 +101,21 @@ class CarController(CarControllerBase):
     self._stw_sequence = []  # list[(frame:int, btn:int)]
     self._op_enabled_prev = False
 
-    # Resolve DBC names robustly (dbc_names comes from CarState.get_can_parsers()).
-    try:
-      dbc_fallback = DBC.get(CP.carFingerprint, {})
-    except Exception:
-      dbc_fallback = {}
-
-    def _dbc(bus: Bus, default: str | None = None) -> str:
-      if isinstance(dbc_names, dict):
-        v = dbc_names.get(bus)
-        if isinstance(v, str) and v:
-          return v
-      v = dbc_fallback.get(bus)
-      if isinstance(v, str) and v:
-        return v
-      if default is not None:
-        return default
-      keys = list(dbc_names.keys()) if isinstance(dbc_names, dict) else [str(type(dbc_names))]
-      raise RuntimeError(f"Missing DBC for {bus}; dbc_names keys={keys} fallback keys={list(dbc_fallback.keys())}")
-
-
     if CP.carFingerprint in LEGACY_CARS:
       if CP.carFingerprint in (CAR.TESLA_MODEL_S_HW1, CAR.TESLA_MODEL_X_HW1):
         CANBUS.powertrain = CANBUS.party
         CANBUS.autopilot_powertrain = CANBUS.autopilot_party
 
-      party_dbc = _dbc(Bus.party)
-      pt_dbc = _dbc(Bus.pt, party_dbc)
-
       self.packers = {
-        int(CANBUS.party): CANPacker(party_dbc),
-        int(CANBUS.powertrain): CANPacker(pt_dbc),
+        CANBUS.party: CANPacker(_resolve_dbc_name(dbc_names, CP, Bus.party)),
+        CANBUS.powertrain: CANPacker(_resolve_dbc_name(dbc_names, CP, Bus.pt)),
       }
       self.tesla_can = TeslaCANLegacy(self.packers)
 
       # STW_ACTN_RQ needs CRC/counter; legacy helper doesn't implement it.
       self._action_can_by_bus = {int(bus): TeslaCAN(pkr) for bus, pkr in self.packers.items()}
     else:
-      self.packer = CANPacker(_dbc(Bus.party))
+      self.packer = CANPacker(_resolve_dbc_name(dbc_names, CP, Bus.party))
       self.tesla_can = TeslaCAN(self.packer)
       self._action_can_by_bus = {int(CANBUS.party): self.tesla_can}
 
