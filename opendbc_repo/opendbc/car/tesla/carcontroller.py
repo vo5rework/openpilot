@@ -48,7 +48,6 @@ BTN_UP1 = 16
 BTN_DOWN1 = 32
 
 
-
 def _resolve_dbc_name(dbc_names, CP, bus: Bus) -> str:
   """Resolve a DBC name for a given bus.
 
@@ -85,7 +84,10 @@ def _resolve_dbc_name(dbc_names, CP, bus: Bus) -> str:
     pass
 
   keys = list(dbc_names.keys()) if isinstance(dbc_names, dict) else type(dbc_names)
-  raise KeyError(f"Missing DBC for bus={bus}. dbc_names keys={keys} cp_dbc keys={list(cp_dbc.keys()) if isinstance(cp_dbc, dict) else None}")
+  raise KeyError(
+    f"Missing DBC for bus={bus}. dbc_names keys={keys} "
+    f"cp_dbc keys={list(cp_dbc.keys()) if isinstance(cp_dbc, dict) else None}"
+  )
 
 
 class CarController(CarControllerBase):
@@ -118,6 +120,12 @@ class CarController(CarControllerBase):
     self._stw_release_bus = int(CANBUS.party)
     self._stw_sequence = []  # list[(frame:int, btn:int)]
     self._op_enabled_prev = False
+
+    # Debounced "hold" state for stalk presses (repeat at ~10Hz, then release)
+    self._stw_hold_btn = None  # type: int | None
+    self._stw_hold_end_frame = -1
+    self._stw_hold_next_frame = -1
+    self._stw_hold_bus = int(CANBUS.party)
 
     if CP.carFingerprint in LEGACY_CARS:
       if CP.carFingerprint in (CAR.TESLA_MODEL_S_HW1, CAR.TESLA_MODEL_X_HW1):
@@ -228,8 +236,26 @@ class CarController(CarControllerBase):
     self._stw_last_send_frame = int(self.frame)
     return True
 
+  def _queue_stalk_hold(self, CS, can_sends, btn: int, *, hold_frames: int = 35, interval_frames: int = 10) -> bool:
+    """Debounced hold: repeat press at ~10Hz for ~0.35s, then release."""
+    if self._stw_hold_btn is not None:
+      return False
+    if int(self._stw_release_frame) >= int(self.frame):
+      return False
+    if bool(self._stw_sequence):
+      return False
+
+    if not self._send_stw(CS, can_sends, btn):
+      return False
+
+    self._stw_hold_btn = int(btn)
+    self._stw_hold_bus = int(self._stw_seed_bus)
+    self._stw_hold_end_frame = int(self.frame) + int(hold_frames)
+    self._stw_hold_next_frame = int(self.frame) + int(interval_frames)
+    return True
+
   def _queue_stalk_pulse(self, CS, can_sends, btn: int) -> bool:
-    # Unity-like pulse: press now, release next frame.
+    # Legacy/sequence pulse: press now, release next frame.
     if int(self._stw_release_frame) > int(self.frame):
       return False
 
@@ -241,13 +267,24 @@ class CarController(CarControllerBase):
     return True
 
   def _process_stalk_actions(self, CS, can_sends) -> None:
+    # Hold-mode (debounced) press repeat + release
+    if self._stw_hold_btn is not None:
+      if int(self.frame) >= int(self._stw_hold_end_frame):
+        self._send_stw(CS, can_sends, BTN_IDLE, bus=int(self._stw_hold_bus))
+        self._stw_hold_btn = None
+        self._stw_hold_end_frame = -1
+        self._stw_hold_next_frame = -1
+      elif int(self.frame) >= int(self._stw_hold_next_frame):
+        self._send_stw(CS, can_sends, int(self._stw_hold_btn), bus=int(self._stw_hold_bus))
+        self._stw_hold_next_frame = int(self._stw_hold_next_frame) + 10
+
     # Release pending pulse
     if int(self._stw_release_frame) == int(self.frame):
       self._send_stw(CS, can_sends, BTN_IDLE, bus=int(self._stw_release_bus))
       self._stw_release_frame = -1
 
-    # Run queued press sequence (e.g. legacy MAIN+RESUME on engage)
-    if (int(self._stw_release_frame) < 0) and self._stw_sequence:
+    # Run queued press sequence (e.g. legacy MAIN+SET on engage)
+    if (self._stw_hold_btn is None) and (int(self._stw_release_frame) < 0) and self._stw_sequence:
       due_frame, btn = self._stw_sequence[0]
       if int(self.frame) >= int(due_frame):
         if self._queue_stalk_pulse(CS, can_sends, int(btn)):
@@ -266,7 +303,7 @@ class CarController(CarControllerBase):
       return
 
     # Don't overlap with press/release sequencing
-    if (int(self._stw_release_frame) >= 0) or bool(self._stw_sequence):
+    if (self._stw_hold_btn is not None) or (int(self._stw_release_frame) >= 0) or bool(self._stw_sequence):
       return
 
     # Rate limit: 0.5s (Unity parity-ish)
@@ -303,7 +340,7 @@ class CarController(CarControllerBase):
     else:
       btn = BTN_DOWN2 if diff_u <= -4.5 else BTN_DOWN1
 
-    if self._queue_stalk_pulse(CS, can_sends, btn):
+    if self._queue_stalk_hold(CS, can_sends, btn):
       self._speed_sync_last_frame = int(self.frame)
       cloudlog.info(
         f"[XNOR_CRUISE_SYNC] uom={uom} target={target_ms*ms_to_u:.1f} current={current_ms*ms_to_u:.1f} "
@@ -402,6 +439,7 @@ class CarController(CarControllerBase):
 
     self.frame += 1
     return new_actuators, can_sends
+
 
 # ===== ABSTRACT-SAFETY SHIM =====
 # If an indentation/merge slip moves CarController.update() outside the class,
