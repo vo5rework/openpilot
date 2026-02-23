@@ -124,7 +124,21 @@ class CarController(CarControllerBase):
     self._op659_prev_btn = stalk_btn
 
     if (self.frame % 10 == 0) or main_edge or cancel_edge:
-      for bus in (CANBUS.party,):
+      # For dual-panda Tesla legacy setups, this carrier must be emitted on *all* TX buses
+      # used by the active TeslaCAN packers. Relying on a fingerprint list is brittle and
+      # can strand one panda at controlsAllowed=False (controlsMismatch).
+      buses = {int(CANBUS.party)}
+      try:
+        pk = getattr(self, "packers", None)
+        if isinstance(pk, dict):
+          for b in pk.keys():
+            buses.add(int(b))
+      except Exception:
+        pass
+      # Backstop for older builds where packers isn't present but legacy cars still need PT bus.
+      if (len(buses) == 1) and (self.CP.carFingerprint in LEGACY_CARS):
+        buses.add(int(CANBUS.powertrain))
+      for bus in sorted(buses):
         can_sends.append(create_fake_das(
           self._cached_pedal_enabled,
           self._cached_autopilot_disabled,
@@ -359,3 +373,44 @@ class CarController(CarControllerBase):
 
     self.frame += 1
     return new_actuators, can_sends
+
+# ===== ABSTRACT-SAFETY SHIM =====
+# If an indentation/merge slip moves CarController.update() outside the class,
+# Python will treat CarController as abstract and crash at startup. This shim
+# installs a minimal compatible update() only when required.
+import abc as _abc  # noqa: E402
+import inspect as _inspect  # noqa: E402
+
+def _cc_update_shim(self, CC, CS, now_nanos, *args, **kwargs):  # noqa: D401
+  actuators = getattr(CC, "actuators", None) or CC.actuators
+  can_sends = kwargs.get("can_sends") or kwargs.get("can_sends_in") or []
+  try:
+    f = getattr(self, "_refresh_cached_params", None)
+    if callable(f):
+      f()
+    f = getattr(self, "_emit_internal_0x659", None)
+    if callable(f):
+      f(CS, can_sends)
+  except Exception:
+    pass
+
+  new_actuators = actuators.as_builder()
+  try:
+    new_actuators.steeringAngleDeg = float(getattr(self, "apply_angle_last", 0.0))
+  except Exception:
+    pass
+
+  try:
+    self.frame = int(getattr(self, "frame", 0)) + 1
+  except Exception:
+    pass
+  return new_actuators, can_sends
+
+if _inspect.isabstract(CarController):  # pragma: no cover
+  try:
+    cloudlog.error(f"[XNOR] CarController abstract ({sorted(getattr(CarController, '__abstractmethods__', []))}); applying shim")
+  except Exception:
+    pass
+  CarController.update = _cc_update_shim
+  _abc.update_abstractmethods(CarController)
+# ===== END ABSTRACT-SAFETY SHIM =====
