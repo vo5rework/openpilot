@@ -1,12 +1,15 @@
 from opendbc.car.common.conversions import Conversions as CV
 from opendbc.car.tesla.values import CANBUS, CarControllerParams
-def _crc8_11d(data: bytes) -> int:
-  """CRC8 poly 0x11D, init 0x00, xorout 0xFF, not reflected (Unity parity)."""
-  crc = 0x00
+def _crc8_j1850(data: bytes) -> int:
+  """CRC-8/J1850 (poly 0x1D, init 0xFF, xorout 0xFF), MSB-first.
+
+  Verified against 660 on-road STW_ACTN_RQ frames (addr 0x045) captured on HW2.
+  """
+  crc = 0xFF
   for b in data:
     crc ^= b
     for _ in range(8):
-      crc = ((crc << 1) ^ 0x11D) if (crc & 0x80) else (crc << 1)
+      crc = ((crc << 1) ^ 0x1D) if (crc & 0x80) else (crc << 1)
       crc &= 0xFF
   return crc ^ 0xFF
 
@@ -103,7 +106,7 @@ class TeslaCAN:
     msg = self.packer.make_can_msg("STW_ACTN_RQ", bus, values)
     # msg[1] is bytes payload
     dat = msg[1]
-    crc = _crc8_11d(dat[:7])
+    crc = _crc8_j1850(dat[:7])
     values["CRC_STW_ACTN_RQ"] = crc
     return self.packer.make_can_msg("STW_ACTN_RQ", bus, values)
 
