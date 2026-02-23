@@ -221,7 +221,7 @@ class CarState(CarStateBase):
     try:
       gps = _msg("UI_gpsVehicleSpeed")
       if gps is not None:
-        msu = int(gps.get("UI_mapSpeedLimitUnits", gps.get("units", 0)) or 0)
+        msu = int(gps.get("UI_mapSpeedLimitUnits", 0))
         map_uom_to_ms = CV.KPH_TO_MS if msu == 1 else CV.MPH_TO_MS
         map_ms_to_uom = CV.MS_TO_KPH if msu == 1 else CV.MS_TO_MPH
 
@@ -237,7 +237,7 @@ class CarState(CarStateBase):
         if base_map > 0.0 and (speed_limit_type != 0x1F or base_map >= 5.56):
           speed_limit_ms = base_map
         else:
-          speed_limit_ms = float(gps.get("UI_mppSpeedLimit", gps.get("mppSpeedLimit", 0.0)) or 0.0) * map_uom_to_ms
+          speed_limit_ms = float(gps.get("UI_mppSpeedLimit", 0.0) or 0.0) * map_uom_to_ms
     except Exception:
       pass
 
@@ -318,77 +318,34 @@ class CarState(CarStateBase):
       ret.steeringDisengage = self.hands_on_level >= 3 or (eac_status == "EAC_INHIBITED" and
                                                          eac_error_code == "EAC_ERROR_HIGH_ANGLE_RATE_SAFETY")
 
-    # Cruise state (HW2 legacy: DI_state is mirrored; choose the authoritative source)
-    try:
-      di_candidates = []
-      for _name, _cp in (("pt", cp_pt), ("chassis", cp_chassis), ("party", cp_party), ("ap_party", cp_ap_party), ("ap_pt", cp_ap_pt)):
-        try:
-          _di = _cp.vl["DI_state"]
-        except Exception:
-          continue
-        try:
-          _raw = int(_di.get("DI_cruiseState", 0) or 0)
-        except Exception:
-          _raw = 0
-        try:
-          _set = float(_di.get("DI_cruiseSet", 0.0) or 0.0)
-        except Exception:
-          _set = 0.0
-        # Prefer frames that actually carry cruiseSet, then engaged-ish states, then larger set speed.
-        _engaged = 1 if _raw not in (0, 1) else 0
-        di_candidates.append(((1 if _set > 0.0 else 0, _engaged, _set, _raw), _name, _di))
+    # Cruise state
+    cruise_state = self.can_define.dv["DI_state"]["DI_cruiseState"].get(int(cp_party.vl["DI_state"]["DI_cruiseState"]), None)
+    speed_units = self.can_define.dv["DI_state"]["DI_speedUnits"].get(int(cp_party.vl["DI_state"]["DI_speedUnits"]), None)
 
-      if di_candidates:
-        di_candidates.sort(key=lambda x: x[0], reverse=True)
-        di_src, di_state = di_candidates[0][1], di_candidates[0][2]
-      else:
-        di_src, di_state = "chassis", cp_chassis.vl["DI_state"]
-    except Exception:
-      di_src, di_state = "chassis", cp_chassis.vl["DI_state"]
-
-    raw_cruise_state = int(di_state.get("DI_cruiseState", 0) or 0)
-    cruise_state = self.can_defines["DI_state"]["DI_cruiseState"].get(raw_cruise_state, None)
-
-    raw_speed_units = int(di_state.get("DI_speedUnits", 0) or 0)
-    speed_units = self.can_defines["DI_state"]["DI_speedUnits"].get(raw_speed_units, None)
-
-    if cruise_state is None:
-      # HW2: raw=1 standby, raw=15 engaged (common), raw=4 fault.
-      cruise_enabled = raw_cruise_state not in (0, 1)
-      cruise_available = raw_cruise_state != 0
-      cruise_standstill = False
-      cruise_faulted = raw_cruise_state == 4
-    else:
-      cruise_enabled = cruise_state in ("ENABLED", "STANDSTILL", "OVERRIDE", "PRE_FAULT", "PRE_CANCEL")
-      cruise_available = cruise_state == "STANDBY" or cruise_enabled
-      cruise_standstill = cruise_state == "STANDSTILL"
-      cruise_faulted = cruise_state == "FAULT"
-
+    autopark_state = self.can_define.dv["DI_state"]["DI_autoparkState"].get(int(cp_party.vl["DI_state"]["DI_autoparkState"]), None)
+    cruise_enabled = cruise_state in ("ENABLED", "STANDSTILL", "OVERRIDE", "PRE_FAULT", "PRE_CANCEL")
+    self.update_autopark_state(autopark_state, cruise_enabled)
     # Cruise set speed (DI_state): pick correct decoded field without changing the DBC
-    ret.cruiseState.enabled = bool(cruise_enabled)
-    uom = speed_units if speed_units in ("KPH", "MPH") else ("KPH" if raw_speed_units == 1 else "MPH")
-    cruise_set_u, src = self._pick_stock_cruise_set_u(di_state, float(ret.vEgo), bool(cruise_enabled), uom)
-
+    uom = speed_units if speed_units in ("KPH", "MPH") else "MPH"
+    cruise_set_u, src = self._pick_stock_cruise_set_u(cp_party.vl["DI_state"], float(ret.vEgo), bool(cruise_enabled), uom)
     self.stock_cruise_enabled = bool(cruise_enabled)
-
     if cruise_set_u > 0.0:
       self.stock_cruise_set_speed_ms = float(cruise_set_u) * (CV.KPH_TO_MS if uom == "KPH" else CV.MPH_TO_MS)
       ret.cruiseState.speed = max(float(self.stock_cruise_set_speed_ms), 1e-3)
     else:
       self.stock_cruise_set_speed_ms = 0.0
       ret.cruiseState.speed = max(float(ret.vEgo), 1e-3)
-
-    self._cruise_set_src = f"{src}/{di_src}"
-    ret.cruiseState.available = bool(cruise_available)
-    ret.cruiseState.standstill = False  # can resume without special msgs
-    ret.standstill = bool(cruise_standstill)
-    ret.accFaulted = bool(cruise_faulted)
-
-    # Speed limit best-effort (needed for speed-limit matching)
-    try:
-      self._update_speed_limit(can_parsers)
-    except Exception:
-      pass
+    self._cruise_set_src = str(src)
+    if self.autopilot_disabled:
+      # Unity parity: allow engagement without Tesla cruise (low-speed lateral only)
+      ret.cruiseState.available = True
+      ret.cruiseState.enabled = bool(self.cruiseEnabled)
+    else:
+      ret.cruiseState.enabled = cruise_enabled and not self.autopark
+      ret.cruiseState.available = cruise_state == "STANDBY" or ret.cruiseState.enabled
+    ret.cruiseState.standstill = False  # This needs to be false, since we can resume from stop without sending anything special
+    ret.standstill = cruise_state == "STANDSTILL"
+    ret.accFaulted = cruise_state == "FAULT"
 
     # Unity parity: store last STW_ACTN_RQ for virtual stalk + tap-to-ALC
     self.speed_units = speed_units if speed_units in ("KPH", "MPH") else "MPH"
@@ -408,8 +365,7 @@ class CarState(CarStateBase):
     if stw is not None:
       self.msg_stw_actn_req = copy.copy(stw)
       if stw_bus is not None:
-        # Measured on HW2: only tx_bus=0 lands on mirrored STW rx_src (0 and 130)
-        self.stw_actn_bus = int(CANBUS.party)
+        self.stw_actn_bus = int(stw_bus)
       self.cruise_buttons = int(stw.get("SpdCtrlLvr_Stat", 0))
       raw_ts = int(stw.get("TurnIndLvr_Stat", 0))
       self.turnSignalStalkState = 0 if raw_ts == 3 else raw_ts
@@ -575,56 +531,16 @@ class CarState(CarStateBase):
     else:
       ret.steeringDisengage = self.hands_on_level >= 3 or (eac_status == "EAC_INHIBITED" and
                                                          eac_error_code == "EAC_ERROR_HIGH_ANGLE_RATE_SAFETY")
-    # Cruise state (legacy HW2/HW3): DI_state differs by bus; pick the best source.
-    try:
-      di_candidates = []
-      for _name, _cp in (("pt", cp_pt), ("chassis", cp_chassis), ("party", cp_party), ("ap_party", cp_ap_party), ("ap_pt", cp_ap_pt)):
-        try:
-          _di = _cp.vl["DI_state"]
-        except Exception:
-          continue
-        try:
-          _raw = int(_di.get("DI_cruiseState", 0) or 0)
-        except Exception:
-          _raw = 0
-        try:
-          _set = float(_di.get("DI_cruiseSet", 0.0) or 0.0)
-        except Exception:
-          _set = 0.0
-        # Prefer frames that actually carry cruiseSet, then engaged-ish states, then larger set speed.
-        _engaged = 1 if _raw not in (0, 1) else 0
-        di_candidates.append(((1 if _set > 0.0 else 0, _engaged, _set, _raw), _name, _di))
 
-      if di_candidates:
-        di_candidates.sort(key=lambda x: x[0], reverse=True)
-        di_src, di_state = di_candidates[0][1], di_candidates[0][2]
-      else:
-        di_src, di_state = "chassis", cp_chassis.vl["DI_state"]
-    except Exception:
-      di_src, di_state = "chassis", cp_chassis.vl["DI_state"]
+    # Cruise state
+    cruise_state = self.can_defines["DI_state"]["DI_cruiseState"].get(int(cp_chassis.vl["DI_state"]["DI_cruiseState"]), None)
+    speed_units = self.can_defines["DI_state"]["DI_speedUnits"].get(int(cp_chassis.vl["DI_state"]["DI_speedUnits"]), None)
 
-    raw_cruise_state = int(di_state.get("DI_cruiseState", 0) or 0)
-    cruise_state = self.can_defines["DI_state"]["DI_cruiseState"].get(raw_cruise_state, None)
-
-    raw_speed_units = int(di_state.get("DI_speedUnits", 0) or 0)
-    speed_units = self.can_defines["DI_state"]["DI_speedUnits"].get(raw_speed_units, None)
-
-    if cruise_state is None:
-      # HW2: raw=1 standby, raw=15 engaged (common), raw=4 fault.
-      cruise_enabled = raw_cruise_state not in (0, 1)
-      cruise_available = raw_cruise_state != 0
-      cruise_standstill = False
-      cruise_faulted = raw_cruise_state == 4
-    else:
-      cruise_enabled = cruise_state in ("ENABLED", "STANDSTILL", "OVERRIDE", "PRE_FAULT", "PRE_CANCEL")
-      cruise_available = cruise_state == "STANDBY" or cruise_enabled
-      cruise_standstill = cruise_state == "STANDSTILL"
-      cruise_faulted = cruise_state == "FAULT"
-
-    ret.cruiseState.enabled = bool(cruise_enabled)
-    uom = speed_units if speed_units in ("KPH", "MPH") else ("KPH" if raw_speed_units == 1 else "MPH")
-    cruise_set_u, src = self._pick_stock_cruise_set_u(di_state, float(ret.vEgo), bool(cruise_enabled), uom)
-
+    cruise_enabled = cruise_state in ("ENABLED", "STANDSTILL", "OVERRIDE", "PRE_FAULT", "PRE_CANCEL")
+    # Cruise set speed (DI_state): pick correct decoded field without changing the DBC
+    ret.cruiseState.enabled = cruise_enabled
+    uom = speed_units if speed_units in ("KPH", "MPH") else "MPH"
+    cruise_set_u, src = self._pick_stock_cruise_set_u(cp_chassis.vl["DI_state"], float(ret.vEgo), bool(cruise_enabled), uom)
     self.stock_cruise_enabled = bool(cruise_enabled)
     if cruise_set_u > 0.0:
       self.stock_cruise_set_speed_ms = float(cruise_set_u) * (CV.KPH_TO_MS if uom == "KPH" else CV.MPH_TO_MS)
@@ -632,14 +548,11 @@ class CarState(CarStateBase):
     else:
       self.stock_cruise_set_speed_ms = 0.0
       ret.cruiseState.speed = max(float(ret.vEgo), 1e-3)
-
-    self._cruise_set_src = f"{src}/{di_src}"
-    self.speed_units = uom
-    ret.cruiseState.available = bool(cruise_available)
-    ret.cruiseState.standstill = False
-    ret.standstill = bool(cruise_standstill)
-    ret.accFaulted = bool(cruise_faulted)
-
+    self._cruise_set_src = str(src)
+    ret.cruiseState.available = cruise_state == "STANDBY" or ret.cruiseState.enabled
+    ret.cruiseState.standstill = False  # This needs to be false, since we can resume from stop without sending anything special
+    ret.standstill = cruise_state == "STANDSTILL"
+    ret.accFaulted = cruise_state == "FAULT"
 
     # Unity parity: store last STW_ACTN_RQ for virtual stalk + tap-to-ALC
     self.speed_units = speed_units if speed_units in ("KPH", "MPH") else "MPH"
@@ -659,8 +572,7 @@ class CarState(CarStateBase):
     if stw is not None:
       self.msg_stw_actn_req = copy.copy(stw)
       if stw_bus is not None:
-        # Measured on HW2: only tx_bus=0 lands on mirrored STW rx_src (0 and 130)
-        self.stw_actn_bus = int(CANBUS.party)
+        self.stw_actn_bus = int(stw_bus)
       self.cruise_buttons = int(stw.get("SpdCtrlLvr_Stat", 0))
       raw_ts = int(stw.get("TurnIndLvr_Stat", 0))
       self.turnSignalStalkState = 0 if raw_ts == 3 else raw_ts
@@ -757,21 +669,79 @@ class CarState(CarStateBase):
 
   @staticmethod
   def get_can_parsers(CP):
-    if CP.carFingerprint in LEGACY_CARS:
-      return {
-        Bus.party: CANParser(DBC[CP.carFingerprint][Bus.party], [], CANBUS.party),
-        Bus.ap_party: CANParser(DBC[CP.carFingerprint][Bus.party], [], CANBUS.autopilot_party),
-        Bus.pt: CANParser(DBC[CP.carFingerprint][Bus.pt], [], CANBUS.powertrain),
-        Bus.ap_pt: CANParser(DBC[CP.carFingerprint][Bus.pt], [], CANBUS.autopilot_powertrain),
-        Bus.chassis: CANParser(DBC[CP.carFingerprint][Bus.chassis], [], CANBUS.chassis if CP.carFingerprint == CAR.TESLA_MODEL_S_HW3 else CANBUS.party),
-        Bus.cam: CANParser(DBC[CP.carFingerprint][Bus.party], [], CANBUS.party + 4),
-      }
+    """Return CANParsers keyed by opendbc.car.Bus.
 
-    return {
-      Bus.party: CANParser(DBC[CP.carFingerprint][Bus.party], [], CANBUS.party),
-      Bus.ap_party: CANParser(DBC[CP.carFingerprint][Bus.party], [], CANBUS.autopilot_party),
-      Bus.cam: CANParser(DBC[CP.carFingerprint][Bus.party], [], CANBUS.party + 4),
+    XNOR note (HW2 legacy Tesla):
+      - canValid is computed as all(cp.can_valid for cp in can_parsers.values()) in interfaces.py.
+      - Therefore every parser included here must be pointed at a bus that actually carries the
+        messages we ask it to validate.
+      - On your HW2 wiring, we have measured:
+          STW_ACTN_RQ (0x045): rx_src 0 and 130 (~10Hz each)
+          DI_state    (0x368): rx_src 0, 4, 130 (~10Hz)
+          UI_gpsVehicleSpeed (0x2f8): rx_src 0 and 130 (~1Hz)
+          EPAS_sysStatus (0x370): rx_src 0 and 130 (~25Hz)
+          DAS_steeringControl (0x488): rx_src 2 and 128 (~50Hz)
+
+    This function is written to avoid CAN error false positives by:
+      - validating party on bus0
+      - validating the mirrored party on bus130 when multiple pandas are present
+      - validating powertrain on bus4
+      - validating steering-control bus on bus2
+    """
+    # Determine whether a mirrored party bus is present (2-panda HW2 setups).
+    num_pandas = int(getattr(CP, "numPandas", 1) or 1)
+    has_mirrored_party = num_pandas > 1
+
+    # Message validation lists (msg_name_or_addr, expected_hz).
+    party_checks = [
+      ("STW_ACTN_RQ", 10),
+      ("DI_state", 10),
+      ("UI_gpsVehicleSpeed", 1),
+      ("EPAS_sysStatus", 25),
+    ]
+
+    mirrored_party_checks = [
+      ("STW_ACTN_RQ", 10),
+      ("DI_state", 10),
+      ("UI_gpsVehicleSpeed", 1),
+    ]
+
+    pt_checks = [
+      ("DI_state", 10),
+      ("EPAS_sysStatus", 25),
+    ]
+
+    steer_checks = [
+      ("DAS_steeringControl", 50),
+    ]
+
+    # Buses are the *rx_src* values we measured.
+    party_bus = CANBUS.party  # 0
+    mirrored_party_bus = 130  # measured mirror of party on HW2
+    pt_bus = CANBUS.powertrain  # 4
+    steer_bus = CANBUS.autopilot_party  # 2
+
+    # Base dict: always include the buses we truly rely on.
+    can_parsers = {
+      Bus.party: CANParser(DBC[CP.carFingerprint][Bus.party], party_checks, party_bus),
+      Bus.pt: CANParser(DBC[CP.carFingerprint][Bus.pt], pt_checks, pt_bus),
+      # Use Bus.ap_pt as the steering-control bus in legacy (0x488 observed on rx_src=2/128).
+      Bus.ap_pt: CANParser(DBC[CP.carFingerprint][Bus.party], steer_checks, steer_bus),
     }
+
+    # Add mirrored party bus parser only when a 2nd panda is present.
+    if has_mirrored_party:
+      can_parsers[Bus.ap_party] = CANParser(DBC[CP.carFingerprint][Bus.party], mirrored_party_checks, mirrored_party_bus)
+    else:
+      # Single-panda fallback: keep API compatibility, but don't require a separate bus.
+      can_parsers[Bus.ap_party] = CANParser(DBC[CP.carFingerprint][Bus.party], [], CANBUS.autopilot_party)
+
+    # Keep these keys present for callers that expect them, but do not gate canValid on them.
+    # Empty check lists => cp.can_valid will converge to True once updated.
+    can_parsers[Bus.chassis] = CANParser(DBC[CP.carFingerprint][Bus.chassis], [], CANBUS.chassis if CP.carFingerprint == CAR.TESLA_MODEL_S_HW3 else CANBUS.party)
+    can_parsers[Bus.cam] = CANParser(DBC[CP.carFingerprint][Bus.party], [], CANBUS.party + 4)
+
+    return can_parsers
 
 # --- XNOR guard: ensure CarState is not left abstract by accidental indentation edits ---
 import abc as _abc  # noqa: E402
