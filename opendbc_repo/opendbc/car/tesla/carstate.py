@@ -127,7 +127,7 @@ class CarState(CarStateBase):
 
 
   def _calc_speed_limit_target_ms(self, speed_units: str) -> float:
-    limit_ms = float(getattr(self, "speed_limit_ms_das", 0.0) or getattr(self, "speed_limit_ms", 0.0) or 0.0)
+    limit_ms = float(getattr(self, "speed_limit_ms", 0.0) or getattr(self, "speed_limit_ms_das", 0.0) or 0.0)
     if limit_ms <= 0.0:
       return 0.0
 
@@ -577,6 +577,10 @@ class CarState(CarStateBase):
 
     # Unity parity: store last STW_ACTN_RQ for virtual stalk + tap-to-ALC
     self.speed_units = speed_units if speed_units in ("KPH", "MPH") else "MPH"
+
+
+    # Speed limit best-effort (needed for speed-limit matching)
+    self._update_speed_limit(can_parsers)
 
     stw = None
     stw_bus = None
