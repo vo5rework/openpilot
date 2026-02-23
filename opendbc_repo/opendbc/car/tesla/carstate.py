@@ -672,6 +672,10 @@ class CarState(CarStateBase):
     """Return CANParsers keyed by opendbc.car.Bus.
 
     XNOR note (HW2 legacy Tesla):
+      - CANParser(dbc_name, [(msg_name, hz), ...], bus) raises immediately if any msg_name is not in the DBC.
+      - Therefore, every validation list below is filtered against the actual DBC at runtime before constructing
+        each CANParser. This prevents hard-crashes if message names drift or the wrong DBC is selected.
+
       - canValid is computed as all(cp.can_valid for cp in can_parsers.values()) in interfaces.py.
       - Therefore every parser included here must be pointed at a bus that actually carries the
         messages we ask it to validate.
@@ -688,6 +692,28 @@ class CarState(CarStateBase):
       - validating powertrain on bus4
       - validating steering-control bus on bus2
     """
+    # Local import to avoid colliding with opendbc.car.tesla.values.DBC
+    from opendbc.can.dbc import DBC as _DBC  # pylint: disable=import-outside-toplevel
+
+    def _filter_msgs(dbc_name: str, checks: list[tuple[str | int, int]], label: str) -> list[tuple[str | int, int]]:
+      try:
+        msg_names = set(_DBC(dbc_name).name_to_msg.keys())
+      except Exception as e:
+        cloudlog.exception(f"[XNOR_CANPARSER] failed to load DBC={dbc_name} ({label}): {e}")
+        return list(checks)
+
+      kept: list[tuple[str | int, int]] = []
+      dropped: list[str] = []
+      for name_or_addr, hz in checks:
+        if isinstance(name_or_addr, str) and (name_or_addr not in msg_names):
+          dropped.append(name_or_addr)
+          continue
+        kept.append((name_or_addr, hz))
+
+      if dropped:
+        cloudlog.warning(f"[XNOR_CANPARSER] dropped msgs not in DBC={dbc_name} ({label}): {sorted(set(dropped))}")
+      return kept
+
     # Determine whether a mirrored party bus is present (2-panda HW2 setups).
     num_pandas = int(getattr(CP, "numPandas", 1) or 1)
     has_mirrored_party = num_pandas > 1
@@ -706,9 +732,9 @@ class CarState(CarStateBase):
       ("UI_gpsVehicleSpeed", 1),
     ]
 
+    # NOTE: EPAS_sysStatus is a *party* DBC message (tesla_can / tesla_raven_party), not in tesla_powertrain.
     pt_checks = [
       ("DI_state", 10),
-      ("EPAS_sysStatus", 25),
     ]
 
     steer_checks = [
@@ -721,25 +747,34 @@ class CarState(CarStateBase):
     pt_bus = CANBUS.powertrain  # 4
     steer_bus = CANBUS.autopilot_party  # 2
 
+    # Filter message lists against each DBC (prevents startup crashes on DBC/name mismatch).
+    party_dbc = DBC[CP.carFingerprint][Bus.party]
+    pt_dbc = DBC[CP.carFingerprint][Bus.pt]
+
+    party_checks = _filter_msgs(party_dbc, party_checks, "party")
+    mirrored_party_checks = _filter_msgs(party_dbc, mirrored_party_checks, "mirrored_party")
+    pt_checks = _filter_msgs(pt_dbc, pt_checks, "powertrain")
+    steer_checks = _filter_msgs(party_dbc, steer_checks, "steer")
+
     # Base dict: always include the buses we truly rely on.
     can_parsers = {
-      Bus.party: CANParser(DBC[CP.carFingerprint][Bus.party], party_checks, party_bus),
-      Bus.pt: CANParser(DBC[CP.carFingerprint][Bus.pt], pt_checks, pt_bus),
+      Bus.party: CANParser(party_dbc, party_checks, party_bus),
+      Bus.pt: CANParser(pt_dbc, pt_checks, pt_bus),
       # Use Bus.ap_pt as the steering-control bus in legacy (0x488 observed on rx_src=2/128).
-      Bus.ap_pt: CANParser(DBC[CP.carFingerprint][Bus.party], steer_checks, steer_bus),
+      Bus.ap_pt: CANParser(party_dbc, steer_checks, steer_bus),
     }
 
     # Add mirrored party bus parser only when a 2nd panda is present.
     if has_mirrored_party:
-      can_parsers[Bus.ap_party] = CANParser(DBC[CP.carFingerprint][Bus.party], mirrored_party_checks, mirrored_party_bus)
+      can_parsers[Bus.ap_party] = CANParser(party_dbc, mirrored_party_checks, mirrored_party_bus)
     else:
       # Single-panda fallback: keep API compatibility, but don't require a separate bus.
-      can_parsers[Bus.ap_party] = CANParser(DBC[CP.carFingerprint][Bus.party], [], CANBUS.autopilot_party)
+      can_parsers[Bus.ap_party] = CANParser(party_dbc, [], CANBUS.autopilot_party)
 
     # Keep these keys present for callers that expect them, but do not gate canValid on them.
     # Empty check lists => cp.can_valid will converge to True once updated.
     can_parsers[Bus.chassis] = CANParser(DBC[CP.carFingerprint][Bus.chassis], [], CANBUS.chassis if CP.carFingerprint == CAR.TESLA_MODEL_S_HW3 else CANBUS.party)
-    can_parsers[Bus.cam] = CANParser(DBC[CP.carFingerprint][Bus.party], [], CANBUS.party + 4)
+    can_parsers[Bus.cam] = CANParser(party_dbc, [], CANBUS.party + 4)
 
     return can_parsers
 
