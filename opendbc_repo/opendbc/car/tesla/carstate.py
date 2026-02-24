@@ -101,6 +101,7 @@ class CarState(CarStateBase):
     self.blinker_controller = BLNKController()
     self.alca_controller = ALCController()
     self.hso_controller = HSOController()
+    self._vego_nan_logged = False
     try:
       self._reload_tinkla_params()
       self.autopilot_disabled = bool(self._tinkla.autopilot_disabled)
@@ -307,7 +308,37 @@ class CarState(CarStateBase):
 
     # Vehicle speed
     ret.vEgoRaw = cp_party.vl["DI_speed"]["DI_vehicleSpeed"] * CV.KPH_TO_MS
-    ret.vEgo, ret.aEgo = self.update_speed_kf(ret.vEgoRaw)
+    if not math.isfinite(ret.vEgoRaw):
+      if not self._vego_nan_logged:
+        cloudlog.error(f"[XNOR_VEGO] non-finite vEgoRaw={ret.vEgoRaw!r} from DI_speed.DI_vehicleSpeed")
+        self._vego_nan_logged = True
+      ret.vEgoRaw = 0.0
+      kf = getattr(self, "v_ego_kf", None)
+      if kf is not None and hasattr(kf, "x"):
+        try:
+          kf.x = [[0.0], [0.0]]
+        except Exception:
+          try:
+            kf.x = [0.0, 0.0]
+          except Exception:
+            pass
+    ret.vEgo, ret.aEgo = self.update_speed_kf(float(ret.vEgoRaw))
+    if (not math.isfinite(ret.vEgo)) or (not math.isfinite(ret.aEgo)):
+      if not self._vego_nan_logged:
+        cloudlog.error(f"[XNOR_VEGO] non-finite vEgo/aEgo from speed_kf vEgoRaw={ret.vEgoRaw!r}")
+        self._vego_nan_logged = True
+      ret.vEgoRaw = 0.0
+      ret.vEgo = 0.0
+      ret.aEgo = 0.0
+      kf = getattr(self, "v_ego_kf", None)
+      if kf is not None and hasattr(kf, "x"):
+        try:
+          kf.x = [[0.0], [0.0]]
+        except Exception:
+          try:
+            kf.x = [0.0, 0.0]
+          except Exception:
+            pass
 
     # Gas pedal
     ret.gasPressed = cp_party.vl["DI_systemStatus"]["DI_accelPedalPos"] > 0
@@ -518,7 +549,37 @@ class CarState(CarStateBase):
 
     # Vehicle speed
     ret.vEgoRaw = cp_chassis.vl["ESP_B"]["ESP_vehicleSpeed"] * CV.KPH_TO_MS
-    ret.vEgo, ret.aEgo = self.update_speed_kf(ret.vEgoRaw)
+    if not math.isfinite(ret.vEgoRaw):
+      if not self._vego_nan_logged:
+        cloudlog.error(f"[XNOR_VEGO] non-finite vEgoRaw={ret.vEgoRaw!r} from ESP_B.ESP_vehicleSpeed")
+        self._vego_nan_logged = True
+      ret.vEgoRaw = 0.0
+      kf = getattr(self, "v_ego_kf", None)
+      if kf is not None and hasattr(kf, "x"):
+        try:
+          kf.x = [[0.0], [0.0]]
+        except Exception:
+          try:
+            kf.x = [0.0, 0.0]
+          except Exception:
+            pass
+    ret.vEgo, ret.aEgo = self.update_speed_kf(float(ret.vEgoRaw))
+    if (not math.isfinite(ret.vEgo)) or (not math.isfinite(ret.aEgo)):
+      if not self._vego_nan_logged:
+        cloudlog.error(f"[XNOR_VEGO] non-finite vEgo/aEgo from speed_kf vEgoRaw={ret.vEgoRaw!r}")
+        self._vego_nan_logged = True
+      ret.vEgoRaw = 0.0
+      ret.vEgo = 0.0
+      ret.aEgo = 0.0
+      kf = getattr(self, "v_ego_kf", None)
+      if kf is not None and hasattr(kf, "x"):
+        try:
+          kf.x = [[0.0], [0.0]]
+        except Exception:
+          try:
+            kf.x = [0.0, 0.0]
+          except Exception:
+            pass
 
     # Gas pedal
     ret.gasPressed = cp_pt.vl["DI_torque1"]["DI_pedalPos"] > 0
