@@ -76,7 +76,6 @@ class CarState(CarStateBase):
     self.speed_limit_ms_das = 0.0
     self.stock_cruise_enabled = False
     self.stock_cruise_set_speed_ms = 0.0
-    self.stock_cruise_state = \"\"
     self.leftBlinkerLamp = False
     self.rightBlinkerLamp = False
     # ALC/BLNK/HSO/ACC (Unity parity)
@@ -102,6 +101,7 @@ class CarState(CarStateBase):
     self.blinker_controller = BLNKController()
     self.alca_controller = ALCController()
     self.hso_controller = HSOController()
+    self._vego_nan_logged = False
     try:
       self._reload_tinkla_params()
       self.autopilot_disabled = bool(self._tinkla.autopilot_disabled)
@@ -128,7 +128,7 @@ class CarState(CarStateBase):
 
 
   def _calc_speed_limit_target_ms(self, speed_units: str) -> float:
-    limit_ms = float(getattr(self, "speed_limit_ms_das", 0.0) or getattr(self, "speed_limit_ms", 0.0) or 0.0)
+    limit_ms = float(getattr(self, "speed_limit_ms", 0.0) or getattr(self, "speed_limit_ms_das", 0.0) or 0.0)
     if limit_ms <= 0.0:
       return 0.0
 
@@ -208,13 +208,20 @@ class CarState(CarStateBase):
     speed_limit_ms = 0.0
     speed_limit_ms_das = 0.0
 
+    # Debug/raw inputs (logged when TinklaAdjustAccWithSpeedLimit is enabled)
+    gps_units = None
+    gps_mpp = None
+    rd_sign = None
+    rd_base_mps = None
+    map_type = None
+    das_mph = None
     def _msg(name: str):
       for bk in (Bus.party, Bus.ap_party, Bus.cam, Bus.chassis, Bus.pt, Bus.ap_pt):
         cp = can_parsers.get(bk)
         if cp is None:
           continue
         try:
-          return cp.vl[name]
+          return cp.vl.get(name)
         except KeyError:
           continue
       return None
@@ -223,13 +230,23 @@ class CarState(CarStateBase):
       gps = _msg("UI_gpsVehicleSpeed")
       if gps is not None:
         msu = int(gps.get("UI_mapSpeedLimitUnits", 0))
+        gps_units = msu
         map_uom_to_ms = CV.KPH_TO_MS if msu == 1 else CV.MPH_TO_MS
         map_ms_to_uom = CV.MS_TO_KPH if msu == 1 else CV.MS_TO_MPH
 
         map_data = _msg("UI_driverAssistMapData") or {}
         speed_limit_type = int(map_data.get("UI_mapSpeedLimitType", map_data.get("UI_mapSpeedLimitType", map_data.get("UI_mapSpeedLimit", 0))) or 0)
+        map_type = speed_limit_type
 
         rd = _msg("UI_driverAssistRoadSign") or {}
+        try:
+          rd_sign = int(rd.get("UI_roadSign", 0) or 0)
+        except Exception:
+          rd_sign = None
+        try:
+          rd_base_mps = float(rd.get("UI_baseMapSpeedLimitMPS", 0.0) or 0.0)
+        except Exception:
+          rd_base_mps = None
         base_map = 0.0
         if int(rd.get("UI_roadSign", 0)) == 3:
           base_map = float(rd.get("UI_baseMapSpeedLimitMPS", 0.0) or 0.0)
@@ -238,21 +255,24 @@ class CarState(CarStateBase):
         if base_map > 0.0 and (speed_limit_type != 0x1F or base_map >= 5.56):
           speed_limit_ms = base_map
         else:
-          speed_limit_ms = float(gps.get("UI_mppSpeedLimit", 0.0) or 0.0) * map_uom_to_ms
+          gps_mpp = float(gps.get("UI_mppSpeedLimit", 0.0) or 0.0)
+          speed_limit_ms = gps_mpp * map_uom_to_ms
     except Exception:
       pass
 
     try:
       ds2 = _msg("DAS_status2") or {}
       if isinstance(ds2, dict) and "DAS_accSpeedLimit" in ds2:
-        speed_limit_ms_das = float(ds2.get("DAS_accSpeedLimit", 0.0) or 0.0) * CV.MPH_TO_MS
+        das_mph = float(ds2.get("DAS_accSpeedLimit", 0.0) or 0.0)
+        speed_limit_ms_das = das_mph * CV.MPH_TO_MS
     except Exception:
       pass
 
     self.speed_limit_ms_das = float(speed_limit_ms_das)
-    if speed_limit_ms_das > 0.0 and speed_limit_ms > 0.0:
-      speed_limit_ms = min(speed_limit_ms, speed_limit_ms_das)
-    self.speed_limit_ms = float(speed_limit_ms)
+    # Empirically on HW2, DAS_accSpeedLimit can stick at a low default (e.g. 15mph) while map/sign shows the real limit.
+    # Use DAS as fallback only, never as a cap.
+    chosen = speed_limit_ms if speed_limit_ms > 0.0 else speed_limit_ms_das
+    self.speed_limit_ms = float(chosen)
 
     if self._tinkla.adjust_acc_with_speed_limit and (self._param_frame % 100 == 0):
       try:
@@ -262,7 +282,8 @@ class CarState(CarStateBase):
           f"[XNOR_CS] uom={uom} src={getattr(self, '_cruise_set_src', 'none')} "
           f"cruiseSet={float(getattr(self, 'stock_cruise_set_speed_ms', 0.0))*conv:.1f} "
           f"stockCruise={bool(getattr(self, 'stock_cruise_enabled', False))} "
-          f"speedLimit={float(getattr(self, 'speed_limit_ms', 0.0))*conv:.1f}"
+          f"speedLimit={float(getattr(self, 'speed_limit_ms', 0.0))*conv:.1f} das={float(getattr(self, 'speed_limit_ms_das', 0.0))*conv:.1f} "
+          f"raw(gps_u={gps_units}, gps_mpp={gps_mpp}, rd_sign={rd_sign}, rd_base_mps={rd_base_mps}, map_type={map_type}, das_mph={das_mph})"
         )
       except Exception:
         pass
@@ -287,7 +308,37 @@ class CarState(CarStateBase):
 
     # Vehicle speed
     ret.vEgoRaw = cp_party.vl["DI_speed"]["DI_vehicleSpeed"] * CV.KPH_TO_MS
-    ret.vEgo, ret.aEgo = self.update_speed_kf(ret.vEgoRaw)
+    if not math.isfinite(ret.vEgoRaw):
+      if not self._vego_nan_logged:
+        cloudlog.error(f"[XNOR_VEGO] non-finite vEgoRaw={ret.vEgoRaw!r} from DI_speed.DI_vehicleSpeed")
+        self._vego_nan_logged = True
+      ret.vEgoRaw = 0.0
+      kf = getattr(self, "v_ego_kf", None)
+      if kf is not None and hasattr(kf, "x"):
+        try:
+          kf.x = [[0.0], [0.0]]
+        except Exception:
+          try:
+            kf.x = [0.0, 0.0]
+          except Exception:
+            pass
+    ret.vEgo, ret.aEgo = self.update_speed_kf(float(ret.vEgoRaw))
+    if (not math.isfinite(ret.vEgo)) or (not math.isfinite(ret.aEgo)):
+      if not self._vego_nan_logged:
+        cloudlog.error(f"[XNOR_VEGO] non-finite vEgo/aEgo from speed_kf vEgoRaw={ret.vEgoRaw!r}")
+        self._vego_nan_logged = True
+      ret.vEgoRaw = 0.0
+      ret.vEgo = 0.0
+      ret.aEgo = 0.0
+      kf = getattr(self, "v_ego_kf", None)
+      if kf is not None and hasattr(kf, "x"):
+        try:
+          kf.x = [[0.0], [0.0]]
+        except Exception:
+          try:
+            kf.x = [0.0, 0.0]
+          except Exception:
+            pass
 
     # Gas pedal
     ret.gasPressed = cp_party.vl["DI_systemStatus"]["DI_accelPedalPos"] > 0
@@ -321,7 +372,6 @@ class CarState(CarStateBase):
 
     # Cruise state
     cruise_state = self.can_define.dv["DI_state"]["DI_cruiseState"].get(int(cp_party.vl["DI_state"]["DI_cruiseState"]), None)
-    self.stock_cruise_state = str(cruise_state or "")
     speed_units = self.can_define.dv["DI_state"]["DI_speedUnits"].get(int(cp_party.vl["DI_state"]["DI_speedUnits"]), None)
 
     autopark_state = self.can_define.dv["DI_state"]["DI_autoparkState"].get(int(cp_party.vl["DI_state"]["DI_autoparkState"]), None)
@@ -499,7 +549,37 @@ class CarState(CarStateBase):
 
     # Vehicle speed
     ret.vEgoRaw = cp_chassis.vl["ESP_B"]["ESP_vehicleSpeed"] * CV.KPH_TO_MS
-    ret.vEgo, ret.aEgo = self.update_speed_kf(ret.vEgoRaw)
+    if not math.isfinite(ret.vEgoRaw):
+      if not self._vego_nan_logged:
+        cloudlog.error(f"[XNOR_VEGO] non-finite vEgoRaw={ret.vEgoRaw!r} from ESP_B.ESP_vehicleSpeed")
+        self._vego_nan_logged = True
+      ret.vEgoRaw = 0.0
+      kf = getattr(self, "v_ego_kf", None)
+      if kf is not None and hasattr(kf, "x"):
+        try:
+          kf.x = [[0.0], [0.0]]
+        except Exception:
+          try:
+            kf.x = [0.0, 0.0]
+          except Exception:
+            pass
+    ret.vEgo, ret.aEgo = self.update_speed_kf(float(ret.vEgoRaw))
+    if (not math.isfinite(ret.vEgo)) or (not math.isfinite(ret.aEgo)):
+      if not self._vego_nan_logged:
+        cloudlog.error(f"[XNOR_VEGO] non-finite vEgo/aEgo from speed_kf vEgoRaw={ret.vEgoRaw!r}")
+        self._vego_nan_logged = True
+      ret.vEgoRaw = 0.0
+      ret.vEgo = 0.0
+      ret.aEgo = 0.0
+      kf = getattr(self, "v_ego_kf", None)
+      if kf is not None and hasattr(kf, "x"):
+        try:
+          kf.x = [[0.0], [0.0]]
+        except Exception:
+          try:
+            kf.x = [0.0, 0.0]
+          except Exception:
+            pass
 
     # Gas pedal
     ret.gasPressed = cp_pt.vl["DI_torque1"]["DI_pedalPos"] > 0
@@ -536,7 +616,6 @@ class CarState(CarStateBase):
 
     # Cruise state
     cruise_state = self.can_defines["DI_state"]["DI_cruiseState"].get(int(cp_chassis.vl["DI_state"]["DI_cruiseState"]), None)
-    self.stock_cruise_state = str(cruise_state or "")
     speed_units = self.can_defines["DI_state"]["DI_speedUnits"].get(int(cp_chassis.vl["DI_state"]["DI_speedUnits"]), None)
 
     cruise_enabled = cruise_state in ("ENABLED", "STANDSTILL", "OVERRIDE", "PRE_FAULT", "PRE_CANCEL")
@@ -559,6 +638,10 @@ class CarState(CarStateBase):
 
     # Unity parity: store last STW_ACTN_RQ for virtual stalk + tap-to-ALC
     self.speed_units = speed_units if speed_units in ("KPH", "MPH") else "MPH"
+
+
+    # Speed limit best-effort (needed for speed-limit matching)
+    self._update_speed_limit(can_parsers)
 
     stw = None
     stw_bus = None
@@ -711,11 +794,11 @@ class CarState(CarStateBase):
 
     pt_checks = [
       ("DI_state", 10),
-      ("EPAS_sysStatus", 25),
     ]
 
     steer_checks = [
       ("DAS_steeringControl", 50),
+      ("DAS_status2", math.nan),
     ]
 
     # Buses are the *rx_src* values we measured.
@@ -742,7 +825,14 @@ class CarState(CarStateBase):
     # Keep these keys present for callers that expect them, but do not gate canValid on them.
     # Empty check lists => cp.can_valid will converge to True once updated.
     can_parsers[Bus.chassis] = CANParser(DBC[CP.carFingerprint][Bus.chassis], [], CANBUS.chassis if CP.carFingerprint == CAR.TESLA_MODEL_S_HW3 else CANBUS.party)
-    can_parsers[Bus.cam] = CANParser(DBC[CP.carFingerprint][Bus.party], [], CANBUS.party + 4)
+    can_parsers[Bus.cam] = CANParser(
+      DBC[CP.carFingerprint][Bus.party],
+      [
+        ("UI_driverAssistRoadSign", math.nan),
+        ("UI_driverAssistMapData", math.nan),
+      ],
+      CANBUS.powertrain,
+    )
 
     return can_parsers
 
