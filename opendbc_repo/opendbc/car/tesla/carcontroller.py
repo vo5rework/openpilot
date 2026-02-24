@@ -14,6 +14,7 @@ It does *not* change steering behavior or ALC behavior.
 from __future__ import annotations
 
 import numpy as np
+import time
 
 from openpilot.common.params import Params
 from openpilot.common.swaglog import cloudlog
@@ -30,7 +31,7 @@ try:
 except ImportError:
   from opendbc.car.tesla.teslacan_legacy import TeslaCANRaven as TeslaCANLegacy
 
-from opendbc.car.tesla.values import DBC, CarControllerParams, CANBUS, LEGACY_CARS, CAR
+from opendbc.car.tesla.values import CarControllerParams, CANBUS, LEGACY_CARS, CAR
 
 try:
   from opendbc.car.tesla.teslacan import create_fake_das_msg as create_fake_das
@@ -46,48 +47,6 @@ BTN_UP2 = 4
 BTN_DOWN2 = 8
 BTN_UP1 = 16
 BTN_DOWN1 = 32
-
-
-def _resolve_dbc_name(dbc_names, CP, bus: Bus) -> str:
-  """Resolve a DBC name for a given bus.
-
-  XNOR note: interfaces.py passes dbc_names built from CarState.get_can_parsers().
-  Some legacy builds omit Bus.party/Bus.pt keys; this must never crash card.
-  """
-  candidates = []
-  if isinstance(dbc_names, dict):
-    candidates.extend([bus, getattr(bus, "value", None), str(bus)])
-    for k in candidates:
-      if k is None:
-        continue
-      try:
-        if k in dbc_names and dbc_names[k]:
-          return dbc_names[k]
-      except TypeError:
-        continue
-
-  # Try CP.dbc (Map(Text,Text)) if present
-  cp_dbc = getattr(CP, "dbc", None)
-  if isinstance(cp_dbc, dict):
-    for k in (getattr(bus, "value", None), str(bus)):
-      if k is None:
-        continue
-      if k in cp_dbc and cp_dbc[k]:
-        return cp_dbc[k]
-
-  # Final authoritative fallback: Tesla DBC map for this fingerprint
-  try:
-    dbc_map = DBC[CP.carFingerprint]
-    if bus in dbc_map and dbc_map[bus]:
-      return dbc_map[bus]
-  except Exception:
-    pass
-
-  keys = list(dbc_names.keys()) if isinstance(dbc_names, dict) else type(dbc_names)
-  raise KeyError(
-    f"Missing DBC for bus={bus}. dbc_names keys={keys} "
-    f"cp_dbc keys={list(cp_dbc.keys()) if isinstance(cp_dbc, dict) else None}"
-  )
 
 
 class CarController(CarControllerBase):
@@ -112,13 +71,12 @@ class CarController(CarControllerBase):
     self.apply_angle_last = 0.0
 
     self._speed_sync_last_frame = -100000
+    # Unity-parity pacing for automated cruise stalk presses
+    self._human_cruise_action_time_ms = 0
+    self._automated_cruise_action_time_ms = 0
+    self._prev_cruise_buttons = BTN_IDLE
 
 
-    # Speed-limit sync (Unity-style pulse pacing)
-    self._acc_target_u = 0
-    self._acc_last_press_frame = -100000
-    self._acc_last_current_u = 0
-    self._acc_no_progress = 0
     self._stw_seed = None
     self._stw_seed_bus = int(CANBUS.party)
     self._stw_last_send_frame = -100000
@@ -127,27 +85,21 @@ class CarController(CarControllerBase):
     self._stw_sequence = []  # list[(frame:int, btn:int)]
     self._op_enabled_prev = False
 
-    # Debounced "hold" state for stalk presses (repeat at ~10Hz, then release)
-    self._stw_hold_btn = None  # type: int | None
-    self._stw_hold_end_frame = -1
-    self._stw_hold_next_frame = -1
-    self._stw_hold_bus = int(CANBUS.party)
-
     if CP.carFingerprint in LEGACY_CARS:
       if CP.carFingerprint in (CAR.TESLA_MODEL_S_HW1, CAR.TESLA_MODEL_X_HW1):
         CANBUS.powertrain = CANBUS.party
         CANBUS.autopilot_powertrain = CANBUS.autopilot_party
 
       self.packers = {
-        CANBUS.party: CANPacker(_resolve_dbc_name(dbc_names, CP, Bus.party)),
-        CANBUS.powertrain: CANPacker(_resolve_dbc_name(dbc_names, CP, Bus.pt)),
+        CANBUS.party: CANPacker(dbc_names[Bus.party]),
+        CANBUS.powertrain: CANPacker(dbc_names[Bus.pt]),
       }
       self.tesla_can = TeslaCANLegacy(self.packers)
 
       # STW_ACTN_RQ needs CRC/counter; legacy helper doesn't implement it.
       self._action_can_by_bus = {int(bus): TeslaCAN(pkr) for bus, pkr in self.packers.items()}
     else:
-      self.packer = CANPacker(_resolve_dbc_name(dbc_names, CP, Bus.party))
+      self.packer = CANPacker(dbc_names[Bus.party])
       self.tesla_can = TeslaCAN(self.packer)
       self._action_can_by_bus = {int(CANBUS.party): self.tesla_can}
 
@@ -167,6 +119,18 @@ class CarController(CarControllerBase):
       self._cached_speed_limit_offset_uom = float(self.params.get("TinklaSpeedLimitOffset", encoding="utf-8") or "0")
     except Exception:
       self._cached_speed_limit_offset_uom = 0.0
+
+
+  @staticmethod
+  def _now_ms() -> int:
+    return int(time.time() * 1000)
+
+  def _track_human_cruise_actions(self, CS) -> None:
+    btn = int(getattr(CS, 'cruise_buttons', BTN_IDLE) or BTN_IDLE)
+    # Unity: throttle automation on any button other than MAIN/IDLE
+    if (btn not in (BTN_MAIN, BTN_IDLE)) and (btn != int(getattr(self, '_prev_cruise_buttons', BTN_IDLE))):
+      self._human_cruise_action_time_ms = self._now_ms()
+    self._prev_cruise_buttons = btn
 
   def _emit_internal_0x659(self, CS, can_sends) -> None:
     stalk_btn = int(getattr(CS, "cruise_buttons", 0) or 0)
@@ -221,41 +185,29 @@ class CarController(CarControllerBase):
       next(iter(self._action_can_by_bus.values()))
     )
 
-
   def _send_stw(self, CS, can_sends, btn: int, *, bus: int | None = None) -> bool:
-    """Send STW_ACTN_RQ seeded from the latest observed vehicle frame (Unity parity)."""
     msg = getattr(CS, "msg_stw_actn_req", None)
     if msg is None:
       return False
 
     b = int(bus if bus is not None else self._stw_bus(CS))
-    seed = dict(msg)
 
-    can_sends.append(self._action_can_for_bus(b).create_action_request(int(b), seed, int(btn)))
+    # Resync seed from the car when idle; preserve our counter across press/release.
+    if (self._stw_seed is None) or (int(self._stw_seed_bus) != b) or ((self.frame - int(self._stw_last_send_frame)) > 20):
+      self._stw_seed = dict(msg)
+      self._stw_seed_bus = int(b)
 
-    self._stw_seed_bus = int(b)
+    mc = int(self._stw_seed.get("MC_STW_ACTN_RQ", 0) or 0)
+    used_counter = (mc + 1) % 16
+
+    can_sends.append(self._action_can_for_bus(b).create_action_request(int(b), self._stw_seed, int(btn)))
+
+    self._stw_seed["MC_STW_ACTN_RQ"] = int(used_counter)
     self._stw_last_send_frame = int(self.frame)
-    return True
-  def _queue_stalk_hold(self, CS, can_sends, btn: int, *, hold_frames: int = 35, interval_frames: int = 10) -> bool:
-    """Debounced hold: repeat press at ~10Hz for ~0.35s, then release."""
-    if self._stw_hold_btn is not None:
-      return False
-    if int(self._stw_release_frame) >= int(self.frame):
-      return False
-    if bool(self._stw_sequence):
-      return False
-
-    if not self._send_stw(CS, can_sends, btn):
-      return False
-
-    self._stw_hold_btn = int(btn)
-    self._stw_hold_bus = int(self._stw_seed_bus)
-    self._stw_hold_end_frame = int(self.frame) + int(hold_frames)
-    self._stw_hold_next_frame = int(self.frame) + int(interval_frames)
     return True
 
   def _queue_stalk_pulse(self, CS, can_sends, btn: int) -> bool:
-    # Legacy/sequence pulse: press now, release next frame.
+    # Unity-like pulse: press now, release next frame.
     if int(self._stw_release_frame) > int(self.frame):
       return False
 
@@ -267,176 +219,96 @@ class CarController(CarControllerBase):
     return True
 
   def _process_stalk_actions(self, CS, can_sends) -> None:
-    # Hold-mode (debounced) press repeat + release
-    if self._stw_hold_btn is not None:
-      if int(self.frame) >= int(self._stw_hold_end_frame):
-        self._send_stw(CS, can_sends, BTN_IDLE, bus=int(self._stw_hold_bus))
-        self._stw_hold_btn = None
-        self._stw_hold_end_frame = -1
-        self._stw_hold_next_frame = -1
-      elif int(self.frame) >= int(self._stw_hold_next_frame):
-        self._send_stw(CS, can_sends, int(self._stw_hold_btn), bus=int(self._stw_hold_bus))
-        self._stw_hold_next_frame = int(self._stw_hold_next_frame) + 10
-
     # Release pending pulse
     if int(self._stw_release_frame) == int(self.frame):
       self._send_stw(CS, can_sends, BTN_IDLE, bus=int(self._stw_release_bus))
       self._stw_release_frame = -1
 
-    # Run queued press sequence (e.g. legacy MAIN+SET on engage)
-    if (self._stw_hold_btn is None) and (int(self._stw_release_frame) < 0) and self._stw_sequence:
+    # Run queued press sequence (e.g. legacy MAIN+RESUME on engage)
+    if (int(self._stw_release_frame) < 0) and self._stw_sequence:
       due_frame, btn = self._stw_sequence[0]
       if int(self.frame) >= int(due_frame):
         if self._queue_stalk_pulse(CS, can_sends, int(btn)):
           self._stw_sequence.pop(0)
-def _speed_limit_sync(self, CC, CS, can_sends) -> None:
-  """Unity-parity cruise set-speed sync to speed limit.
 
-  Key properties (to avoid oscillation / cruise faults):
-    - Only sends *single pulses* (press + release next frame).
-    - Paces presses at ~3Hz.
-    - Uses an internal estimate of set speed to avoid stale/laggy readback causing overshoot.
-    - Treats speed limit as a target snapshot; only retargets on meaningful changes.
-  """
-  enabled = bool(getattr(CC, "enabled", False) or getattr(CC, "latActive", False))
-  if not enabled or (not self._cached_autopilot_disabled) or (not self._cached_adjust_acc_with_speed_limit):
-    self._acc_no_progress = 0
-    setattr(self, "_acc_adjusting", False)
-    return
-
-  if not bool(getattr(CS, "stock_cruise_enabled", False)):
-    self._acc_no_progress = 0
-    setattr(self, "_acc_adjusting", False)
-    if (self.frame % 200) == 0:
-      cloudlog.info("[XNOR_CRUISE_SYNC] gated: stock cruise not enabled")
-    return
-
-  # Don't overlap with explicit sequences or a pending pulse release.
-  if (int(self._stw_release_frame) >= 0) or bool(self._stw_sequence):
-    return
-
-  target_ms = float(self._speed_limit_target_ms(CS))
-  current_ms = float(getattr(CS, "stock_cruise_set_speed_ms", 0.0) or 0.0)
-  if target_ms <= 0.1 or current_ms <= 0.1:
-    self._acc_no_progress = 0
-    setattr(self, "_acc_adjusting", False)
-    if (self.frame % 200) == 0:
-      cloudlog.info(
-        f"[XNOR_CRUISE_SYNC] gated: target_ms={target_ms:.2f} current_ms={current_ms:.2f} "
-        f"speedLimit_ms={float(getattr(CS, 'speed_limit_ms', 0.0) or 0.0):.2f}"
-      )
-    return
-
-  uom = str(getattr(CS, "speed_units", "MPH"))
-  ms_to_u = CV.MS_TO_KPH if uom == "KPH" else CV.MS_TO_MPH
-
-  # Tesla minimum set speed is ~18mph (or ~30kph). Clamp target to avoid faulting.
-  min_u = 30 if uom == "KPH" else 18
-  new_target_u = int(round(target_ms * ms_to_u))
-  if new_target_u <= 0:
-    setattr(self, "_acc_adjusting", False)
-    return
-  new_target_u = max(int(new_target_u), int(min_u))
-
-  current_u = int(round(current_ms * ms_to_u))
-  if current_u <= 0:
-    setattr(self, "_acc_adjusting", False)
-    return
-
-  adjusting = bool(getattr(self, "_acc_adjusting", False))
-  est_u = int(getattr(self, "_acc_est_u", current_u) or current_u)
-  tgt_u = int(getattr(self, "_acc_target_u", new_target_u) or new_target_u)
-  last_press = int(getattr(self, "_acc_last_press_frame", -100000))
-  last_seen_u = int(getattr(self, "_acc_last_current_u", current_u) or current_u)
-  abort_until = int(getattr(self, "_acc_abort_until_frame", -100000))
-
-  # Abort cool-down after repeated no-progress to prevent cruise faults.
-  if int(self.frame) < abort_until:
-    return
-
-  # Retarget only on meaningful changes (reduces limit jitter).
-  if (not adjusting) or (abs(int(new_target_u) - int(tgt_u)) >= 2):
-    tgt_u = int(new_target_u)
-    est_u = int(current_u)
-    adjusting = True
-    self._acc_no_progress = 0
-
-  # Trust measured set speed when it moves.
-  if int(current_u) != int(last_seen_u):
-    est_u = int(current_u)
-    self._acc_no_progress = 0
-
-  # Completion test based on *measured* set speed.
-  if abs(int(tgt_u) - int(current_u)) <= 0:
-    adjusting = False
-    self._acc_no_progress = 0
-    setattr(self, "_acc_adjusting", False)
-    self._acc_target_u = int(tgt_u)
-    self._acc_est_u = int(est_u)
-    self._acc_last_current_u = int(current_u)
-    return
-
-  diff_u = int(tgt_u - est_u)
-  if diff_u == 0:
-    # est caught up; wait for measured to catch up
-    self._acc_last_current_u = int(current_u)
-    self._acc_target_u = int(tgt_u)
-    self._acc_est_u = int(est_u)
-    setattr(self, "_acc_adjusting", True)
-    return
-
-  # Pace presses ~3Hz (Unity behavior); avoid rapid-fire.
-  if (int(self.frame) - int(last_press)) < 33:
-    self._acc_last_current_u = int(current_u)
-    self._acc_target_u = int(tgt_u)
-    self._acc_est_u = int(est_u)
-    setattr(self, "_acc_adjusting", True)
-    return
-
-  # No-progress guard: if measured set speed isn't moving, stop and cool down.
-  if int(current_u) == int(last_seen_u):
-    self._acc_no_progress = int(self._acc_no_progress) + 1
-    if self._acc_no_progress >= 6:
-      cloudlog.info(
-        f"[XNOR_CRUISE_SYNC] abort: no progress uom={uom} target={tgt_u} current={current_u} est={est_u}"
-      )
-      self._acc_no_progress = 0
-      setattr(self, "_acc_abort_until_frame", int(self.frame) + 300)  # 3s
-      setattr(self, "_acc_adjusting", False)
-      self._acc_last_press_frame = int(self.frame)
+  def _speed_limit_sync(self, CC, CS, can_sends) -> None:
+    enabled = bool(getattr(CC, 'enabled', False) or getattr(CC, 'latActive', False))
+    if (not enabled) or (not self._cached_autopilot_disabled) or (not self._cached_adjust_acc_with_speed_limit):
       return
-  else:
-    self._acc_no_progress = 0
 
-  # Choose 5-unit vs 1-unit press based on est diff (prevents overshoot on laggy readback).
-  if diff_u > 0:
-    btn = BTN_UP2 if diff_u >= 5 else BTN_UP1
-    step = 5 if diff_u >= 5 else 1
-  else:
-    btn = BTN_DOWN2 if diff_u <= -5 else BTN_DOWN1
-    step = -5 if diff_u <= -5 else -1
+    if not bool(getattr(CS, 'stock_cruise_enabled', False)):
+      if (self.frame % 200) == 0:
+        cloudlog.info('[XNOR_CRUISE_SYNC] gated: stock cruise not enabled')
+      return
 
-  if self._queue_stalk_pulse(CS, can_sends, btn):
-    last_press = int(self.frame)
-    est_u = int(est_u + step)
-    cloudlog.info(
-      f"[XNOR_CRUISE_SYNC] uom={uom} target={tgt_u} current={current_u} est={est_u} diff={tgt_u - est_u} btn={btn}"
-    )
-  else:
-    if (self.frame % 200) == 0:
-      cloudlog.info("[XNOR_CRUISE_SYNC] gated: missing CS.msg_stw_actn_req")
+    # Don't overlap with explicit sequences or a pending pulse release.
+    if (int(self._stw_release_frame) >= 0) or bool(self._stw_sequence):
+      return
 
-  # Persist state
-  setattr(self, "_acc_adjusting", True)
-  self._acc_last_press_frame = int(last_press)
-  self._acc_last_current_u = int(current_u)
-  self._acc_target_u = int(tgt_u)
-  setattr(self, "_acc_est_u", int(est_u))
+    now_ms = self._now_ms()
+    if now_ms <= int(self._human_cruise_action_time_ms) + 3000:
+      return
+    if now_ms <= int(self._automated_cruise_action_time_ms) + 400:
+      return
 
+    desired_ms = float(self._speed_limit_target_ms(CS))
+    current_set_ms = float(getattr(CS, 'stock_cruise_set_speed_ms', 0.0) or 0.0)
+    if desired_ms <= 0.1 or current_set_ms <= 0.1:
+      if (self.frame % 200) == 0:
+        cloudlog.info(f"[XNOR_CRUISE_SYNC] gated: target_ms={desired_ms:.2f} current_ms={current_set_ms:.2f} speedLimit_ms={float(getattr(CS,'speed_limit_ms',0.0) or 0.0):.2f}")
+      return
+
+    uom = str(getattr(CS, 'speed_units', 'MPH'))
+    desired_kph = desired_ms * CV.MS_TO_KPH
+    current_kph = current_set_ms * CV.MS_TO_KPH
+
+    # Unity parity: 1/5 mph cars adjust in mph; 1/5 kph cars adjust in kph
+    if uom == 'MPH':
+      half_press_kph = 1.0 * CV.MPH_TO_KPH
+      full_press_kph = 5.0 * CV.MPH_TO_KPH
+      min_cruise_ms = 17.1 * CV.MPH_TO_MS
+    else:
+      half_press_kph = 1.0
+      full_press_kph = 5.0
+      min_cruise_ms = 30.0 * CV.KPH_TO_MS
+
+    # If below Tesla min cruise speed, do nothing (avoid CANCEL faults).
+    if float(getattr(CS.out, 'vEgo', 0.0)) < float(min_cruise_ms):
+      return
+
+    speed_offset_kph = desired_kph - current_kph
+    btn = None
+
+    # Reduce speed (no CANCEL; use stalk down).
+    if speed_offset_kph < (-0.6 * full_press_kph):
+      btn = BTN_DOWN2
+    elif speed_offset_kph < (-0.9 * half_press_kph):
+      btn = BTN_DOWN1
+    else:
+      available_kph = desired_kph - current_kph
+      if (speed_offset_kph >= full_press_kph) and (full_press_kph < available_kph):
+        btn = BTN_UP2
+      elif (speed_offset_kph >= half_press_kph) and (half_press_kph < available_kph):
+        btn = BTN_UP1
+
+    if btn is None:
+      return
+
+    if self._queue_stalk_pulse(CS, can_sends, int(btn)):
+      self._automated_cruise_action_time_ms = now_ms
+      # Log in displayed units to match Unity expectations
+      kph_to_u = CV.KPH_TO_MPH if uom == 'MPH' else 1.0
+      cloudlog.info(f"[XNOR_CRUISE_SYNC] uom={uom} target={desired_kph*kph_to_u:.1f} current={current_kph*kph_to_u:.1f} btn={int(btn)}")
+    else:
+      if (self.frame % 200) == 0:
+        cloudlog.info('[XNOR_CRUISE_SYNC] gated: missing CS.msg_stw_actn_req')
 
   def update(self, CC, CS, now_nanos):
     actuators = CC.actuators
     can_sends = []
+
+    self._track_human_cruise_actions(CS)
+
 
     self._refresh_cached_params()
     self._emit_internal_0x659(CS, can_sends)
@@ -523,7 +395,6 @@ def _speed_limit_sync(self, CC, CS, can_sends) -> None:
 
     self.frame += 1
     return new_actuators, can_sends
-
 
 # ===== ABSTRACT-SAFETY SHIM =====
 # If an indentation/merge slip moves CarController.update() outside the class,
