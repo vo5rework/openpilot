@@ -76,7 +76,7 @@ class CarState(CarStateBase):
     self.speed_limit_ms_das = 0.0
     self.stock_cruise_enabled = False
     self.stock_cruise_set_speed_ms = 0.0
-    self.stock_cruise_state = \"\"
+    self.stock_cruise_state = ""
     self.leftBlinkerLamp = False
     self.rightBlinkerLamp = False
     # ALC/BLNK/HSO/ACC (Unity parity)
