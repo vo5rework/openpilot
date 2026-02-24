@@ -113,6 +113,16 @@ class CarController(CarControllerBase):
 
     self._speed_sync_last_frame = -100000
 
+    # Unity-parity speed-limit set-speed sync state
+    self._acc_prev_speed_limit_uom = 0
+    self._acc_prev_speed_limit_ms_das = 0.0
+    self._acc_prev_enabled_edge = False
+    self._acc_adjusting = False
+    self._acc_target_u = 0
+    self._acc_last_press_frame = -100000
+    self._acc_last_current_u = 0
+    self._acc_no_progress = 0
+
     self._stw_seed = None
     self._stw_seed_bus = int(CANBUS.party)
     self._stw_last_send_frame = -100000
@@ -215,26 +225,24 @@ class CarController(CarControllerBase):
       next(iter(self._action_can_by_bus.values()))
     )
 
-  def _send_stw(self, CS, can_sends, btn: int, *, bus: int | None = None) -> bool:
-    msg = getattr(CS, "msg_stw_actn_req", None)
-    if msg is None:
-      return False
+def _send_stw(self, CS, can_sends, btn: int, *, bus: int | None = None) -> bool:
+  """Send STW_ACTN_RQ using the latest observed vehicle frame as seed (Unity parity).
 
-    b = int(bus if bus is not None else self._stw_bus(CS))
+  Rationale: the car transmits STW_ACTN_RQ continuously; the receiver expects the
+  rolling counter and other fields to stay coherent with the live stream.
+  """
+  msg = getattr(CS, "msg_stw_actn_req", None)
+  if msg is None:
+    return False
 
-    # Resync seed from the car when idle; preserve our counter across press/release.
-    if (self._stw_seed is None) or (int(self._stw_seed_bus) != b) or ((self.frame - int(self._stw_last_send_frame)) > 20):
-      self._stw_seed = dict(msg)
-      self._stw_seed_bus = int(b)
+  b = int(bus if bus is not None else self._stw_bus(CS))
+  seed = dict(msg)
 
-    mc = int(self._stw_seed.get("MC_STW_ACTN_RQ", 0) or 0)
-    used_counter = (mc + 1) % 16
+  can_sends.append(self._action_can_for_bus(b).create_action_request(int(b), seed, int(btn)))
 
-    can_sends.append(self._action_can_for_bus(b).create_action_request(int(b), self._stw_seed, int(btn)))
-
-    self._stw_seed["MC_STW_ACTN_RQ"] = int(used_counter)
-    self._stw_last_send_frame = int(self.frame)
-    return True
+  self._stw_seed_bus = int(b)
+  self._stw_last_send_frame = int(self.frame)
+  return True
 
   def _queue_stalk_hold(self, CS, can_sends, btn: int, *, hold_frames: int = 35, interval_frames: int = 10) -> bool:
     """Debounced hold: repeat press at ~10Hz for ~0.35s, then release."""
@@ -290,65 +298,113 @@ class CarController(CarControllerBase):
         if self._queue_stalk_pulse(CS, can_sends, int(btn)):
           self._stw_sequence.pop(0)
 
-  def _speed_limit_sync(self, CC, CS, can_sends) -> None:
-    # Only when OP is engaged (steering control) and user enabled this feature.
-    enabled = bool(getattr(CC, "enabled", False) or getattr(CC, "latActive", False))
-    if not enabled:
-      return
+def _speed_limit_sync(self, CC, CS, can_sends) -> None:
+  """Unity-parity cruise set-speed sync to speed limit.
 
-    if not self._cached_autopilot_disabled:
-      return
+  Unity behavior (LONG_module):
+    - computes a target set-speed in MPH/KPH (integer) from speed_limit_ms + offset
+    - enters "adjusting" state on: speed limit change, enable edge, or DAS limit change
+    - while adjusting, sends a single stalk press at a low rate until current==target
+  """
+  enabled = bool(getattr(CC, "enabled", False) or getattr(CC, "latActive", False))
+  self._acc_prev_enabled = bool(enabled)
 
-    if not self._cached_adjust_acc_with_speed_limit:
-      return
+  if not enabled:
+    self._acc_adjusting = False
+    return
+  if not self._cached_autopilot_disabled:
+    self._acc_adjusting = False
+    return
+  if not self._cached_adjust_acc_with_speed_limit:
+    self._acc_adjusting = False
+    return
 
-    # Don't overlap with press/release sequencing
-    if (self._stw_hold_btn is not None) or (int(self._stw_release_frame) >= 0) or bool(self._stw_sequence):
-      return
+  # Do not overlap with other stalk actions.
+  if int(self._stw_release_frame) >= int(self.frame) or bool(self._stw_sequence):
+    return
 
-    # Rate limit: 0.5s (Unity parity-ish)
-    if (self.frame - int(self._speed_sync_last_frame)) < 50:
-      return
+  if not bool(getattr(CS, "stock_cruise_enabled", False)):
+    self._acc_adjusting = False
+    if (self.frame % 200) == 0:
+      cloudlog.info("[XNOR_CRUISE_SYNC] gated: stock cruise not enabled")
+    return
 
-    if not bool(getattr(CS, "stock_cruise_enabled", False)):
-      if (self.frame % 200) == 0:
-        cloudlog.info("[XNOR_CRUISE_SYNC] gated: stock cruise not enabled")
-      return
+  uom = str(getattr(CS, "speed_units", "MPH"))
+  ms_to_u = CV.MS_TO_KPH if uom == "KPH" else CV.MS_TO_MPH
+  u_to_ms = CV.KPH_TO_MS if uom == "KPH" else CV.MPH_TO_MS
 
-    target_ms = float(self._speed_limit_target_ms(CS))
-    current_ms = float(getattr(CS, "stock_cruise_set_speed_ms", 0.0) or 0.0)
+  limit_ms = float(getattr(CS, "speed_limit_ms", 0.0) or 0.0)
+  if limit_ms <= 0.0:
+    self._acc_adjusting = False
+    return
 
-    if target_ms <= 0.1 or current_ms <= 0.1:
-      if (self.frame % 200) == 0:
-        cloudlog.info(
-          f"[XNOR_CRUISE_SYNC] gated: target_ms={target_ms:.2f} current_ms={current_ms:.2f} "
-          f"speedLimit_ms={float(getattr(CS, 'speed_limit_ms', 0.0) or 0.0):.2f}"
-        )
-      return
+  off_u = float(self._cached_speed_limit_offset_uom)
+  if self._cached_speed_limit_use_relative:
+    offset_ms = (off_u / 100.0) * limit_ms
+  else:
+    offset_ms = off_u * u_to_ms
 
-    uom = str(getattr(CS, "speed_units", "MPH"))
-    ms_to_u = CV.MS_TO_KPH if uom == "KPH" else CV.MS_TO_MPH
-    diff_u = (target_ms - current_ms) * ms_to_u
+  target_u = int(round((limit_ms + offset_ms) * ms_to_u + 0.01))
 
-    # Deadband: ~1 unit
-    if abs(diff_u) < 0.9:
-      return
+  current_ms = float(getattr(getattr(CS, "out", None), "cruiseState", None).speed or getattr(CS, "stock_cruise_set_speed_ms", 0.0) or 0.0)
+  current_u = int(round(current_ms * ms_to_u + 0.01))
 
-    # Choose 5-unit vs 1-unit press
-    if diff_u > 0:
-      btn = BTN_UP2 if diff_u >= 4.5 else BTN_UP1
-    else:
-      btn = BTN_DOWN2 if diff_u <= -4.5 else BTN_DOWN1
+  das_ms = float(getattr(CS, "speed_limit_ms_das", 0.0) or 0.0)
+  das_changed = (das_ms != float(getattr(self, "_acc_prev_speed_limit_ms_das", 0.0))) and (das_ms > 0.0)
 
-    if self._queue_stalk_hold(CS, can_sends, btn):
-      self._speed_sync_last_frame = int(self.frame)
-      cloudlog.info(
-        f"[XNOR_CRUISE_SYNC] uom={uom} target={target_ms*ms_to_u:.1f} current={current_ms*ms_to_u:.1f} "
-        f"diff={diff_u:.1f} btn={btn}"
-      )
-    else:
-      if (self.frame % 200) == 0:
-        cloudlog.info("[XNOR_CRUISE_SYNC] gated: missing CS.msg_stw_actn_req")
+  # Start/refresh adjusting state on Unity triggers.
+  if ((target_u != int(getattr(self, "_acc_prev_speed_limit_uom", 0))) and (target_u > 0) and (current_u != target_u)) or        ((enabled and (not bool(getattr(self, "_acc_prev_enabled_edge", False)))) and (target_u > 0) and (current_u != target_u)) or        (das_changed and (target_u > 0) and (current_u != target_u)):
+    self._acc_adjusting = True
+    self._acc_target_u = int(target_u)
+    self._acc_no_progress = 0
+    self._acc_last_current_u = int(current_u)
+
+  # Track previous trigger state.
+  self._acc_prev_speed_limit_uom = int(target_u)
+  self._acc_prev_speed_limit_ms_das = float(das_ms)
+  self._acc_prev_enabled_edge = bool(enabled)
+
+  if not bool(self._acc_adjusting):
+    return
+
+  if current_u == int(self._acc_target_u):
+    self._acc_adjusting = False
+    self._acc_no_progress = 0
+    return
+
+  # Unity uses a low-rate press loop (their frame%33).
+  if (int(self.frame) - int(getattr(self, "_acc_last_press_frame", -100000))) < 33:
+    return
+
+  delta_u = int(self._acc_target_u) - int(current_u)
+  btn = None
+  if delta_u <= -5:
+    btn = BTN_DOWN2
+  elif delta_u <= -1:
+    btn = BTN_DOWN1
+  elif delta_u >= 5:
+    btn = BTN_UP2
+  elif delta_u >= 1:
+    btn = BTN_UP1
+
+  if btn is None:
+    self._acc_adjusting = False
+    return
+
+  if self._queue_stalk_pulse(CS, can_sends, int(btn)):
+    self._acc_last_press_frame = int(self.frame)
+    cloudlog.info(f"[XNOR_CRUISE_SYNC] uom={uom} target={target_u:.0f} current={current_u:.0f} diff={delta_u:.0f} btn={int(btn)}")
+
+  # Safety: abort if set speed isn't updating (prevents runaway if current_u decode is wrong).
+  if int(current_u) == int(getattr(self, "_acc_last_current_u", current_u)):
+    self._acc_no_progress = int(getattr(self, "_acc_no_progress", 0)) + 1
+  else:
+    self._acc_no_progress = 0
+    self._acc_last_current_u = int(current_u)
+
+  if int(self._acc_no_progress) >= 10:
+    self._acc_adjusting = False
+    cloudlog.info("[XNOR_CRUISE_SYNC] abort: no set-speed progress")
 
   def update(self, CC, CS, now_nanos):
     actuators = CC.actuators

@@ -446,11 +446,15 @@ static safety_config tesla_legacy_init(uint16_t param) {
     {0x488, 0, 4, .check_relay = false},  // DAS_steeringControl
     {0x27D, 0, 3, .check_relay = false},  // APS_eacMonitor
     {0x659, 0, 8, .check_relay = false},  // OP->safety internal carrier (blocked in tx_hook)
+    {0x45, 0, 8, .check_relay = false},  // STW_ACTN_RQ
+
   };
 
   static const CanMsg TESLA_LEGACY_TX_MSGS_LONG[] = {
     {0x2BF, 0, 8, .check_relay = false},  // DAS_longControl
     {0x659, 0, 8, .check_relay = false},  // OP->safety internal carrier (blocked in tx_hook)
+    {0x45, 0, 8, .check_relay = false},  // STW_ACTN_RQ
+
   };
 
   // These RX checks are the primary source of 'safetyRxChecksInvalid' -> controls mismatch.
