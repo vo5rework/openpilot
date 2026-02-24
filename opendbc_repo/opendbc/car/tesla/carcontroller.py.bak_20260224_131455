@@ -242,7 +242,6 @@ class CarController(CarControllerBase):
 
   def update(self, CC, CS, now_nanos):
 
-
     actuators = CC.actuators
     can_sends = []
 
