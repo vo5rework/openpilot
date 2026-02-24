@@ -289,93 +289,151 @@ class CarController(CarControllerBase):
       if int(self.frame) >= int(due_frame):
         if self._queue_stalk_pulse(CS, can_sends, int(btn)):
           self._stw_sequence.pop(0)
+def _speed_limit_sync(self, CC, CS, can_sends) -> None:
+  """Unity-parity cruise set-speed sync to speed limit.
 
+  Key properties (to avoid oscillation / cruise faults):
+    - Only sends *single pulses* (press + release next frame).
+    - Paces presses at ~3Hz.
+    - Uses an internal estimate of set speed to avoid stale/laggy readback causing overshoot.
+    - Treats speed limit as a target snapshot; only retargets on meaningful changes.
+  """
+  enabled = bool(getattr(CC, "enabled", False) or getattr(CC, "latActive", False))
+  if not enabled or (not self._cached_autopilot_disabled) or (not self._cached_adjust_acc_with_speed_limit):
+    self._acc_no_progress = 0
+    setattr(self, "_acc_adjusting", False)
+    return
 
-  def _speed_limit_sync(self, CC, CS, can_sends) -> None:
-    # Only when OP is engaged and user enabled this feature.
-    enabled = bool(getattr(CC, "enabled", False) or getattr(CC, "latActive", False))
-    if not enabled:
-      self._acc_no_progress = 0
-      return
+  if not bool(getattr(CS, "stock_cruise_enabled", False)):
+    self._acc_no_progress = 0
+    setattr(self, "_acc_adjusting", False)
+    if (self.frame % 200) == 0:
+      cloudlog.info("[XNOR_CRUISE_SYNC] gated: stock cruise not enabled")
+    return
 
-    if not self._cached_autopilot_disabled:
-      return
+  # Don't overlap with explicit sequences or a pending pulse release.
+  if (int(self._stw_release_frame) >= 0) or bool(self._stw_sequence):
+    return
 
-    if not self._cached_adjust_acc_with_speed_limit:
-      return
-
-    # Don't overlap with press/release sequencing or explicit sequences
-    if (int(self._stw_release_frame) >= 0) or bool(self._stw_sequence):
-      return
-
-    if not bool(getattr(CS, "stock_cruise_enabled", False)):
-      self._acc_no_progress = 0
-      if (self.frame % 200) == 0:
-        cloudlog.info("[XNOR_CRUISE_SYNC] gated: stock cruise not enabled")
-      return
-
-    target_ms = float(self._speed_limit_target_ms(CS))
-    current_ms = float(getattr(CS, "stock_cruise_set_speed_ms", 0.0) or 0.0)
-
-    if target_ms <= 0.1 or current_ms <= 0.1:
-      self._acc_no_progress = 0
-      if (self.frame % 200) == 0:
-        cloudlog.info(
-          f"[XNOR_CRUISE_SYNC] gated: target_ms={target_ms:.2f} current_ms={current_ms:.2f} "
-          f"speedLimit_ms={float(getattr(CS, 'speed_limit_ms', 0.0) or 0.0):.2f}"
-        )
-      return
-
-    uom = str(getattr(CS, "speed_units", "MPH"))
-    ms_to_u = CV.MS_TO_KPH if uom == "KPH" else CV.MS_TO_MPH
-
-    target_u = int(round(target_ms * ms_to_u))
-    current_u = int(round(current_ms * ms_to_u))
-    if target_u <= 0 or current_u <= 0:
-      self._acc_no_progress = 0
-      return
-
-    # Update target every cycle (map/sign can change); clamp to reasonable range
-    self._acc_target_u = int(target_u)
-
-    diff_u = int(self._acc_target_u - current_u)
-
-    # Done (within 1 unit)
-    if abs(diff_u) < 1:
-      self._acc_no_progress = 0
-      return
-
-    # Conservative pulse pacing: 0.5s (Unity-style "slow nudge", avoids cruise faults)
-    if (self.frame - int(self._acc_last_press_frame)) < 50:
-      return
-
-    # No-progress guard: if our reported set speed isn't moving, stop spamming presses.
-    if current_u == int(self._acc_last_current_u):
-      self._acc_no_progress = int(self._acc_no_progress) + 1
-      if self._acc_no_progress >= 4:
-        cloudlog.info(f"[XNOR_CRUISE_SYNC] abort: no progress current={current_u} target={self._acc_target_u}")
-        self._acc_no_progress = 0
-        self._acc_last_press_frame = int(self.frame)
-        return
-    else:
-      self._acc_no_progress = 0
-
-    # Choose 5-unit vs 1-unit press
-    if diff_u > 0:
-      btn = BTN_UP2 if diff_u >= 5 else BTN_UP1
-    else:
-      btn = BTN_DOWN2 if diff_u <= -5 else BTN_DOWN1
-
-    if self._queue_stalk_pulse(CS, can_sends, btn):
-      self._acc_last_press_frame = int(self.frame)
-      self._acc_last_current_u = int(current_u)
+  target_ms = float(self._speed_limit_target_ms(CS))
+  current_ms = float(getattr(CS, "stock_cruise_set_speed_ms", 0.0) or 0.0)
+  if target_ms <= 0.1 or current_ms <= 0.1:
+    self._acc_no_progress = 0
+    setattr(self, "_acc_adjusting", False)
+    if (self.frame % 200) == 0:
       cloudlog.info(
-        f"[XNOR_CRUISE_SYNC] uom={uom} target={float(self._acc_target_u):.1f} current={float(current_u):.1f} "
-        f"diff={float(diff_u):.1f} btn={btn}"
+        f"[XNOR_CRUISE_SYNC] gated: target_ms={target_ms:.2f} current_ms={current_ms:.2f} "
+        f"speedLimit_ms={float(getattr(CS, 'speed_limit_ms', 0.0) or 0.0):.2f}"
       )
-    else:
-      if (self.frame % 200) == 0:
-        cloudlog.info("[XNOR_CRUISE_SYNC] gated: missing CS.msg_stw_actn_req")
+    return
+
+  uom = str(getattr(CS, "speed_units", "MPH"))
+  ms_to_u = CV.MS_TO_KPH if uom == "KPH" else CV.MS_TO_MPH
+
+  # Tesla minimum set speed is ~18mph (or ~30kph). Clamp target to avoid faulting.
+  min_u = 30 if uom == "KPH" else 18
+  new_target_u = int(round(target_ms * ms_to_u))
+  if new_target_u <= 0:
+    setattr(self, "_acc_adjusting", False)
+    return
+  new_target_u = max(int(new_target_u), int(min_u))
+
+  current_u = int(round(current_ms * ms_to_u))
+  if current_u <= 0:
+    setattr(self, "_acc_adjusting", False)
+    return
+
+  adjusting = bool(getattr(self, "_acc_adjusting", False))
+  est_u = int(getattr(self, "_acc_est_u", current_u) or current_u)
+  tgt_u = int(getattr(self, "_acc_target_u", new_target_u) or new_target_u)
+  last_press = int(getattr(self, "_acc_last_press_frame", -100000))
+  last_seen_u = int(getattr(self, "_acc_last_current_u", current_u) or current_u)
+  abort_until = int(getattr(self, "_acc_abort_until_frame", -100000))
+
+  # Abort cool-down after repeated no-progress to prevent cruise faults.
+  if int(self.frame) < abort_until:
+    return
+
+  # Retarget only on meaningful changes (reduces limit jitter).
+  if (not adjusting) or (abs(int(new_target_u) - int(tgt_u)) >= 2):
+    tgt_u = int(new_target_u)
+    est_u = int(current_u)
+    adjusting = True
+    self._acc_no_progress = 0
+
+  # Trust measured set speed when it moves.
+  if int(current_u) != int(last_seen_u):
+    est_u = int(current_u)
+    self._acc_no_progress = 0
+
+  # Completion test based on *measured* set speed.
+  if abs(int(tgt_u) - int(current_u)) <= 0:
+    adjusting = False
+    self._acc_no_progress = 0
+    setattr(self, "_acc_adjusting", False)
+    self._acc_target_u = int(tgt_u)
+    self._acc_est_u = int(est_u)
+    self._acc_last_current_u = int(current_u)
+    return
+
+  diff_u = int(tgt_u - est_u)
+  if diff_u == 0:
+    # est caught up; wait for measured to catch up
+    self._acc_last_current_u = int(current_u)
+    self._acc_target_u = int(tgt_u)
+    self._acc_est_u = int(est_u)
+    setattr(self, "_acc_adjusting", True)
+    return
+
+  # Pace presses ~3Hz (Unity behavior); avoid rapid-fire.
+  if (int(self.frame) - int(last_press)) < 33:
+    self._acc_last_current_u = int(current_u)
+    self._acc_target_u = int(tgt_u)
+    self._acc_est_u = int(est_u)
+    setattr(self, "_acc_adjusting", True)
+    return
+
+  # No-progress guard: if measured set speed isn't moving, stop and cool down.
+  if int(current_u) == int(last_seen_u):
+    self._acc_no_progress = int(self._acc_no_progress) + 1
+    if self._acc_no_progress >= 6:
+      cloudlog.info(
+        f"[XNOR_CRUISE_SYNC] abort: no progress uom={uom} target={tgt_u} current={current_u} est={est_u}"
+      )
+      self._acc_no_progress = 0
+      setattr(self, "_acc_abort_until_frame", int(self.frame) + 300)  # 3s
+      setattr(self, "_acc_adjusting", False)
+      self._acc_last_press_frame = int(self.frame)
+      return
+  else:
+    self._acc_no_progress = 0
+
+  # Choose 5-unit vs 1-unit press based on est diff (prevents overshoot on laggy readback).
+  if diff_u > 0:
+    btn = BTN_UP2 if diff_u >= 5 else BTN_UP1
+    step = 5 if diff_u >= 5 else 1
+  else:
+    btn = BTN_DOWN2 if diff_u <= -5 else BTN_DOWN1
+    step = -5 if diff_u <= -5 else -1
+
+  if self._queue_stalk_pulse(CS, can_sends, btn):
+    last_press = int(self.frame)
+    est_u = int(est_u + step)
+    cloudlog.info(
+      f"[XNOR_CRUISE_SYNC] uom={uom} target={tgt_u} current={current_u} est={est_u} diff={tgt_u - est_u} btn={btn}"
+    )
+  else:
+    if (self.frame % 200) == 0:
+      cloudlog.info("[XNOR_CRUISE_SYNC] gated: missing CS.msg_stw_actn_req")
+
+  # Persist state
+  setattr(self, "_acc_adjusting", True)
+  self._acc_last_press_frame = int(last_press)
+  self._acc_last_current_u = int(current_u)
+  self._acc_target_u = int(tgt_u)
+  setattr(self, "_acc_est_u", int(est_u))
+
+
   def update(self, CC, CS, now_nanos):
     actuators = CC.actuators
     can_sends = []
