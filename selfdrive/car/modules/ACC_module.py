@@ -53,10 +53,10 @@ class ACCController:
     self._est_time_ms: int = 0
 
   def note_human_buttons(self, cruise_buttons: int, *, now_ms: Optional[int] = None) -> None:
-    """Call every update with the latest CS.cruise_buttons (raw)."""
+    """Unity parity: extend the 3s pause continuously while a human holds a stalk button."""
     now = _now_ms() if now_ms is None else int(now_ms)
     btn = int(cruise_buttons or 0)
-    if btn != int(CruiseButtons.IDLE) and self.prev_cruise_buttons == int(CruiseButtons.IDLE):
+    if btn not in (int(CruiseButtons.MAIN), int(CruiseButtons.IDLE)):
       self.human_action_time_ms = now
     self.prev_cruise_buttons = btn
 

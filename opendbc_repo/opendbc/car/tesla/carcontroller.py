@@ -255,10 +255,22 @@ class CarController(CarControllerBase):
     autopilot_disabled = bool(self._cached_autopilot_disabled)
 
     # Always define before use
-    human_control = bool(getattr(CS, "human_control", False))
+    cs_out = getattr(CS, "out", None)
+    out_steer_pressed = bool(getattr(cs_out, "steeringPressed", False)) if cs_out is not None else False
+    human_control = bool(getattr(CS, "human_control", False) or out_steer_pressed)
+    steer_inhibit = bool(
+      (bool(getattr(cs_out, "steerFaultTemporary", False)) if cs_out is not None else False) or
+      (bool(getattr(cs_out, "steerFaultPermanent", False)) if cs_out is not None else False) or
+      (bool(getattr(cs_out, "steeringDisengage", False)) if cs_out is not None else False)
+    )
 
     op_enabled = bool(getattr(CC, "enabled", False) or getattr(CC, "latActive", False))
     if op_enabled and (not bool(self._op_enabled_prev)):
+      # Unity parity: avoid a first-command step when engaging with wheel turned.
+      try:
+        self.apply_angle_last = float(getattr(cs_out, "steeringAngleDeg", 0.0) if cs_out is not None else 0.0)
+      except Exception:
+        pass
       if (autopilot_disabled and (self.CP.carFingerprint in LEGACY_CARS) and
           (float(getattr(CS.out, "vEgo", 0.0)) >= (18.0 * CV.MPH_TO_MS)) and
           (not bool(getattr(CS, "stock_cruise_enabled", False))) and
@@ -276,15 +288,17 @@ class CarController(CarControllerBase):
       bool(CC.latActive) and
       autopilot_disabled and
       (not CS.out.cruiseState.standstill) and
-      (not human_control)
+      (not human_control) and
+      (not steer_inhibit)
     )
 
     # Steering (50Hz)
     if self.frame % 2 == 0:
-      if human_control:
-        self.apply_angle_last = float(CS.out.steeringAngleDeg)
+      # Unity parity: if steering isn't active (or EPS is inhibited), track the real wheel angle.
+      if (not lat_active) or human_control or steer_inhibit:
+        apply_angle = float(CS.out.steeringAngleDeg)
       else:
-        self.apply_angle_last = float(apply_std_steer_angle_limits(
+        apply_angle = float(apply_std_steer_angle_limits(
           float(actuators.steeringAngleDeg),
           float(self.apply_angle_last),
           float(getattr(CS.out, "vEgoRaw", CS.out.vEgo)),
@@ -292,6 +306,14 @@ class CarController(CarControllerBase):
           lat_active,
           CarControllerParams.ANGLE_LIMITS,
         ))
+        # Unity parity: additional guard to avoid EPS faults on engage/large transients.
+        apply_angle = float(np.clip(
+          apply_angle,
+          float(CS.out.steeringAngleDeg) - 20.0,
+          float(CS.out.steeringAngleDeg) + 20.0,
+        ))
+
+      self.apply_angle_last = float(apply_angle)
 
       if self.CP.carFingerprint in LEGACY_CARS:
         counter = (self.frame // 2) % 16
@@ -303,7 +325,7 @@ class CarController(CarControllerBase):
           self.tesla_can.create_steering_control(self.apply_angle_last, lat_active)
         )
 
-    # EPS allow (legacy)
+# EPS allow (legacy)
     if (self.CP.carFingerprint in LEGACY_CARS) and (self.frame % 10 == 0):
       counter = (self.frame // 10) % 16
       can_sends.append(self.tesla_can.create_steering_allowed(counter))
