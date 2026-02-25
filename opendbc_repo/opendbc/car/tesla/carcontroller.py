@@ -281,10 +281,11 @@ class CarController(CarControllerBase):
 
     # Steering (50Hz)
     if self.frame % 2 == 0:
-      if human_control or steer_inhibit:
+      # Prevent EPS inhibit: when not actively steering (or driver/EPS override), track the real wheel angle.
+      if (not lat_active) or human_control or steer_inhibit:
         self.apply_angle_last = float(CS.out.steeringAngleDeg)
       else:
-        self.apply_angle_last = float(apply_std_steer_angle_limits(
+        apply_angle = float(apply_std_steer_angle_limits(
           float(actuators.steeringAngleDeg),
           float(self.apply_angle_last),
           float(getattr(CS.out, "vEgoRaw", CS.out.vEgo)),
@@ -292,6 +293,13 @@ class CarController(CarControllerBase):
           lat_active,
           CarControllerParams.ANGLE_LIMITS,
         ))
+        # Extra safety clamp (Unity-style) to avoid large instantaneous steps.
+        apply_angle = float(np.clip(
+          apply_angle,
+          float(CS.out.steeringAngleDeg) - 20.0,
+          float(CS.out.steeringAngleDeg) + 20.0,
+        ))
+        self.apply_angle_last = float(apply_angle)
 
       if self.CP.carFingerprint in LEGACY_CARS:
         counter = (self.frame // 2) % 16
