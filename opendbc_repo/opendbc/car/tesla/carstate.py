@@ -74,6 +74,10 @@ class CarState(CarStateBase):
     self.speed_units = "MPH"
     self.speed_limit_ms = 0.0
     self.speed_limit_ms_das = 0.0
+    # Tesla UI speed limit offset (if present on CAN). Falls back to Tinkla params when absent.
+    self.car_speed_limit_offset = 0.0
+    self.car_speed_limit_offset_is_percent = False
+    self.car_speed_limit_offset_valid = False
     self.stock_cruise_enabled = False
     self.stock_cruise_state = ""
     self.stock_cruise_set_speed_ms = 0.0
@@ -128,10 +132,68 @@ class CarState(CarStateBase):
     self.enableACC = bool(self._tinkla.enable_acc)
 
 
+
+
+  def _extract_car_speed_limit_offset(self, *msgs) -> None:
+    """Best-effort: read Tesla's own speed limit offset setting if it appears on CAN.
+
+    This is intentionally defensive: if we can't find an offset-like signal, we mark it invalid and
+    the system falls back to TinklaSpeedLimitOffset/TinklaSpeedLimitUseRelative.
+    """
+    self.car_speed_limit_offset_valid = False
+    self.car_speed_limit_offset = 0.0
+    self.car_speed_limit_offset_is_percent = False
+
+    for m in msgs:
+      if not isinstance(m, dict):
+        continue
+      for k, v in m.items():
+        if not isinstance(k, str):
+          continue
+        kl = k.lower()
+        if ("speed" not in kl) or ("limit" not in kl) or ("offset" not in kl):
+          continue
+        try:
+          fv = float(v)
+        except Exception:
+          continue
+        if not math.isfinite(fv):
+          continue
+
+        is_pct = ("pct" in kl) or ("percent" in kl)
+        # Reasonable bounds: percent offsets typically <= 50%; absolute offsets typically <= 30 mph/kph.
+        if is_pct and abs(fv) <= 50.0:
+          self.car_speed_limit_offset = fv
+          self.car_speed_limit_offset_is_percent = True
+          self.car_speed_limit_offset_valid = True
+          return
+        if (not is_pct) and abs(fv) <= 30.0:
+          self.car_speed_limit_offset = fv
+          self.car_speed_limit_offset_is_percent = False
+          self.car_speed_limit_offset_valid = True
+          return
   def _calc_speed_limit_target_ms(self, speed_units: str) -> float:
     limit_ms = float(getattr(self, "speed_limit_ms", 0.0) or getattr(self, "speed_limit_ms_das", 0.0) or 0.0)
     if limit_ms <= 0.0:
       return 0.0
+
+    # Prefer Tesla's own speed-limit offset setting if present; else use Tinkla params.
+    if bool(getattr(self, "car_speed_limit_offset_valid", False)):
+      off = float(getattr(self, "car_speed_limit_offset", 0.0) or 0.0)
+      if bool(getattr(self, "car_speed_limit_offset_is_percent", False)):
+        return max(0.0, limit_ms * (1.0 + off / 100.0))
+      if speed_units == "KPH":
+        return max(0.0, limit_ms + off * CV.KPH_TO_MS)
+      return max(0.0, limit_ms + off * CV.MPH_TO_MS)
+
+    off = float(self._tinkla.speed_limit_offset)
+    if self._tinkla.speed_limit_use_relative:
+      return max(0.0, limit_ms * (1.0 + off / 100.0))
+
+    if speed_units == "KPH":
+      return max(0.0, limit_ms + off * CV.KPH_TO_MS)
+    return max(0.0, limit_ms + off * CV.MPH_TO_MS)
+
 
     off = float(self._tinkla.speed_limit_offset)
     if self._tinkla.speed_limit_use_relative:
@@ -216,6 +278,10 @@ class CarState(CarStateBase):
     rd_base_mps = None
     map_type = None
     das_mph = None
+    gps = None
+    map_data = None
+    rd = None
+    ds2 = None
     def _msg(name: str):
       for bk in (Bus.party, Bus.ap_party, Bus.cam, Bus.chassis, Bus.pt, Bus.ap_pt):
         cp = can_parsers.get(bk)
@@ -268,6 +334,8 @@ class CarState(CarStateBase):
         speed_limit_ms_das = das_mph * CV.MPH_TO_MS
     except Exception:
       pass
+
+    self._extract_car_speed_limit_offset(gps or {}, map_data or {}, rd or {}, ds2 or {})
 
     self.speed_limit_ms_das = float(speed_limit_ms_das)
     # Empirically on HW2, DAS_accSpeedLimit can stick at a low default (e.g. 15mph) while map/sign shows the real limit.

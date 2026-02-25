@@ -72,6 +72,9 @@ class CarController(CarControllerBase):
     self._op659_prev_btn = 0
     self.apply_angle_last = 0.0
 
+    self._lat_active_prev = False
+    self._steer_warmup_until_frame = -1
+
     self._speed_sync_last_frame = -100000
     # Unity-parity pacing for automated cruise stalk presses
     self._human_cruise_action_time_ms = 0
@@ -277,29 +280,38 @@ class CarController(CarControllerBase):
       (not CS.out.cruiseState.standstill) and
       (not human_control) and
       (not steer_inhibit)
+
+    # Steering warm-up: avoid EPS inhibit when engaging with wheels turned.
+    if lat_active and (not bool(self._lat_active_prev)):
+      self._steer_warmup_until_frame = int(self.frame) + 20  # ~0.2s at 100Hz
+    self._lat_active_prev = bool(lat_active)
     )
 
     # Steering (50Hz)
     if self.frame % 2 == 0:
-      # Prevent EPS inhibit: when not actively steering (or driver/EPS override), track the real wheel angle.
+      # Track real wheel angle whenever steering isn't actively commanded.
       if (not lat_active) or human_control or steer_inhibit:
-        self.apply_angle_last = float(CS.out.steeringAngleDeg)
+        apply_angle = float(CS.out.steeringAngleDeg)
       else:
-        apply_angle = float(apply_std_steer_angle_limits(
-          float(actuators.steeringAngleDeg),
-          float(self.apply_angle_last),
-          float(getattr(CS.out, "vEgoRaw", CS.out.vEgo)),
-          float(CS.out.steeringAngleDeg),
-          lat_active,
-          CarControllerParams.ANGLE_LIMITS,
-        ))
-        # Extra safety clamp (Unity-style) to avoid large instantaneous steps.
-        apply_angle = float(np.clip(
-          apply_angle,
-          float(CS.out.steeringAngleDeg) - 20.0,
-          float(CS.out.steeringAngleDeg) + 20.0,
-        ))
-        self.apply_angle_last = float(apply_angle)
+        # Warm-up hold to avoid first-command step (EPS inhibit) when engaging with wheels turned.
+        if int(self.frame) < int(self._steer_warmup_until_frame):
+          apply_angle = float(CS.out.steeringAngleDeg)
+        else:
+          apply_angle = float(apply_std_steer_angle_limits(
+            float(actuators.steeringAngleDeg),
+            float(self.apply_angle_last),
+            float(getattr(CS.out, "vEgoRaw", CS.out.vEgo)),
+            float(CS.out.steeringAngleDeg),
+            lat_active,
+            CarControllerParams.ANGLE_LIMITS,
+          ))
+          apply_angle = float(np.clip(
+            apply_angle,
+            float(CS.out.steeringAngleDeg) - 20.0,
+            float(CS.out.steeringAngleDeg) + 20.0,
+          ))
+
+      self.apply_angle_last = float(apply_angle)
 
       if self.CP.carFingerprint in LEGACY_CARS:
         counter = (self.frame // 2) % 16
