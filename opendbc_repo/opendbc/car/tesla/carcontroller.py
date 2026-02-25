@@ -72,14 +72,8 @@ class CarController(CarControllerBase):
     self._op659_prev_btn = 0
     self.apply_angle_last = 0.0
 
-    self._lat_active_prev = False
-    self._steer_warmup_until_frame = -1
-
     self._speed_sync_last_frame = -100000
     # Unity-parity pacing for automated cruise stalk presses
-    self._human_cruise_action_time_ms = 0
-    self._automated_cruise_action_time_ms = 0
-    self._prev_cruise_buttons = BTN_IDLE
 
 
     self._stw_seed = None
@@ -128,15 +122,7 @@ class CarController(CarControllerBase):
 
   @staticmethod
   def _now_ms() -> int:
-    return int(time.monotonic_ns() // 1_000_000)
-
-  def _track_human_cruise_actions(self, CS) -> None:
-    btn = int(getattr(CS, 'cruise_buttons', BTN_IDLE) or BTN_IDLE)
-    # Unity: throttle automation on any button other than MAIN/IDLE
-    if (btn not in (BTN_MAIN, BTN_IDLE)) and (btn != int(getattr(self, '_prev_cruise_buttons', BTN_IDLE))):
-      self._human_cruise_action_time_ms = self._now_ms()
-    self._prev_cruise_buttons = btn
-
+    return int(time.time() * 1000)
   def _emit_internal_0x659(self, CS, can_sends) -> None:
     stalk_btn = int(getattr(CS, "cruise_buttons", 0) or 0)
     prev_btn = int(self._op659_prev_btn)
@@ -189,6 +175,42 @@ class CarController(CarControllerBase):
       self._action_can_by_bus.get(int(CANBUS.party)) or
       next(iter(self._action_can_by_bus.values()))
     )
+
+  @staticmethod
+  def _note_virtual_stalk_send(CS, *, btn: int, bus: int) -> None:
+    """Expose last virtual stalk press to CarState for data-driven set-speed learning."""
+    if int(btn) == int(BTN_IDLE):
+      return
+    try:
+      CS._xnor_last_virtual_stalk_btn = int(btn)
+      CS._xnor_last_virtual_stalk_bus = int(bus)
+      CS._xnor_last_virtual_stalk_ns = int(time.monotonic_ns())
+      # +1 means 'increase set speed', -1 means 'decrease set speed'
+      if int(btn) in (BTN_UP2, BTN_UP1):
+        CS._xnor_last_virtual_stalk_dir = 1
+      elif int(btn) in (BTN_DOWN2, BTN_DOWN1):
+        CS._xnor_last_virtual_stalk_dir = -1
+      else:
+        CS._xnor_last_virtual_stalk_dir = 0
+    except Exception:
+      pass
+
+  @staticmethod
+  def _maybe_invert_stalk_btn(CS, btn: int) -> int:
+    """Swap UP/DOWN codes if CarState detected inverted stalk mapping."""
+    if not bool(getattr(CS, "_xnor_stalk_invert", False)):
+      return int(btn)
+    b = int(btn)
+    if b == BTN_UP2:
+      return BTN_DOWN2
+    if b == BTN_DOWN2:
+      return BTN_UP2
+    if b == BTN_UP1:
+      return BTN_DOWN1
+    if b == BTN_DOWN1:
+      return BTN_UP1
+    return b
+
   def _send_stw(self, CS, can_sends, btn: int, *, bus: int | None = None) -> bool:
     msg = getattr(CS, "msg_stw_actn_req", None)
     if msg is None:
@@ -197,7 +219,15 @@ class CarController(CarControllerBase):
     b = int(bus if bus is not None else self._stw_bus(CS))
     seed = dict(msg)  # Unity parity: seed from latest observed frame every send
 
-    can_sends.append(self._action_can_for_bus(b).create_action_request(int(b), seed, int(btn)))
+    self._note_virtual_stalk_send(CS, btn=int(btn), bus=int(b))
+
+    send_btn = self._maybe_invert_stalk_btn(CS, int(btn))
+    try:
+      CS._xnor_last_virtual_stalk_btn_sent = int(send_btn)
+      CS._xnor_last_virtual_stalk_inverted = bool(int(send_btn) != int(btn))
+    except Exception:
+      pass
+    can_sends.append(self._action_can_for_bus(b).create_action_request(int(b), seed, int(send_btn)))
     self._stw_seed_bus = int(b)
     self._stw_last_send_frame = int(self.frame)
     return True
@@ -220,30 +250,33 @@ class CarController(CarControllerBase):
       self._send_stw(CS, can_sends, BTN_IDLE, bus=int(self._stw_release_bus))
       self._stw_release_frame = -1
 
+    # Run queued press sequence (e.g. legacy MAIN+RESUME on engage)
+    if (int(self._stw_release_frame) < 0) and self._stw_sequence:
+      due_frame, btn = self._stw_sequence[0]
+      if int(self.frame) >= int(due_frame):
+        if self._queue_stalk_pulse(CS, can_sends, int(btn)):
+          self._stw_sequence.pop(0)
   def _speed_limit_sync(self, CC, CS, can_sends) -> None:
     enabled = bool(getattr(CC, "enabled", False) or getattr(CC, "latActive", False))
     if (not enabled) or (not self._cached_autopilot_disabled):
       return
 
     # Don't overlap with explicit sequences or a pending pulse release.
-    if (int(self._stw_release_frame) >= 0):
+    if (int(self._stw_release_frame) >= 0) or bool(self._stw_sequence):
       return
 
-    decision = self._long_module.update(CS, enabled=enabled, frame=int(self.frame), now_ms=int(self._now_ms()))
+    decision = self._long_module.update(CS, enabled=enabled, now_ms=int(self._now_ms()))
     if decision.button is None:
       return
 
     # One Unity-style pulse; release is handled next frame by _queue_stalk_pulse().
-    if self._queue_stalk_pulse(CS, can_sends, int(decision.button)):
-      self._automated_cruise_action_time_ms = int(self._now_ms())
+    self._queue_stalk_pulse(CS, can_sends, int(decision.button))
 
   def update(self, CC, CS, now_nanos):
 
 
     actuators = CC.actuators
     can_sends = []
-
-    self._track_human_cruise_actions(CS)
 
 
     self._refresh_cached_params()
@@ -252,66 +285,46 @@ class CarController(CarControllerBase):
     autopilot_disabled = bool(self._cached_autopilot_disabled)
 
     # Always define before use
-    cs_out = getattr(CS, "out", None)
-    out_steer_pressed = bool(getattr(cs_out, "steeringPressed", False)) if cs_out is not None else False
-    human_control = bool(getattr(CS, "human_control", False) or out_steer_pressed)
-    steer_inhibit = bool(
-      (bool(getattr(cs_out, "steerFaultTemporary", False)) if cs_out is not None else False) or
-      (bool(getattr(cs_out, "steerFaultPermanent", False)) if cs_out is not None else False) or
-      (bool(getattr(cs_out, "steeringDisengage", False)) if cs_out is not None else False)
-    )
-
+    human_control = bool(getattr(CS, "human_control", False))
     op_enabled = bool(getattr(CC, "enabled", False) or getattr(CC, "latActive", False))
-    if op_enabled and (not bool(self._op_enabled_prev)):
-      # Avoid a first-command step when engaging with wheel turned (EPS inhibit prevention).
-      try:
-        self.apply_angle_last = float(getattr(cs_out, "steeringAngleDeg", 0.0) if cs_out is not None else 0.0)
-      except Exception:
-        pass
     self._op_enabled_prev = bool(op_enabled)
 
     self._process_stalk_actions(CS, can_sends)
 
     self._speed_limit_sync(CC, CS, can_sends)
+    standstill = False
+    try:
+      standstill = bool(getattr(getattr(cs_out, "cruiseState", None), "standstill", False))
+    except Exception:
+      standstill = False
 
     lat_active = (
       bool(CC.latActive) and
       autopilot_disabled and
-      (not CS.out.cruiseState.standstill) and
+      (not standstill) and
       (not human_control) and
       (not steer_inhibit)
+    )
 
     # Steering warm-up: avoid EPS inhibit when engaging with wheels turned.
     if lat_active and (not bool(self._lat_active_prev)):
       self._steer_warmup_until_frame = int(self.frame) + 20  # ~0.2s at 100Hz
     self._lat_active_prev = bool(lat_active)
-    )
 
     # Steering (50Hz)
-    if self.frame % 2 == 0:
-      # Track real wheel angle whenever steering isn't actively commanded.
-      if (not lat_active) or human_control or steer_inhibit:
-        apply_angle = float(CS.out.steeringAngleDeg)
-      else:
-        # Warm-up hold to avoid first-command step (EPS inhibit) when engaging with wheels turned.
-        if int(self.frame) < int(self._steer_warmup_until_frame):
-          apply_angle = float(CS.out.steeringAngleDeg)
-        else:
-          apply_angle = float(apply_std_steer_angle_limits(
-            float(actuators.steeringAngleDeg),
-            float(self.apply_angle_last),
-            float(getattr(CS.out, "vEgoRaw", CS.out.vEgo)),
-            float(CS.out.steeringAngleDeg),
-            lat_active,
-            CarControllerParams.ANGLE_LIMITS,
-          ))
-          apply_angle = float(np.clip(
-            apply_angle,
-            float(CS.out.steeringAngleDeg) - 20.0,
-            float(CS.out.steeringAngleDeg) + 20.0,
-          ))
 
-      self.apply_angle_last = float(apply_angle)
+    if self.frame % 2 == 0:
+      if human_control:
+        self.apply_angle_last = float(CS.out.steeringAngleDeg)
+      else:
+        self.apply_angle_last = float(apply_std_steer_angle_limits(
+          float(actuators.steeringAngleDeg),
+          float(self.apply_angle_last),
+          float(getattr(CS.out, "vEgoRaw", CS.out.vEgo)),
+          float(CS.out.steeringAngleDeg),
+          lat_active,
+          CarControllerParams.ANGLE_LIMITS,
+        ))
 
       if self.CP.carFingerprint in LEGACY_CARS:
         counter = (self.frame // 2) % 16
