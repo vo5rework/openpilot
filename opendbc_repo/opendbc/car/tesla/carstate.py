@@ -116,9 +116,6 @@ class CarState(CarStateBase):
     self._tinkla.adjust_acc_with_speed_limit = load_bool_param("TinklaAdjustAccWithSpeedLimit", False)
     self._tinkla.speed_limit_offset = load_float_param("TinklaSpeedLimitOffset", 0.0)
     self._tinkla.speed_limit_use_relative = load_bool_param("TinklaSpeedLimitUseRelative", False)
-    self.car_speed_limit_offset_u = 0.0
-    self.car_speed_limit_offset_uom = "MPH"
-    self.car_speed_limit_offset_valid = False
     self._tinkla.enable_alc = load_bool_param("TinklaEnableALC", True)
     self._tinkla.alc_delay = load_float_param("TinklaAlcDelay", 0.75)
     self._tinkla.enable_hso = load_bool_param("TinklaEnableHSO", True)
@@ -136,15 +133,6 @@ class CarState(CarStateBase):
     if limit_ms <= 0.0:
       return 0.0
 
-    # Prefer Tesla's own UI offset setting if it is present on CAN.
-    if bool(getattr(self, "car_speed_limit_offset_valid", False)):
-      off_u = float(getattr(self, "car_speed_limit_offset_u", 0.0) or 0.0)
-      off_uom = str(getattr(self, "car_speed_limit_offset_uom", "MPH") or "MPH")
-      if off_uom == "KPH":
-        return max(0.0, limit_ms + off_u * CV.KPH_TO_MS)
-      return max(0.0, limit_ms + off_u * CV.MPH_TO_MS)
-
-    # Fallback to existing Tinkla params.
     off = float(self._tinkla.speed_limit_offset)
     if self._tinkla.speed_limit_use_relative:
       return max(0.0, limit_ms * (1.0 + off / 100.0))
@@ -221,11 +209,6 @@ class CarState(CarStateBase):
     speed_limit_ms = 0.0
     speed_limit_ms_das = 0.0
 
-    # Tesla UI offset (if broadcast); used in _calc_speed_limit_target_ms()
-    self.car_speed_limit_offset_valid = False
-    self.car_speed_limit_offset_u = 0.0
-    self.car_speed_limit_offset_uom = "MPH"
-
     # Debug/raw inputs (logged when TinklaAdjustAccWithSpeedLimit is enabled)
     gps_units = None
     gps_mpp = None
@@ -249,14 +232,6 @@ class CarState(CarStateBase):
       if gps is not None:
         msu = int(gps.get("UI_mapSpeedLimitUnits", 0))
         gps_units = msu
-        # Prefer Tesla's own user speed offset setting when available.
-        try:
-          self.car_speed_limit_offset_u = float(gps.get("UI_userSpeedOffset", 0.0) or 0.0)
-          off_uom = int(gps.get("UI_userSpeedOffsetUnits", msu) or msu)
-          self.car_speed_limit_offset_uom = "KPH" if off_uom == 1 else "MPH"
-          self.car_speed_limit_offset_valid = True
-        except Exception:
-          self.car_speed_limit_offset_valid = False
         map_uom_to_ms = CV.KPH_TO_MS if msu == 1 else CV.MPH_TO_MS
         map_ms_to_uom = CV.MS_TO_KPH if msu == 1 else CV.MS_TO_MPH
 
