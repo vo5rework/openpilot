@@ -4,14 +4,15 @@
 This module chooses Tesla cruise stalk button presses (STW_ACTN_RQ) to move the *stock*
 cruise SET speed toward a target based on map speed limit (+offset).
 
-Fixes implemented (based on your recent behavior/logs):
-  - Never uses longitudinalPlan to cap desired speed (unstable in lateral-only; causes random drops).
-  - Smooths by ramping an internal desired set-speed toward the speed-limit target.
-  - Auto-(re)engage from STANDBY using SET(current) (prevents resuming an old memorized speed).
-  - On ENABLED edge, if Tesla resumes too high, temporarily targets vEgo (capped by limit) to pull set speed down.
+Behaviors implemented (Unity outcome):
+  - STANDBY → press SET(current) (auto-(re)engage) when enabled and safe.
+  - ENABLED edge → if Tesla resumed too high, immediately bias desired target to vEgo (capped by limit),
+    bypassing the 3s human pause so it corrects quickly.
+  - Keeps the existing 1.5s “pull down toward vEgo” fallback.
+  - Smooths by ramping an internal desired set-speed toward the target (no longitudinalPlan dependency).
 
-Unity parity points kept:
-  - Only adjusts when DI_cruiseState == ENABLED (caller provides CS.stock_cruise_state).
+Parity constraints kept:
+  - Only adjusts when DI_cruiseState == ENABLED (except the STANDBY auto-engage SET(current)).
   - Human pause: 3s after any human stalk action (extended while held).
   - Automated cooldown: 400ms after any automated press.
 """
@@ -42,7 +43,7 @@ class LongDecision:
 class LongController:
   MIN_CRUISE_SPEED_MS = 17.1 * CV.MPH_TO_MS
 
-  # Smoothing knobs (mph/sec). These bound how quickly we *request* set-speed changes.
+  # Smoothing knobs (mph/sec). Bounds how quickly we *request* set-speed changes.
   RAMP_UP_MPH_PER_S = 2.0
   RAMP_DOWN_MPH_PER_S = 3.0
 
@@ -101,7 +102,7 @@ class LongController:
 
     speed_units = str(getattr(CS, "speed_units", "MPH") or "MPH")
 
-    # Speed limit (+offset) from CarState helper (now prefers Tesla's offset if present).
+    # Speed limit (+offset) from CarState helper (prefers Tesla's offset if present).
     try:
       speed_limit_target_ms = float(CS._calc_speed_limit_target_ms(speed_units))
     except Exception:
@@ -137,6 +138,7 @@ class LongController:
     if stock_enabled and (not bool(self._stock_enabled_prev)):
       self._engage_override_until_ms = int(now) + 1500
       try:
+        # Bypass 3s human pause so correction can happen immediately.
         self.acc.human_action_time_ms = min(int(getattr(self.acc, "human_action_time_ms", 0)), int(now) - 3001)
       except Exception:
         pass

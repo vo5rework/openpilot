@@ -1,5 +1,6 @@
 import copy
 import math
+import time
 from dataclasses import dataclass
 
 from openpilot.common.swaglog import cloudlog
@@ -79,8 +80,31 @@ class CarState(CarStateBase):
     self.car_speed_limit_offset_is_percent = False
     self.car_speed_limit_offset_valid = False
     self.stock_cruise_enabled = False
-    self.stock_cruise_state = ""
     self.stock_cruise_set_speed_ms = 0.0
+    self.stock_cruise_state = ""
+
+    # Cruise set-speed source (data-driven learning to avoid guessing)
+    self._cruise_set_src = "unknown"
+    self._cruise_set_learn_key = ""
+    self._cruise_set_learn_scale = 1.0
+    self._cruise_set_learn_raw_uom = "MPH"
+    self._cruise_set_prev1_raw = {}
+    self._cruise_set_prev2_raw = {}
+    self._cruise_set_prev_u = 0.0
+
+    # Last stalk press for learning (human + virtual)
+    self._xnor_prev_stalk_btn = 0
+    self._xnor_last_stalk_btn = 0
+    self._xnor_last_stalk_ns = 0
+    self._xnor_last_virtual_stalk_btn = 0
+    self._xnor_last_virtual_stalk_bus = -1
+    self._xnor_last_virtual_stalk_ns = 0
+    self._xnor_last_press_ns_seen = 0
+
+    # If detected, CarController will swap UP/DOWN codes before send
+    self._xnor_stalk_invert = False
+    self._xnor_stalk_invert_votes = 0
+    self._xnor_last_virtual_inv_seen_ns = 0
     self.leftBlinkerLamp = False
     self.rightBlinkerLamp = False
     # ALC/BLNK/HSO/ACC (Unity parity)
@@ -130,141 +154,251 @@ class CarState(CarStateBase):
     self.enableHSO = bool(self._tinkla.enable_hso)
     self.hsoNumbPeriod = float(self._tinkla.hso_numb_period)
     self.enableACC = bool(self._tinkla.enable_acc)
+def _extract_car_speed_limit_offset(self, *msgs) -> None:
+  """Best-effort: read Tesla's own speed limit offset setting if it appears on CAN.
 
+  Defensive: if we can't find an offset-like signal, we mark it invalid and fall back to
+  TinklaSpeedLimitOffset/TinklaSpeedLimitUseRelative.
+  """
+  self.car_speed_limit_offset_valid = False
+  self.car_speed_limit_offset = 0.0
+  self.car_speed_limit_offset_is_percent = False
 
-
-
-  def _extract_car_speed_limit_offset(self, *msgs) -> None:
-    """Best-effort: read Tesla's own speed limit offset setting if it appears on CAN.
-
-    This is intentionally defensive: if we can't find an offset-like signal, we mark it invalid and
-    the system falls back to TinklaSpeedLimitOffset/TinklaSpeedLimitUseRelative.
-    """
-    self.car_speed_limit_offset_valid = False
-    self.car_speed_limit_offset = 0.0
-    self.car_speed_limit_offset_is_percent = False
-
-    for m in msgs:
-      if not isinstance(m, dict):
+  for m in msgs:
+    if not isinstance(m, dict):
+      continue
+    for k, v in m.items():
+      if not isinstance(k, str):
         continue
-      for k, v in m.items():
-        if not isinstance(k, str):
-          continue
-        kl = k.lower()
-        if ("speed" not in kl) or ("limit" not in kl) or ("offset" not in kl):
-          continue
-        try:
-          fv = float(v)
-        except Exception:
-          continue
-        if not math.isfinite(fv):
-          continue
+      kl = k.lower()
+      if ("speed" not in kl) or ("limit" not in kl) or ("offset" not in kl):
+        continue
+      try:
+        fv = float(v)
+      except Exception:
+        continue
+      if not math.isfinite(fv):
+        continue
 
-        is_pct = ("pct" in kl) or ("percent" in kl)
-        # Reasonable bounds: percent offsets typically <= 50%; absolute offsets typically <= 30 mph/kph.
-        if is_pct and abs(fv) <= 50.0:
-          self.car_speed_limit_offset = fv
-          self.car_speed_limit_offset_is_percent = True
-          self.car_speed_limit_offset_valid = True
-          return
-        if (not is_pct) and abs(fv) <= 30.0:
-          self.car_speed_limit_offset = fv
-          self.car_speed_limit_offset_is_percent = False
-          self.car_speed_limit_offset_valid = True
-          return
+      is_pct = ("pct" in kl) or ("percent" in kl)
+      if is_pct and abs(fv) <= 50.0:
+        self.car_speed_limit_offset = fv
+        self.car_speed_limit_offset_is_percent = True
+        self.car_speed_limit_offset_valid = True
+        return
+      if (not is_pct) and abs(fv) <= 30.0:
+        self.car_speed_limit_offset = fv
+        self.car_speed_limit_offset_is_percent = False
+        self.car_speed_limit_offset_valid = True
+        return
+
+
+
   def _calc_speed_limit_target_ms(self, speed_units: str) -> float:
+
+
+
     limit_ms = float(getattr(self, "speed_limit_ms", 0.0) or getattr(self, "speed_limit_ms_das", 0.0) or 0.0)
+
+
+
     if limit_ms <= 0.0:
+
+
+
       return 0.0
 
-    # Prefer Tesla's own speed-limit offset setting if present; else use Tinkla params.
+
+
+
     if bool(getattr(self, "car_speed_limit_offset_valid", False)):
+
+
+
       off = float(getattr(self, "car_speed_limit_offset", 0.0) or 0.0)
+
+
+
       if bool(getattr(self, "car_speed_limit_offset_is_percent", False)):
+
+
+
         return max(0.0, limit_ms * (1.0 + off / 100.0))
+
+
+
       if speed_units == "KPH":
+
+
+
         return max(0.0, limit_ms + off * CV.KPH_TO_MS)
+
+
+
       return max(0.0, limit_ms + off * CV.MPH_TO_MS)
 
-    off = float(self._tinkla.speed_limit_offset)
-    if self._tinkla.speed_limit_use_relative:
-      return max(0.0, limit_ms * (1.0 + off / 100.0))
 
-    if speed_units == "KPH":
-      return max(0.0, limit_ms + off * CV.KPH_TO_MS)
-    return max(0.0, limit_ms + off * CV.MPH_TO_MS)
 
 
     off = float(self._tinkla.speed_limit_offset)
+
+
+
     if self._tinkla.speed_limit_use_relative:
+
+
+
       return max(0.0, limit_ms * (1.0 + off / 100.0))
 
+
+
+
     if speed_units == "KPH":
+
+
+
       return max(0.0, limit_ms + off * CV.KPH_TO_MS)
+
+
+
     return max(0.0, limit_ms + off * CV.MPH_TO_MS)
+
+
 
 
 
   def _pick_stock_cruise_set_u(self, di_state: dict, v_ego_ms: float, cruise_enabled: bool, speed_units: str) -> tuple[float, str]:
-    """Pick Tesla cruise setpoint in MPH/KPH without changing the DBC.
+    """Pick Tesla cruise SET speed in current units, data-driven.
 
-    - If stock cruise is disabled (XNOR lateral-only), DI_cruiseSet may look like ~0.5*vEgo.
-      Prefer DI_digitalSpeed to keep the Comma UI sane.
-    - If stock cruise is enabled, choose between DI_cruiseSet, DI_digitalSpeed, and DI_cruiseSet*2
-      using plausibility + stability.
+    Until the correct set-speed field is learned, returns (0.0, "unknown") so the
+    ACC speed-limit sync cannot act on vehicle speed (which causes runaway presses).
     """
-    try:
-      a = float(di_state.get("DI_cruiseSet", 0.0) or 0.0)
-    except Exception:
-      a = 0.0
-    try:
-      b = float(di_state.get("DI_digitalSpeed", 0.0) or 0.0)
-    except Exception:
-      b = 0.0
+    if not bool(cruise_enabled):
+      return 0.0, "unknown"
 
-    uom = "KPH" if speed_units == "KPH" else "MPH"
+    uom = "KPH" if str(speed_units or "") == "KPH" else "MPH"
     ms_to_u = CV.MS_TO_KPH if uom == "KPH" else CV.MS_TO_MPH
-    v_u = float(v_ego_ms) * ms_to_u
-    thr = max(2.5, 0.10 * max(v_u, 1.0))
+    v_u = float(v_ego_ms) * float(ms_to_u)
 
-    prev_enabled = bool(getattr(self, "_stock_cruise_enabled_prev", False))
-    if bool(cruise_enabled) and (not prev_enabled) and a > 0.0:
-      # On enable edge, setpoint typically equals current speed; detect half-scale once.
-      if (b > 0.0) and (abs((2.0 * a) - b) <= thr) and (abs(a - b) > thr):
-        self._cruise_set_scale = 2.0
-      elif (abs((2.0 * a) - v_u) <= thr) and (abs(a - v_u) > thr):
-        self._cruise_set_scale = 2.0
-      elif (b > 0.0) and (abs(a - b) <= thr):
-        self._cruise_set_scale = 1.0
-      elif abs(a - v_u) <= thr:
-        self._cruise_set_scale = 1.0
+    # Human stalk edge (may be delayed by one update; ok for 1.5s window).
+    now_ns = int(time.monotonic_ns())
+    btn = int(getattr(self, "cruise_buttons", 0) or 0)
+    prev_btn = int(getattr(self, "_xnor_prev_stalk_btn", 0) or 0)
+    if (btn not in (0, 2)) and (btn != prev_btn):
+      self._xnor_last_stalk_btn = int(btn)
+      self._xnor_last_stalk_ns = int(now_ns)
+    self._xnor_prev_stalk_btn = int(btn)
 
-    scale = float(getattr(self, "_cruise_set_scale", 1.0) or 1.0)
-    self._stock_cruise_enabled_prev = bool(cruise_enabled)
+    # Choose most recent press (virtual or human).
+    press_ns = 0
+    press_btn = 0
+    press_src = ""
+    vns = int(getattr(self, "_xnor_last_virtual_stalk_ns", 0) or 0)
+    if vns and (0 <= (now_ns - vns) <= 1_500_000_000):
+      press_ns, press_btn, press_src = vns, int(getattr(self, "_xnor_last_virtual_stalk_btn", 0) or 0), "virt"
+    hns = int(getattr(self, "_xnor_last_stalk_ns", 0) or 0)
+    if hns and (0 <= (now_ns - hns) <= 1_500_000_000) and (hns > press_ns):
+      press_ns, press_btn, press_src = hns, int(getattr(self, "_xnor_last_stalk_btn", 0) or 0), "human"
 
-    if bool(cruise_enabled):
-      if a > 0.0:
-        val = a * scale
-        src = "DI_cruiseSet" if scale < 1.5 else "DI_cruiseSet_x2"
-        return float(val), src
-      if b > 0.0:
-        return float(b), "DI_digitalSpeed"
-      return 0.0, "none"
+    di = dict(di_state or {})
+    cur_raw: dict[str, float] = {}
+    for k, v in di.items():
+      try:
+        fv = float(v)
+      except Exception:
+        continue
+      if not math.isfinite(fv):
+        continue
+      if fv <= 0.0 or fv >= 250.0:
+        continue
+      cur_raw[str(k)] = fv
 
-    # Stock cruise disabled: keep UI stable by using digital speed (and correct half-scale if present).
-    if b > 0.0:
-      if (abs((2.0 * b) - v_u) <= thr) and (abs(b - v_u) > thr):
-        return float(2.0 * b), "DI_digitalSpeed_x2"
-      return float(b), "DI_digitalSpeed"
+    prev1 = dict(getattr(self, "_cruise_set_prev1_raw", {}) or {})
+    prev2 = dict(getattr(self, "_cruise_set_prev2_raw", {}) or {})
+    self._cruise_set_prev2_raw = dict(prev1)
+    self._cruise_set_prev1_raw = dict(cur_raw)
 
-    if a > 0.0:
-      # Fallback (rare): if DI_cruiseSet is the only non-zero, apply learned scale.
-      val = a * scale
-      src = "DI_cruiseSet" if scale < 1.5 else "DI_cruiseSet_x2"
-      return float(val), src
+    # Learn once per press event, before we start using it for control.
+    if press_ns and (press_ns != int(getattr(self, "_xnor_last_press_ns_seen", 0) or 0)) and (self._cruise_set_learn_key == ""):
+      self._xnor_last_press_ns_seen = int(press_ns)
 
-    return 0.0, "none"
+      steps = (1.0, 5.0)  # in current uom (after scaling/conversion)
+      best = None  # (score, key, scale, raw_uom)
+      for key, raw_now in cur_raw.items():
+        k_low = str(key).lower()
+        if ("counter" in k_low) or ("crc" in k_low) or ("alive" in k_low) or ("checksum" in k_low):
+          continue
+        raw_prev = prev1.get(key)
+        raw_prev2 = prev2.get(key)
+        if raw_prev is None or raw_prev2 is None:
+          continue
+        baseline = abs(float(raw_prev) - float(raw_prev2))
+        # Set speed is stable between presses; exclude values that move every DI_state tick.
+        if baseline > 0.15:
+          continue
 
+        for scale in (0.5, 1.0, 2.0):
+          for raw_uom in ("MPH", "KPH"):
+            conv = 1.0
+            if raw_uom != uom:
+              conv = (CV.KPH_TO_MPH if (raw_uom == "KPH" and uom == "MPH") else CV.MPH_TO_KPH)
+            now_u = float(raw_now) * float(scale) * float(conv)
+            prev_u = float(raw_prev) * float(scale) * float(conv)
+            if not (5.0 <= now_u <= 120.0):
+              continue
+            ad = abs(now_u - prev_u)
+            step_err = min(abs(ad - s) for s in steps)
+            if step_err > 0.75:
+              continue
+            # Prefer values not extremely close to vEgo (vehicle speed fields).
+            v_pen = 1.0 if abs(now_u - v_u) < 0.75 else 0.0
+            score = (step_err * 10.0) + v_pen
+            if best is None or score < best[0]:
+              best = (score, str(key), float(scale), str(raw_uom))
+
+      if best is not None:
+        _, key, scale, raw_uom = best
+        self._cruise_set_learn_key = str(key)
+        self._cruise_set_learn_scale = float(scale)
+        self._cruise_set_learn_raw_uom = str(raw_uom)
+        self._cruise_set_src = f"{key}*{scale:g}@{raw_uom}"
+        cloudlog.info(f"[XNOR_CRUISE_LEARN] key={key} scale={scale:g} raw_uom={raw_uom} via_btn={press_btn} via={press_src}")
+      else:
+        self._cruise_set_src = "unknown"
+
+    # Use learned set speed if available.
+    if self._cruise_set_learn_key:
+      raw = cur_raw.get(self._cruise_set_learn_key, 0.0) or 0.0
+      conv = 1.0
+      if self._cruise_set_learn_raw_uom != uom:
+        conv = (CV.KPH_TO_MPH if (self._cruise_set_learn_raw_uom == "KPH" and uom == "MPH") else CV.MPH_TO_KPH)
+      val_u = float(raw) * float(self._cruise_set_learn_scale) * float(conv)
+
+      # Detect inverted stalk mapping only from *virtual* presses we send.
+      # Using human presses for this is too noisy and can false-trigger inversion, which then
+      # drives the set speed toward Tesla's minimum (~18 mph) and "sticks" there.
+      if (press_src == "virt") and press_ns and (press_ns != int(getattr(self, "_xnor_last_virtual_inv_seen_ns", 0) or 0)) and (not bool(getattr(self, "_xnor_stalk_invert", False))):
+        self._xnor_last_virtual_inv_seen_ns = int(press_ns)
+        if 0 <= (now_ns - press_ns) <= 1_500_000_000:
+          expected_dir = int(getattr(self, "_xnor_last_virtual_stalk_dir", 0) or 0)
+          if expected_dir in (-1, 1):
+            prev_u = float(getattr(self, "_cruise_set_prev_u", val_u) or val_u)
+            delta = float(val_u) - float(prev_u)
+            ad = abs(delta)
+            if min(abs(ad - 1.0), abs(ad - 5.0)) <= 0.75:
+              observed_dir = 1 if delta > 0.2 else (-1 if delta < -0.2 else 0)
+              if observed_dir and (observed_dir != expected_dir):
+                self._xnor_stalk_invert_votes = int(getattr(self, "_xnor_stalk_invert_votes", 0) or 0) + 1
+                if self._xnor_stalk_invert_votes >= 2:
+                  self._xnor_stalk_invert = True
+                  cloudlog.warning("[XNOR_CRUISE_INV] detected inverted stalk mapping; swapping UP/DOWN before send")
+              elif observed_dir == expected_dir:
+                self._xnor_stalk_invert_votes = 0
+      self._cruise_set_prev_u = float(val_u)
+      return float(val_u), str(getattr(self, "_cruise_set_src", "unknown") or "unknown")
+
+    self._cruise_set_prev_u = 0.0
+    return 0.0, "unknown"
 
   def _update_speed_limit(self, can_parsers) -> None:
     """Unity-parity speed limit parsing (map/sign + DAS fallback) into m/s."""
@@ -278,10 +412,6 @@ class CarState(CarStateBase):
     rd_base_mps = None
     map_type = None
     das_mph = None
-    gps = None
-    map_data = None
-    rd = None
-    ds2 = None
     def _msg(name: str):
       for bk in (Bus.party, Bus.ap_party, Bus.cam, Bus.chassis, Bus.pt, Bus.ap_pt):
         cp = can_parsers.get(bk)
@@ -334,8 +464,8 @@ class CarState(CarStateBase):
         speed_limit_ms_das = das_mph * CV.MPH_TO_MS
     except Exception:
       pass
-
     self._extract_car_speed_limit_offset(gps or {}, map_data or {}, rd or {}, ds2 or {})
+
 
     self.speed_limit_ms_das = float(speed_limit_ms_das)
     # Empirically on HW2, DAS_accSpeedLimit can stick at a low default (e.g. 15mph) while map/sign shows the real limit.

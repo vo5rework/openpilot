@@ -292,12 +292,8 @@ class CarController(CarControllerBase):
     self._process_stalk_actions(CS, can_sends)
 
     self._speed_limit_sync(CC, CS, can_sends)
-    standstill = False
-    try:
-      standstill = bool(getattr(getattr(cs_out, "cruiseState", None), "standstill", False))
-    except Exception:
-      standstill = False
 
+    standstill = bool(getattr(getattr(cs_out, "cruiseState", None), "standstill", False)) if cs_out is not None else False
     lat_active = (
       bool(CC.latActive) and
       autopilot_disabled and
@@ -311,8 +307,8 @@ class CarController(CarControllerBase):
       self._steer_warmup_until_frame = int(self.frame) + 20  # ~0.2s at 100Hz
     self._lat_active_prev = bool(lat_active)
 
-    # Steering (50Hz)
 
+    # Steering (50Hz)
     if self.frame % 2 == 0:
       if human_control:
         self.apply_angle_last = float(CS.out.steeringAngleDeg)
