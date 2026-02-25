@@ -15,12 +15,9 @@ Key Unity behaviors implemented:
 
 from __future__ import annotations
 
-import math
 import time
 from dataclasses import dataclass
 from typing import Optional
-
-import cereal.messaging as messaging
 
 from openpilot.common.swaglog import cloudlog
 from opendbc.car.common.conversions import Conversions as CV
@@ -49,23 +46,14 @@ class LongController:
     self._last_eval_frame = -100000
     self._last_gate_log_ms = 0
 
-    self._long_plan_sock = None
-    self._long_plan_v_target_ms = 0.0
-    try:
-      self._long_plan_sock = messaging.sub_sock("longitudinalPlan", conflate=True)
-    except Exception:
-      self._long_plan_sock = None
-
     self._last_brake_ms = 0
+    self._smooth_target_ms: Optional[float] = None
+    self._engage_override_until_ms = 0
 
   @staticmethod
   def _uom_half_step_ms(speed_units: str) -> float:
     half_kph = (1.0 * CV.MPH_TO_KPH) if speed_units == "MPH" else 1.0
     return float(half_kph) * CV.KPH_TO_MS
-
-  def _poll_long_plan(self) -> None:
-    if self._long_plan_sock is None:
-      return
     try:
       msg = messaging.recv_one_or_none(self._long_plan_sock)
     except Exception:
@@ -126,11 +114,8 @@ class LongController:
       self._gate_log("no speed limit")
       return LongDecision(None, "gated: no speed limit")
 
-    # Smooth ramp target from long plan, capped by speed limit.
-    self._poll_long_plan()
+    # Desired set-speed target starts at the speed-limit target.
     desired_ms = float(speed_limit_target_ms)
-    if float(self._long_plan_v_target_ms) > 0.1:
-      desired_ms = float(min(desired_ms, float(self._long_plan_v_target_ms)))
 
     stock_state = str(getattr(CS, "stock_cruise_state", "") or "")
     stock_enabled = (stock_state == "ENABLED")
@@ -140,19 +125,60 @@ class LongController:
     current_set_ms = float(getattr(CS, "stock_cruise_set_speed_ms", 0.0) or 0.0)
     src = str(getattr(CS, "_cruise_set_src", "none") or "none")
 
-    # Unity outcome: (re)engage in STANDBY at current speed when speed-limit matching is active.
-    if enabled and stock_standby and (v_ego_ms >= self.MIN_CRUISE_SPEED_MS) and (desired_ms >= v_ego_ms):
+        # Unity outcome: (re)engage in STANDBY at current speed when speed-limit matching is active.
+    # Tesla behavior: RES resumes old set speed; SET engages at current speed.
+    if enabled and stock_standby and (v_ego_ms >= self.MIN_CRUISE_SPEED_MS):
       # Avoid auto-engage right after braking.
       if (now - int(self._last_brake_ms)) > 2000:
-        # Respect normal cooldowns to avoid fighting the driver.
         if self.acc._no_human_action_for(now_ms=now, milliseconds=1000) and self.acc._no_automated_action_for(now_ms=now, milliseconds=400):
-          cloudlog.info("[XNOR_CRUISE_SYNC] autoengage: STANDBY -> RES_ACCEL")
+          cloudlog.info("[XNOR_CRUISE_SYNC] autoengage: STANDBY -> SET(current)")
           self.acc.automated_action_time_ms = int(now)
-          return LongDecision(int(CruiseButtons.RES_ACCEL), "autoengage")
+          return LongDecision(int(CruiseButtons.DECEL_SET), "autoengage_set_current")
       return LongDecision(None, "gated: standby")
 
     if not stock_enabled:
       return LongDecision(None, f"gated: stock_state={stock_state}")
+
+    # ENABLED edge: if Tesla resumed an old high set speed, press SET(current) once to snap to vEgo.
+    one_u_ms = float(CV.MPH_TO_MS if speed_units == "MPH" else CV.KPH_TO_MS)
+    if stock_enabled and (not bool(self._stock_enabled_prev)):
+      self._engage_override_until_ms = int(now) + 1500
+      # allow immediate correction (don't wait for the 3s human pause)
+      try:
+        self.acc.human_action_time_ms = min(int(getattr(self.acc, "human_action_time_ms", 0)), int(now) - 3001)
+      except Exception:
+        pass
+      if (v_ego_ms >= self.MIN_CRUISE_SPEED_MS) and (current_set_ms > (v_ego_ms + 0.6 * one_u_ms)):
+        if self.acc._no_automated_action_for(now_ms=now, milliseconds=400):
+          cloudlog.info("[XNOR_CRUISE_SYNC] engage: SET(current) to avoid resume")
+          self.acc.automated_action_time_ms = int(now)
+          self._stock_enabled_prev = bool(stock_enabled)
+          return LongDecision(int(CruiseButtons.DECEL_SET), "engage_set_current")
+
+    self._stock_enabled_prev = bool(stock_enabled)
+
+    # Fallback for 1.5s after enable: if set speed is still above vEgo, bias desired target down to vEgo (capped by speed limit).
+    if int(now) < int(self._engage_override_until_ms):
+      if current_set_ms > (v_ego_ms + 0.6 * one_u_ms):
+        desired_ms = float(min(speed_limit_target_ms, max(v_ego_ms, float(self.MIN_CRUISE_SPEED_MS))))
+        src = f"{src}|engage_to_vEgo"
+      else:
+        self._engage_override_until_ms = 0
+
+    # Smooth the desired target toward the limit to avoid "rushing" with large button presses.
+    if self._smooth_target_ms is None:
+      base = current_set_ms if current_set_ms > 0.1 else max(v_ego_ms, float(self.MIN_CRUISE_SPEED_MS))
+      self._smooth_target_ms = float(min(speed_limit_target_ms, base))
+
+    dt_s = 0.2  # 5Hz
+    up_msps = 2.0 * (CV.MPH_TO_MS if speed_units == "MPH" else CV.KPH_TO_MS)
+    down_msps = 3.0 * (CV.MPH_TO_MS if speed_units == "MPH" else CV.KPH_TO_MS)
+    if desired_ms > float(self._smooth_target_ms):
+      self._smooth_target_ms = float(min(desired_ms, float(self._smooth_target_ms) + up_msps * dt_s))
+    else:
+      self._smooth_target_ms = float(max(desired_ms, float(self._smooth_target_ms) - down_msps * dt_s))
+
+    desired_ms = float(self._smooth_target_ms)
 
     # If set speed is way above the limit (resume case), prioritize bringing it down smoothly.
     # (This uses normal ACC rules; smoothing is handled by 5Hz + longPlan cap.)
