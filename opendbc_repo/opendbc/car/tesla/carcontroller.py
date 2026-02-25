@@ -125,7 +125,7 @@ class CarController(CarControllerBase):
 
   @staticmethod
   def _now_ms() -> int:
-    return int(time.time() * 1000)
+    return int(time.monotonic_ns() // 1_000_000)
 
   def _track_human_cruise_actions(self, CS) -> None:
     btn = int(getattr(CS, 'cruise_buttons', BTN_IDLE) or BTN_IDLE)
@@ -217,22 +217,16 @@ class CarController(CarControllerBase):
       self._send_stw(CS, can_sends, BTN_IDLE, bus=int(self._stw_release_bus))
       self._stw_release_frame = -1
 
-    # Run queued press sequence (e.g. legacy MAIN+RESUME on engage)
-    if (int(self._stw_release_frame) < 0) and self._stw_sequence:
-      due_frame, btn = self._stw_sequence[0]
-      if int(self.frame) >= int(due_frame):
-        if self._queue_stalk_pulse(CS, can_sends, int(btn)):
-          self._stw_sequence.pop(0)
   def _speed_limit_sync(self, CC, CS, can_sends) -> None:
     enabled = bool(getattr(CC, "enabled", False) or getattr(CC, "latActive", False))
     if (not enabled) or (not self._cached_autopilot_disabled):
       return
 
     # Don't overlap with explicit sequences or a pending pulse release.
-    if (int(self._stw_release_frame) >= 0) or bool(self._stw_sequence):
+    if (int(self._stw_release_frame) >= 0):
       return
 
-    decision = self._long_module.update(CS, enabled=enabled, now_ms=int(self._now_ms()))
+    decision = self._long_module.update(CS, enabled=enabled, frame=int(self.frame), now_ms=int(self._now_ms()))
     if decision.button is None:
       return
 
@@ -266,18 +260,11 @@ class CarController(CarControllerBase):
 
     op_enabled = bool(getattr(CC, "enabled", False) or getattr(CC, "latActive", False))
     if op_enabled and (not bool(self._op_enabled_prev)):
-      # Unity parity: avoid a first-command step when engaging with wheel turned.
+      # Avoid a first-command step when engaging with wheel turned (EPS inhibit prevention).
       try:
         self.apply_angle_last = float(getattr(cs_out, "steeringAngleDeg", 0.0) if cs_out is not None else 0.0)
       except Exception:
         pass
-      if (autopilot_disabled and (self.CP.carFingerprint in LEGACY_CARS) and
-          (float(getattr(CS.out, "vEgo", 0.0)) >= (18.0 * CV.MPH_TO_MS)) and
-          (not bool(getattr(CS, "stock_cruise_enabled", False))) and
-          (not bool(self._stw_sequence))):
-        # Unity parity: legacy cars often require MAIN + SET on engage
-        self._stw_sequence = [(int(self.frame), BTN_MAIN), (int(self.frame) + 10, BTN_DOWN1)]
-        cloudlog.info("[XNOR_CRUISE_SYNC] legacy engage: queued MAIN+SET")
     self._op_enabled_prev = bool(op_enabled)
 
     self._process_stalk_actions(CS, can_sends)
@@ -294,11 +281,10 @@ class CarController(CarControllerBase):
 
     # Steering (50Hz)
     if self.frame % 2 == 0:
-      # Unity parity: if steering isn't active (or EPS is inhibited), track the real wheel angle.
-      if (not lat_active) or human_control or steer_inhibit:
-        apply_angle = float(CS.out.steeringAngleDeg)
+      if human_control or steer_inhibit:
+        self.apply_angle_last = float(CS.out.steeringAngleDeg)
       else:
-        apply_angle = float(apply_std_steer_angle_limits(
+        self.apply_angle_last = float(apply_std_steer_angle_limits(
           float(actuators.steeringAngleDeg),
           float(self.apply_angle_last),
           float(getattr(CS.out, "vEgoRaw", CS.out.vEgo)),
@@ -306,14 +292,6 @@ class CarController(CarControllerBase):
           lat_active,
           CarControllerParams.ANGLE_LIMITS,
         ))
-        # Unity parity: additional guard to avoid EPS faults on engage/large transients.
-        apply_angle = float(np.clip(
-          apply_angle,
-          float(CS.out.steeringAngleDeg) - 20.0,
-          float(CS.out.steeringAngleDeg) + 20.0,
-        ))
-
-      self.apply_angle_last = float(apply_angle)
 
       if self.CP.carFingerprint in LEGACY_CARS:
         counter = (self.frame // 2) % 16
@@ -325,7 +303,7 @@ class CarController(CarControllerBase):
           self.tesla_can.create_steering_control(self.apply_angle_last, lat_active)
         )
 
-# EPS allow (legacy)
+    # EPS allow (legacy)
     if (self.CP.carFingerprint in LEGACY_CARS) and (self.frame % 10 == 0):
       counter = (self.frame // 10) % 16
       can_sends.append(self.tesla_can.create_steering_allowed(counter))
