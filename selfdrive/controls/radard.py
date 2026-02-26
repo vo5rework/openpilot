@@ -6,7 +6,6 @@ from typing import Any
 
 import capnp
 from cereal import messaging, log, car
-from opendbc.car.tesla.radar_interface import RadarInterface
 from openpilot.common.filter_simple import FirstOrderFilter
 from openpilot.common.params import Params
 from openpilot.common.realtime import DT_MDL, Priority, config_realtime_process
@@ -261,29 +260,25 @@ def main() -> None:
   CP = messaging.log_from_bytes(Params().get("CarParams", block=True), car.CarParams)
   cloudlog.info("radard got CarParams")
 
-  # Tesla radar: parse CAN in-process (avoid missing liveTracks publisher)
-  RI = RadarInterface(CP)
-  can_sock = messaging.sub_sock('can')
-
-  def _drain_can(sock):
-    # drain_sock API differs slightly across forks; try both.
-    try:
-      msgs = messaging.drain_sock(sock, wait_for_one=False)
-    except TypeError:
-      msgs = messaging.drain_sock(sock)
-    return msgs
-
-
   # *** setup messaging
-  sm = messaging.SubMaster(['modelV2', 'carState'], poll='modelV2')
+  sm = messaging.SubMaster(['modelV2', 'carState', 'liveTracks'], poll='modelV2')
   pm = messaging.PubMaster(['radarState'])
+
+  # Read CAN directly and parse Tesla radar tracks via RadarInterface (XNOR / Unity outcome).
+  can_sock = messaging.sub_sock('can', conflate=False)
+  RI = RadarInterface(CP) if not CP.radarUnavailable else None
+
   RD = RadarD(CP.radarDelay)
 
-  while True:
+  while 1:
     sm.update()
-    can_msgs = _drain_can(can_sock)
-    rr = RI.update(can_msgs)
+
+    can_msgs = messaging.drain_sock(can_sock, wait_for_one=False)
+    rr = RI.update(can_msgs) if RI is not None else sm['liveTracks']
+
     RD.update(sm, rr)
     RD.publish(pm)
+
+
 if __name__ == "__main__":
   main()
