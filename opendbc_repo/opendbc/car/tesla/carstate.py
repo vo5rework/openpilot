@@ -75,6 +75,8 @@ class CarState(CarStateBase):
     self.enable_adaptive_cruise = False
     self._last_cruise_stalk_pull_ms = 0
     self._prev_pull_button = 0
+    self._xnor_last_virtual_btn = 0
+    self._xnor_last_virtual_ms = 0
 
     self.turnSignalStalkState = 0
     self.speed_units = "MPH"
@@ -136,66 +138,77 @@ class CarState(CarStateBase):
     self.enableHSO = bool(self._tinkla.enable_hso)
     self.hsoNumbPeriod = float(self._tinkla.hso_numb_period)
     self.enableACC = bool(self._tinkla.enable_acc)
-def _calc_speed_limit_target_ms(self, speed_units: str) -> float:
-  """Compute target speed for speed-limit matching (Unity parity).
+  def _calc_speed_limit_target_ms(self, speed_units: str) -> float:
+    """Compute target speed for speed-limit matching (Unity parity).
 
-  If Tesla UI offset is present on CAN (UI_userSpeedOffset), use it as the base offset value.
-  Then apply the repo's relative/absolute setting:
-    - relative: treat offset as a percent
-    - absolute: treat offset as an absolute MPH/KPH delta
+    If Tesla UI offset is present on CAN (UI_userSpeedOffset), use it as the base offset value.
+    Then apply the repo's relative/absolute setting:
+      - relative: treat offset as a percent
+      - absolute: treat offset as an absolute MPH/KPH delta
 
-  If Tesla UI offset is not available, fall back to Tinkla params.
-  """
-  limit_ms = float(getattr(self, "speed_limit_ms", 0.0) or getattr(self, "speed_limit_ms_das", 0.0) or 0.0)
-  if limit_ms <= 0.0:
-    return 0.0
+    If Tesla UI offset is not available, fall back to Tinkla params.
+    """
+    limit_ms = float(getattr(self, "speed_limit_ms", 0.0) or getattr(self, "speed_limit_ms_das", 0.0) or 0.0)
+    if limit_ms <= 0.0:
+      return 0.0
 
-  use_relative = bool(getattr(self._tinkla, "speed_limit_use_relative", False))
+    use_relative = bool(getattr(self._tinkla, "speed_limit_use_relative", False))
 
-  # Base offset comes from Tesla UI if available, else from param.
-  if bool(getattr(self, "ui_speed_limit_offset_valid", False)):
-    off_uom = float(getattr(self, "ui_speed_limit_offset_uom", 0.0) or 0.0)
-    off_units = str(getattr(self, "ui_speed_limit_offset_units", speed_units) or speed_units)
-  else:
-    off_uom = float(getattr(self._tinkla, "speed_limit_offset", 0.0) or 0.0)
-    off_units = str(speed_units or "MPH")
+    # Base offset comes from Tesla UI if available, else from param.
+    if bool(getattr(self, "ui_speed_limit_offset_valid", False)):
+      off_uom = float(getattr(self, "ui_speed_limit_offset_uom", 0.0) or 0.0)
+      off_units = str(getattr(self, "ui_speed_limit_offset_units", speed_units) or speed_units)
+    else:
+      off_uom = float(getattr(self._tinkla, "speed_limit_offset", 0.0) or 0.0)
+      off_units = str(speed_units or "MPH")
 
-  if use_relative:
-    return max(0.0, limit_ms * (1.0 + off_uom / 100.0))
+    if use_relative:
+      return max(0.0, limit_ms * (1.0 + off_uom / 100.0))
 
-  if off_units == "KPH":
-    return max(0.0, limit_ms + off_uom * CV.KPH_TO_MS)
-  return max(0.0, limit_ms + off_uom * CV.MPH_TO_MS)
-def _update_adaptive_cruise_mode(self, *, now_ms: int, v_ego_ms: float) -> None:
-  """Unity parity: double-pull enable for adaptive speed matching.
+    if off_units == "KPH":
+      return max(0.0, limit_ms + off_uom * CV.KPH_TO_MS)
+    return max(0.0, limit_ms + off_uom * CV.MPH_TO_MS)
+  def _update_adaptive_cruise_mode(self, *, now_ms: int, v_ego_ms: float) -> None:
+    """Unity outcome: double stalk pull toggles adaptive speed matching.
 
-  Two pulls within 750ms enables adaptive matching.
-  A single pull while enabled disables it (falls back to steering-only).
-  """
-  btn = int(getattr(self, "cruise_buttons", 0) or 0)
-  pull = btn in (int(CruiseButtons.MAIN), int(CruiseButtons.DECEL_SET))
+    - Two MAIN pulls within 750ms enables adaptive matching.
+    - One MAIN pull while enabled disables it.
+    - Auto-disables when stock cruise is not ENABLED/STANDBY or speed is below minimum.
+    """
+    btn = int(getattr(self, "cruise_buttons", 0) or 0)
+    prev_btn = int(getattr(self, "_prev_pull_button", 0) or 0)
 
-  prev_pull = int(getattr(self, "_prev_pull_button", 0) or 0)
-  if pull and prev_pull != btn:
-    last_ms = int(getattr(self, "_last_cruise_stalk_pull_ms", 0) or 0)
-    double_pull = (int(now_ms) - last_ms) < 750
-    self._last_cruise_stalk_pull_ms = int(now_ms)
+    pull_btns = {int(CruiseButtons.MAIN), int(CruiseButtons.DECEL_SET)}
+    is_pull = int(btn) in pull_btns
+    is_edge = is_pull and (prev_btn != int(btn))
 
+    if is_edge:
+      # Ignore our own virtual stalk pulses (sent by CarController).
+      vbtn = int(getattr(self, "_xnor_last_virtual_btn", 0) or 0)
+      vms = int(getattr(self, "_xnor_last_virtual_ms", 0) or 0)
+      is_virtual = (int(btn) == vbtn) and (0 <= (int(now_ms) - vms) <= 250)
+
+      if not is_virtual:
+        last_ms = int(getattr(self, "_last_cruise_stalk_pull_ms", 0) or 0)
+        double_pull = (int(now_ms) - last_ms) <= 750
+        self._last_cruise_stalk_pull_ms = int(now_ms)
+
+        stock_state = str(getattr(self, "stock_cruise_state", "") or "")
+        ready = (stock_state in ("ENABLED", "STANDBY")) and (float(v_ego_ms) > (17.1 * CV.MPH_TO_MS))
+
+        if ready and (not bool(getattr(self, "enable_adaptive_cruise", False))):
+          if double_pull:
+            self.enable_adaptive_cruise = True
+        elif ready and bool(getattr(self, "enable_adaptive_cruise", False)):
+          # single pull toggles off
+          self.enable_adaptive_cruise = False
+
+    # auto-disable when cruise not ready
     stock_state = str(getattr(self, "stock_cruise_state", "") or "")
-    ready = (stock_state in ("ENABLED", "STANDBY")) and (float(v_ego_ms) > (17.1 * CV.MPH_TO_MS))
-
-    if ready and double_pull:
-      self.enable_adaptive_cruise = True
-    elif ready and bool(getattr(self, "enable_adaptive_cruise", False)):
+    if (stock_state not in ("ENABLED", "STANDBY")) or (float(v_ego_ms) <= (17.1 * CV.MPH_TO_MS)):
       self.enable_adaptive_cruise = False
 
     self._prev_pull_button = int(btn)
-
-
-
-
-
-
 
   def _pick_stock_cruise_set_u(self, di_state: dict, v_ego_ms: float, cruise_enabled: bool, speed_units: str) -> tuple[float, str]:
     """Pick Tesla cruise setpoint in MPH/KPH without changing the DBC.

@@ -197,6 +197,13 @@ class CarController(CarControllerBase):
     seed = dict(msg)  # Unity parity: seed from latest observed frame every send
 
     can_sends.append(self._action_can_for_bus(b).create_action_request(int(b), seed, int(btn)))
+    # Mark last virtual stalk press so CarState can ignore it for adaptive double-pull detection.
+    try:
+      if int(btn) != int(BTN_IDLE):
+        CS._xnor_last_virtual_btn = int(btn)
+        CS._xnor_last_virtual_ms = int(self._now_ms())
+    except Exception:
+      pass
     self._stw_seed_bus = int(b)
     self._stw_last_send_frame = int(self.frame)
     return True

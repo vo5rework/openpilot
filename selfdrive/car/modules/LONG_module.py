@@ -1,4 +1,4 @@
-# /data/openpilot/selfdrive/car/modules/LONG_module.py
+# /data/openpilot/openpilot/selfdrive/car/modules/LONG_module.py
 """Unity-style speed-limit cruise syncing (XNOR).
 
 Responsibilities:
@@ -9,7 +9,7 @@ Responsibilities:
 
 Key Unity behaviors implemented:
   - Only adjust when DI_cruiseState == ENABLED (not OVERRIDE/PRE_CANCEL/etc).
-  - Auto-(re)engage cruise in STANDBY using RES_ACCEL when speed-limit matching is active and safe
+  - Auto-(re)engage cruise in STANDBY using SET(current) when speed-limit matching is active and safe
     (Unity's _should_autoengage_cc outcome: engage at current speed, not last memorized).
 """
 
@@ -42,7 +42,7 @@ class LongController:
   def __init__(self) -> None:
     self.acc = ACCController()
 
-    self._stock_enabled_prev = False
+    self._stock_active_prev = False
     self._last_eval_frame = -100000
     self._last_gate_log_ms = 0
 
@@ -122,6 +122,7 @@ class LongController:
 
     stock_state = str(getattr(CS, "stock_cruise_state", "") or "")
     stock_enabled = (stock_state == "ENABLED")
+    stock_active = (stock_state in ("ENABLED", "OVERRIDE"))
     stock_standby = (stock_state == "STANDBY")
 
     v_ego_ms = float(getattr(getattr(CS, "out", None), "vEgo", 0.0) or 0.0)
@@ -132,18 +133,18 @@ class LongController:
     if enabled and stock_standby and (v_ego_ms >= self.MIN_CRUISE_SPEED_MS):
       if (now - int(self._last_brake_ms)) > 2000:
         if self.acc._no_human_action_for(now_ms=now, milliseconds=1000) and self.acc._no_automated_action_for(now_ms=now, milliseconds=400):
-          cloudlog.info("[XNOR_CRUISE_SYNC] autoengage: STANDBY -> RES_ACCEL (Unity)")
+          cloudlog.info("[XNOR_CRUISE_SYNC] autoengage: STANDBY -> SET(current) (Unity)")
           self.acc.automated_action_time_ms = int(now)
-          return LongDecision(int(CruiseButtons.RES_ACCEL), "autoengage_res_accel")
+          return LongDecision(int(CruiseButtons.DECEL_SET), "autoengage_set_current")
       return LongDecision(None, "gated: standby")
 
-    if not stock_enabled:
+    if not stock_active:
       return LongDecision(None, f"gated: stock_state={stock_state}")
 
     one_u_ms = float(CV.MPH_TO_MS if speed_units == "MPH" else CV.KPH_TO_MS)
 
     # ENABLED edge: correct set-speed to current vEgo (both directions).
-    if stock_enabled and (not bool(self._stock_enabled_prev)):
+    if stock_active and (not bool(self._stock_active_prev)):
       self._engage_override_until_ms = int(now) + 1500
       try:
         self.acc.human_action_time_ms = min(int(getattr(self.acc, "human_action_time_ms", 0)), int(now) - 3001)
@@ -152,13 +153,13 @@ class LongController:
 
       if (v_ego_ms >= self.MIN_CRUISE_SPEED_MS) and (abs(current_set_ms - v_ego_ms) > (0.6 * one_u_ms)):
         if self.acc._no_automated_action_for(now_ms=now, milliseconds=400):
-          btn = int(CruiseButtons.RES_ACCEL) if current_set_ms < v_ego_ms else int(CruiseButtons.DECEL_SET)
-          cloudlog.info(f"[XNOR_CRUISE_SYNC] engage: kick btn={btn} to converge to vEgo")
+          btn = int(CruiseButtons.DECEL_SET)
+          cloudlog.info(f"[XNOR_CRUISE_SYNC] engage: SET(current) btn={btn} to converge to vEgo")
           self.acc.automated_action_time_ms = int(now)
-          self._stock_enabled_prev = bool(stock_enabled)
-          return LongDecision(btn, "engage_converge_kick")
+          self._stock_active_prev = bool(stock_enabled)
+          return LongDecision(btn, "engage_set_current")
 
-    self._stock_enabled_prev = bool(stock_enabled)
+    self._stock_active_prev = bool(stock_enabled)
 
     # Fallback for 1.5s after enable: bias desired toward vEgo (or speed limit, whichever is higher).
     if int(now) < int(self._engage_override_until_ms):
