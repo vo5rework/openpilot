@@ -13,7 +13,13 @@ class RadarInterface(RadarInterfaceBase):
     self.ignore_radar_sgu_error = False
 
     self.continental_radar = CP.carFingerprint in (CAR.TESLA_MODEL_S_HW3, )
-    self.bosch_radar = CP.carFingerprint in (CAR.TESLA_MODEL_S_HW1, CAR.TESLA_MODEL_X_HW1, CAR.TESLA_MODEL_S_HW2, )
+    bosch_fps = [CAR.TESLA_MODEL_S_HW1, CAR.TESLA_MODEL_X_HW1, CAR.TESLA_MODEL_S_HW2]
+    # Enable Bosch radar parsing for Model 3/Y when Tesla radar is enabled.
+    for _n in ("TESLA_MODEL_3", "TESLA_MODEL_Y"):
+      _v = getattr(CAR, _n, None)
+      if _v is not None:
+        bosch_fps.append(_v)
+    self.bosch_radar = (CP.carFingerprint in tuple(bosch_fps))
 
     messages = []
     if self.continental_radar:
@@ -36,8 +42,19 @@ class RadarInterface(RadarInterfaceBase):
         ])
 
     self.radar_off_can = CP.radarUnavailable
-    if not  CP.radarUnavailable:
-      self.rcp = CANParser(DBC[CP.carFingerprint][Bus.radar], messages, CANBUS.radar)
+    if not CP.radarUnavailable:
+      dbc_map = DBC.get(CP.carFingerprint, {}) if isinstance(DBC, dict) else {}
+      dbc_name = None
+      if isinstance(dbc_map, dict):
+        dbc_name = dbc_map.get(Bus.radar)
+        if dbc_name is None:
+          try:
+            dbc_name = dbc_map.get(getattr(Bus.radar, 'value', 'radar'))
+          except Exception:
+            dbc_name = None
+      if dbc_name is None:
+        dbc_name = 'tesla_radar_continental_generated' if self.continental_radar else 'tesla_radar_bosch_generated'
+      self.rcp = CANParser(dbc_name, messages, CANBUS.radar)
     else:
       self.rcp = None
 
