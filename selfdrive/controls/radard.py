@@ -6,6 +6,7 @@ from typing import Any
 
 import capnp
 from cereal import messaging, log, car
+from opendbc.car.tesla.radar_interface import RadarInterface
 from openpilot.common.filter_simple import FirstOrderFilter
 from openpilot.common.params import Params
 from openpilot.common.realtime import DT_MDL, Priority, config_realtime_process
@@ -260,8 +261,21 @@ def main() -> None:
   CP = messaging.log_from_bytes(Params().get("CarParams", block=True), car.CarParams)
   cloudlog.info("radard got CarParams")
 
+  # Tesla radar: parse CAN in-process (avoid missing liveTracks publisher)
+  RI = RadarInterface(CP)
+  can_sock = messaging.sub_sock('can')
+
+  def _drain_can(sock):
+    # drain_sock API differs slightly across forks; try both.
+    try:
+      msgs = messaging.drain_sock(sock, wait_for_one=False)
+    except TypeError:
+      msgs = messaging.drain_sock(sock)
+    return msgs
+
+
   # *** setup messaging
-  sm = messaging.SubMaster(['modelV2', 'carState', 'liveTracks'], poll='modelV2')
+  sm = messaging.SubMaster(['modelV2', 'carState'], poll='modelV2')
   pm = messaging.PubMaster(['radarState'])
 
   RD = RadarD(CP.radarDelay)
@@ -269,7 +283,9 @@ def main() -> None:
   while 1:
     sm.update()
 
-    RD.update(sm, sm['liveTracks'])
+        can_msgs = _drain_can(can_sock)
+    rr = RI.update(can_msgs)
+    RD.update(sm, rr)
     RD.publish(pm)
 
 
