@@ -255,7 +255,6 @@ class RadarD:
 def main() -> None:
   config_realtime_process(5, Priority.CTRL_LOW)
 
-  # wait for stats about the car to come in from controls
   cloudlog.info("radard is waiting for CarParams")
   CP = messaging.log_from_bytes(Params().get("CarParams", block=True), car.CarParams)
   cloudlog.info("radard got CarParams")
@@ -263,20 +262,29 @@ def main() -> None:
   # *** setup messaging
   sm = messaging.SubMaster(['modelV2', 'carState', 'liveTracks'], poll='modelV2')
   pm = messaging.PubMaster(['radarState'])
-
-  # Read CAN directly and parse Tesla radar tracks via RadarInterface (XNOR / Unity outcome).
   can_sock = messaging.sub_sock('can', conflate=False)
-  RI = RadarInterface(CP) if not CP.radarUnavailable else None
 
   RD = RadarD(CP.radarDelay)
 
-  while 1:
+  RI = None
+  if not CP.radarUnavailable and getattr(CP, 'carName', '') == 'tesla':
+    try:
+      from opendbc.car.tesla.radar_interface import RadarInterface as TeslaRadarInterface
+      RI = TeslaRadarInterface(CP)
+      cloudlog.info("radard: using Tesla RadarInterface (CAN parsed)")
+    except Exception:
+      cloudlog.exception("radard: failed to init Tesla RadarInterface; falling back to liveTracks")
+
+  while True:
     sm.update()
 
-    can_msgs = messaging.drain_sock(can_sock, wait_for_one=False)
-    rr = RI.update(can_msgs) if RI is not None else sm['liveTracks']
+    if RI is not None:
+      can_msgs = messaging.drain_sock_raw(can_sock)
+      rr = RI.update(can_msgs)
+      RD.update(sm, rr)
+    else:
+      RD.update(sm, sm['liveTracks'])
 
-    RD.update(sm, rr)
     RD.publish(pm)
 
 
