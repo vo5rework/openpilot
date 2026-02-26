@@ -143,28 +143,26 @@ class LongController:
 
     one_u_ms = float(CV.MPH_TO_MS if speed_units == "MPH" else CV.KPH_TO_MS)
 
-    # ENABLED edge: correct set-speed to current vEgo (both directions).
+    # stock_active rising edge: start a short vEgo-align window (Unity outcome).
+    # Goal: avoid "resume last set speed" surges by first aligning set-speed to *current* vEgo,
+    # then letting normal speed-limit matching take over smoothly.
     if stock_active and (not bool(self._stock_active_prev)):
       self._engage_override_until_ms = int(now) + 1500
       try:
+        # Allow immediate correction (do not wait for the 3s human pause).
         self.acc.human_action_time_ms = min(int(getattr(self.acc, "human_action_time_ms", 0)), int(now) - 3001)
       except Exception:
         pass
 
-      if (v_ego_ms >= self.MIN_CRUISE_SPEED_MS) and (abs(current_set_ms - v_ego_ms) > (0.6 * one_u_ms)):
-        if self.acc._no_automated_action_for(now_ms=now, milliseconds=400):
-          btn = int(CruiseButtons.DECEL_SET)
-          cloudlog.info(f"[XNOR_CRUISE_SYNC] engage: SET(current) btn={btn} to converge to vEgo")
-          self.acc.automated_action_time_ms = int(now)
-          self._stock_active_prev = bool(stock_enabled)
-          return LongDecision(btn, "engage_set_current")
+      engage_target_ms = float(min(speed_limit_target_ms, max(v_ego_ms, float(self.MIN_CRUISE_SPEED_MS))))
+      self._smooth_target_ms = float(engage_target_ms)
 
-    self._stock_active_prev = bool(stock_enabled)
+    self._stock_active_prev = bool(stock_active)
 
-    # Fallback for 1.5s after enable: bias desired toward vEgo (or speed limit, whichever is higher).
+    # Fallback for 1.5s after enable: bias desired toward current vEgo (capped by speed limit).
     if int(now) < int(self._engage_override_until_ms):
       if (v_ego_ms >= self.MIN_CRUISE_SPEED_MS) and (abs(current_set_ms - v_ego_ms) > (0.6 * one_u_ms)):
-        desired_ms = float(max(speed_limit_target_ms, v_ego_ms))
+        desired_ms = float(min(speed_limit_target_ms, max(v_ego_ms, float(self.MIN_CRUISE_SPEED_MS))))
         src = f"{src}|engage_to_vEgo"
       else:
         self._engage_override_until_ms = 0
