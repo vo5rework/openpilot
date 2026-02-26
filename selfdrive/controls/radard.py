@@ -277,17 +277,13 @@ def main() -> None:
   # *** setup messaging
   sm = messaging.SubMaster(['modelV2', 'carState'], poll='modelV2')
   pm = messaging.PubMaster(['radarState'])
-
   RD = RadarD(CP.radarDelay)
 
-  while 1:
+  while True:
     sm.update()
-
-        can_msgs = _drain_can(can_sock)
+    can_msgs = _drain_can(can_sock)
     rr = RI.update(can_msgs)
     RD.update(sm, rr)
     RD.publish(pm)
-
-
 if __name__ == "__main__":
   main()
