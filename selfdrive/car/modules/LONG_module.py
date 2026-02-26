@@ -47,6 +47,8 @@ class LongController:
     self._last_gate_log_ms = 0
 
     self._last_brake_ms = 0
+
+    self._gas_prev = False
     self._smooth_target_ms: Optional[float] = None
     self._engage_override_until_ms = 0
 
@@ -129,14 +131,64 @@ class LongController:
     current_set_ms = float(getattr(CS, "stock_cruise_set_speed_ms", 0.0) or 0.0)
     src = str(getattr(CS, "_cruise_set_src", "none") or "none")
 
-    # Auto-(re)engage in STANDBY (Unity: RES_ACCEL) when safe.
+    # Auto-(re)engage in STANDBY (Unity outcome): wait for driver accelerator press, then SET(current).
+
+
+    # This avoids time-based auto re-engage after braking.
+
+
+    gas_pressed = bool(getattr(getattr(CS, "out", None), "gasPressed", False))
+
+
+    gas_edge = gas_pressed and (not bool(self._gas_prev))
+
+
+    self._gas_prev = bool(gas_pressed)
+
+
+
     if enabled and stock_standby and (v_ego_ms >= self.MIN_CRUISE_SPEED_MS):
-      if (now - int(self._last_brake_ms)) > 2000:
+
+
+      # Track our smoothing target to current speed (capped by speed limit) so we don't step when we do engage.
+
+
+      try:
+
+
+        engage_target = float(min(speed_limit_target_ms, max(v_ego_ms, float(self.MIN_CRUISE_SPEED_MS))))
+
+
+        self._smooth_target_ms = float(engage_target)
+
+
+      except Exception:
+
+
+        pass
+
+
+
+      # Only engage when the driver requests it via accelerator press.
+
+
+      if gas_edge and ((now - int(self._last_brake_ms)) > 250):
+
+
         if self.acc._no_human_action_for(now_ms=now, milliseconds=1000) and self.acc._no_automated_action_for(now_ms=now, milliseconds=400):
-          cloudlog.info("[XNOR_CRUISE_SYNC] autoengage: STANDBY -> SET(current) (Unity)")
+
+
+          cloudlog.info("[XNOR_CRUISE_SYNC] autoengage: STANDBY + gas -> SET(current) (Unity)")
+
+
           self.acc.automated_action_time_ms = int(now)
-          return LongDecision(int(CruiseButtons.DECEL_SET), "autoengage_set_current")
-      return LongDecision(None, "gated: standby")
+
+
+          return LongDecision(int(CruiseButtons.DECEL_SET), "autoengage_set_current_gas")
+
+
+
+      return LongDecision(None, "gated: standby_wait_gas")
 
     if not stock_active:
       return LongDecision(None, f"gated: stock_state={stock_state}")

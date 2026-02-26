@@ -429,6 +429,7 @@ class CarState(CarStateBase):
     # Steering wheel
     epas_status = cp_party.vl["EPAS3S_sysStatus"]
     self.hands_on_level = epas_status["EPAS3S_handsOnLevel"]
+    self.human_control = bool(self.hands_on_level >= 1)
     ret.steeringAngleDeg = -epas_status["EPAS3S_internalSAS"]
     ret.steeringRateDeg = -cp_ap_party.vl["SCCM_steeringAngleSensor"]["SCCM_steeringAngleSpeed"]
     ret.steeringTorque = -epas_status["EPAS3S_torsionBarTorque"]
@@ -686,6 +687,7 @@ class CarState(CarStateBase):
     else:
       epas_status = cp_chassis.vl["EPAS_sysStatus"]
     self.hands_on_level = epas_status["EPAS_handsOnLevel"]
+    self.human_control = bool(self.hands_on_level >= 1)
     ret.steeringAngleDeg = -epas_status["EPAS_internalSAS"]
     ret.steeringRateDeg = -cp_chassis.vl["STW_ANGLHP_STAT"]["StW_AnglHP_Spd"]
     ret.steeringTorque = -epas_status["EPAS_torsionBarTorque"]
