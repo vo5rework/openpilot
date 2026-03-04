@@ -178,7 +178,9 @@ class CarController(CarControllerBase):
 
   def _stw_bus(self, CS) -> int:
     try:
-      return int(getattr(CS, "stw_actn_bus", CANBUS.party))
+      b = int(getattr(CS, "stw_actn_bus", CANBUS.party))
+      # Never transmit on CANBUS.radar (bus 1); some harnesses have no ACK on that bus.
+      return int(CANBUS.party) if b == int(CANBUS.radar) else int(b)
     except Exception:
       return int(CANBUS.party)
 
