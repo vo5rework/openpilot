@@ -530,12 +530,17 @@ class CarState(CarStateBase):
         # Keep the read bus for diagnostics
         self.stw_actn_read_bus = int(stw_bus)
         # TX bus must be on a real bus (mirrored busses like 130 cause CAN errors)
+        # NOTE: STW_ACTN_RQ can be mirrored onto radar/ap buses for RX; TX must stay on a real control bus.
+        # On many Tesla legacy harnesses, transmitting on CANBUS.radar (1) causes CAN errors (no ACK/termination).
         tx_bus = int(stw_bus)
         if tx_bus >= 128:
           tx_bus -= 128
-        if tx_bus not in (int(CANBUS.party), int(CANBUS.radar), int(CANBUS.autopilot_party)):
+        # Never TX on radar bus; prefer party (0), otherwise autopilot_party (2).
+        if tx_bus == int(CANBUS.radar):
           tx_bus = int(CANBUS.party)
-        self.stw_actn_bus = tx_bus
+        if tx_bus not in (int(CANBUS.party), int(CANBUS.autopilot_party)):
+          tx_bus = int(CANBUS.party)
+        self.stw_actn_bus = int(tx_bus)
       self.cruise_buttons = int(stw.get("SpdCtrlLvr_Stat", 0))
       # Unity parity: publish followDistanceS from stalk distance setting (DTR_Dist_Rq).
       # Keep last valid value if the stalk message is missing/SNA this frame.
@@ -916,12 +921,17 @@ class CarState(CarStateBase):
         # Keep the read bus for diagnostics
         self.stw_actn_read_bus = int(stw_bus)
         # TX bus must be on a real bus (mirrored busses like 130 cause CAN errors)
+        # NOTE: STW_ACTN_RQ can be mirrored onto radar/ap buses for RX; TX must stay on a real control bus.
+        # On many Tesla legacy harnesses, transmitting on CANBUS.radar (1) causes CAN errors (no ACK/termination).
         tx_bus = int(stw_bus)
         if tx_bus >= 128:
           tx_bus -= 128
-        if tx_bus not in (int(CANBUS.party), int(CANBUS.radar), int(CANBUS.autopilot_party)):
+        # Never TX on radar bus; prefer party (0), otherwise autopilot_party (2).
+        if tx_bus == int(CANBUS.radar):
           tx_bus = int(CANBUS.party)
-        self.stw_actn_bus = tx_bus
+        if tx_bus not in (int(CANBUS.party), int(CANBUS.autopilot_party)):
+          tx_bus = int(CANBUS.party)
+        self.stw_actn_bus = int(tx_bus)
       self.cruise_buttons = int(stw.get("SpdCtrlLvr_Stat", 0))
       # Unity parity: publish followDistanceS from stalk distance setting (DTR_Dist_Rq).
       # Keep last valid value if the stalk message is missing/SNA this frame.
