@@ -530,17 +530,12 @@ class CarState(CarStateBase):
         # Keep the read bus for diagnostics
         self.stw_actn_read_bus = int(stw_bus)
         # TX bus must be on a real bus (mirrored busses like 130 cause CAN errors)
-        # NOTE: STW_ACTN_RQ can be mirrored onto radar/ap buses for RX; TX must stay on a real control bus.
-        # On many Tesla legacy harnesses, transmitting on CANBUS.radar (1) causes CAN errors (no ACK/termination).
         tx_bus = int(stw_bus)
         if tx_bus >= 128:
           tx_bus -= 128
-        # Never TX on radar bus; prefer party (0), otherwise autopilot_party (2).
-        if tx_bus == int(CANBUS.radar):
+        if tx_bus not in (int(CANBUS.party), int(CANBUS.radar), int(CANBUS.autopilot_party)):
           tx_bus = int(CANBUS.party)
-        if tx_bus not in (int(CANBUS.party), int(CANBUS.autopilot_party)):
-          tx_bus = int(CANBUS.party)
-        self.stw_actn_bus = int(tx_bus)
+        self.stw_actn_bus = tx_bus
       self.cruise_buttons = int(stw.get("SpdCtrlLvr_Stat", 0))
       # Unity parity: publish followDistanceS from stalk distance setting (DTR_Dist_Rq).
       # Keep last valid value if the stalk message is missing/SNA this frame.
@@ -882,9 +877,16 @@ class CarState(CarStateBase):
 
     # Speed limit best-effort (needed for speed-limit matching)
     self._update_speed_limit(can_parsers)
+    # Unity parity + XNOR safety:
+    # - Use the Bus.party STW frame as the seed AND TX bus for virtual stalk (known-good, avoids CAN errors).
+    # - Read follow-distance from the best available STW copy (some mirrored copies pin DTR_Dist_Rq).
+    stw_seed = None
+    stw_seed_bus = int(getattr(cp_party, "bus", CANBUS.party))
+    try:
+      stw_seed = cp_party.vl["STW_ACTN_RQ"]
+    except KeyError:
+      stw_seed = None
 
-    # Prefer the STW_ACTN_RQ instance that actually carries a changing follow-distance.
-    # Some harnesses/bus layouts mirror STW_ACTN_RQ onto multiple buses; a mirrored copy may pin DTR_Dist_Rq.
     stw_candidates = []
     for bk in (Bus.party, Bus.chassis, Bus.pt, Bus.ap_party, Bus.ap_pt):
       _cp = can_parsers.get(bk)
@@ -902,37 +904,35 @@ class CarState(CarStateBase):
         _dtr_i = None
       stw_candidates.append((_stw, _bus, _dtr_i))
 
-    stw = None
-    stw_bus = None
+    stw_follow = None
+    stw_follow_bus = None
     if stw_candidates:
-      changed = [c for c in stw_candidates if (c[2] is not None and c[2] != 255 and c[2] != getattr(self, "cruise_distance", 255))]
+      # 1) Prefer a non-SNA DTR value that changed vs the last observed distance request.
+      changed = [c for c in stw_candidates
+                 if (c[2] is not None and c[2] != 255 and c[2] != getattr(self, "cruise_distance", 255))]
       if changed:
-        stw, stw_bus, _ = changed[0]
+        stw_follow, stw_follow_bus, _ = changed[0]
       else:
+        # 2) Otherwise prefer any non-SNA value.
         non_sna = [c for c in stw_candidates if (c[2] is not None and c[2] != 255)]
         if non_sna:
-          stw, stw_bus, _ = non_sna[0]
+          stw_follow, stw_follow_bus, _ = non_sna[0]
         else:
-          stw, stw_bus, _ = stw_candidates[0]
+          # 3) Fallback: first available STW copy.
+          stw_follow, stw_follow_bus, _ = stw_candidates[0]
+
+    # Keep the read bus for diagnostics, but TX must remain on Bus.party (pre-radar working behavior).
+    if stw_follow_bus is not None:
+      self.stw_actn_read_bus = int(stw_follow_bus)
+    self.stw_actn_bus = int(stw_seed_bus)
+
+    # Use party seed for buttons/turn stalk; fall back to follow STW if party STW isn't available.
+    stw = stw_seed if stw_seed is not None else stw_follow
 
     if stw is not None:
       self.msg_stw_actn_req = copy.copy(stw)
-      if stw_bus is not None:
-        # Keep the read bus for diagnostics
-        self.stw_actn_read_bus = int(stw_bus)
-        # TX bus must be on a real bus (mirrored busses like 130 cause CAN errors)
-        # NOTE: STW_ACTN_RQ can be mirrored onto radar/ap buses for RX; TX must stay on a real control bus.
-        # On many Tesla legacy harnesses, transmitting on CANBUS.radar (1) causes CAN errors (no ACK/termination).
-        tx_bus = int(stw_bus)
-        if tx_bus >= 128:
-          tx_bus -= 128
-        # Never TX on radar bus; prefer party (0), otherwise autopilot_party (2).
-        if tx_bus == int(CANBUS.radar):
-          tx_bus = int(CANBUS.party)
-        if tx_bus not in (int(CANBUS.party), int(CANBUS.autopilot_party)):
-          tx_bus = int(CANBUS.party)
-        self.stw_actn_bus = int(tx_bus)
       self.cruise_buttons = int(stw.get("SpdCtrlLvr_Stat", 0))
+
       # Unity parity: publish followDistanceS from stalk distance setting (DTR_Dist_Rq).
       # Keep last valid value if the stalk message is missing/SNA this frame.
       try:
@@ -940,7 +940,8 @@ class CarState(CarStateBase):
       except AttributeError:
         pass
 
-      dtr_raw = stw.get("DTR_Dist_Rq", 255)
+      stw_for_dtr = stw_follow if stw_follow is not None else stw
+      dtr_raw = stw_for_dtr.get("DTR_Dist_Rq", 255)
       try:
         dtr = int(dtr_raw) if dtr_raw is not None else 255
       except (ValueError, TypeError):
@@ -968,8 +969,6 @@ class CarState(CarStateBase):
       self.turnSignalStalkState = 0
       self.tap_direction = 0
       self.blinker_controller.tap_direction = 0
-
-
     if self.autopilot_disabled:
       if self.cruise_buttons == 2:  # MAIN
         self.cruiseEnabled = True
