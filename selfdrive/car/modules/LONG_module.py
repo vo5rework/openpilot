@@ -1,24 +1,34 @@
-# /data/openpilot/openpilot/selfdrive/car/modules/LONG_module.py
-"""Unity-style speed-limit cruise syncing (XNOR).
+# /data/openpilot/selfdrive/car/modules/LONG_module.py
+"""
+Unity-style stock cruise set-speed syncing (XNOR).
 
-Responsibilities:
-  - decide which Tesla cruise stalk press to emulate (if any) to sync stock cruise set speed
-    toward a desired target.
-  - provide Unity-like smoothness by evaluating at 5 Hz (frame % 20) and using a smooth ramp
-    target from longitudinalPlan when available.
+This module decides which Tesla cruise stalk button to emulate (if any) to move
+stock cruise set speed toward a desired target speed.
 
-Key Unity behaviors implemented:
-  - Only adjust when DI_cruiseState == ENABLED (not OVERRIDE/PRE_CANCEL/etc).
-  - Auto-(re)engage cruise in STANDBY using SET(current) when speed-limit matching is active and safe
-    (Unity's _should_autoengage_cc outcome: engage at current speed, not last memorized).
+Design goals
+- Regression-safe: only uses speed-limit target when longitudinalPlan is missing.
+- Lead-safe: when longitudinalPlan is available, clamp desired speed to the plan's
+  near-horizon minimum (anticipates braking for a slowing lead).
+- Smooth: evaluates at 5 Hz and ramps desired target to avoid oscillation.
+
+Inputs (via CarState)
+- CS._calc_speed_limit_target_ms(speed_units): speed-limit (+offset) target
+- CS.enable_adaptive_cruise: double-tap gating
+- CS.stock_cruise_state / CS.stock_cruise_set_speed_ms / CS.cruise_buttons
+- CS.out.vEgo / CS.out.brakePressed / CS.out.gasPressed
+
+Outputs
+- LongDecision(button): CruiseButtons value to emulate once (pulse).
 """
 
 from __future__ import annotations
 
+import math
 import time
 from dataclasses import dataclass
 from typing import Optional
 
+from cereal import messaging
 from openpilot.common.swaglog import cloudlog
 from opendbc.car.common.conversions import Conversions as CV
 from opendbc.car.tesla.values import CruiseButtons
@@ -37,64 +47,69 @@ class LongDecision:
 
 
 class LongController:
+  # Unity constant: Tesla cruise only functions above ~17.1 mph
   MIN_CRUISE_SPEED_MS = 17.1 * CV.MPH_TO_MS
 
   def __init__(self) -> None:
     self.acc = ACCController()
 
-    self._stock_active_prev = False
-    self._last_eval_frame = -100000
+    self._smooth_target_ms: Optional[float] = None
     self._last_gate_log_ms = 0
 
-    self._last_brake_ms = 0
-
-    self._gas_prev = False
-    self._smooth_target_ms: Optional[float] = None
-    self._engage_override_until_ms = 0
-
-  @staticmethod
-  def _uom_half_step_ms(speed_units: str) -> float:
-    half_kph = (1.0 * CV.MPH_TO_KPH) if speed_units == "MPH" else 1.0
-    return float(half_kph) * CV.KPH_TO_MS
-    try:
-      msg = messaging.recv_one_or_none(self._long_plan_sock)
-    except Exception:
-      return
-    if msg is None:
-      return
-    try:
-      lp = msg.longitudinalPlan
-      speeds = getattr(lp, "speeds", None)
-      if speeds and len(speeds) > 0:
-        v = float(speeds[-1])
-        if math.isfinite(v) and v >= 0.0:
-          self._long_plan_v_target_ms = v
-    except Exception:
-      return
+    # Plan/lead polling (conflated). Use SubMaster to avoid missing messages at 5 Hz.
+    self._sm = messaging.SubMaster(["longitudinalPlan", "radarState"])
+    self._lp_target_ms: Optional[float] = None
+    self._lp_last_ns: int = 0
+    self._lead_present: bool = False
+    self._lead_vrel: float = 0.0
+    self._lead_drel: float = 0.0
 
   def _gate_log(self, reason: str) -> None:
     now = _mono_ms()
     if now - int(self._last_gate_log_ms) < 1000:
       return
-    self._last_gate_log_ms = int(now)
-    cloudlog.info(f"[XNOR_CRUISE_GATE] {reason}")
-
-  def update(self, CS, *, enabled: bool, frame: int, now_ms: Optional[int] = None) -> LongDecision:
-    now = _mono_ms() if now_ms is None else int(now_ms)
-
-    # Track brake timing for safe auto-engage.
+  def _poll_plan_and_lead(self, *, now_ns: int) -> None:
+    """Cache near-horizon min speed from longitudinalPlan and basic lead state from radarState."""
     try:
-      if bool(getattr(getattr(CS, "out", None), "brakePressed", False)):
-        self._last_brake_ms = int(now)
+      self._sm.update(0)
+    except Exception:
+      return
+
+    try:
+      if bool(self._sm.valid.get("longitudinalPlan", False)):
+        lp = self._sm["longitudinalPlan"]
+        speeds = getattr(lp, "speeds", None)
+        if speeds:
+          n = min(12, len(speeds))
+          v = float(min(float(x) for x in speeds[:n]))
+          if math.isfinite(v) and v >= 0.0:
+            self._lp_target_ms = v
+            self._lp_last_ns = int(self._sm.logMonoTime.get("longitudinalPlan", now_ns))
     except Exception:
       pass
 
-    # Unity: extend pause while held.
     try:
-      cruise_buttons = int(getattr(CS, "cruise_buttons", int(CruiseButtons.IDLE)) or 0)
-      self.acc.note_human_buttons(cruise_buttons, now_ms=now)
+      self._lead_present = False
+      self._lead_vrel = 0.0
+      self._lead_drel = 0.0
+      if bool(self._sm.valid.get("radarState", False)):
+        rs = self._sm["radarState"]
+        lead = getattr(rs, "leadOne", None)
+        if lead is not None and bool(getattr(lead, "status", False)):
+          self._lead_present = True
+          self._lead_vrel = float(getattr(lead, "vRel", 0.0) or 0.0)
+          self._lead_drel = float(getattr(lead, "dRel", 0.0) or 0.0)
     except Exception:
-      cruise_buttons = int(CruiseButtons.IDLE)
+      pass
+      return
+
+  @staticmethod
+  def _uom_step_ms(speed_units: str) -> float:
+    return float(CV.MPH_TO_MS if speed_units == "MPH" else CV.KPH_TO_MS)
+
+  def update(self, CS, *, enabled: bool, frame: int, now_ms: Optional[int] = None) -> LongDecision:
+    now = _mono_ms() if now_ms is None else int(now_ms)
+    now_ns = int(now) * 1_000_000
 
     # 5 Hz eval (Unity: frame % 20 on a 100 Hz loop).
     if (int(frame) % 20) != 0:
@@ -120,123 +135,73 @@ class LongController:
       self._gate_log("no speed limit")
       return LongDecision(None, "gated: no speed limit")
 
-    desired_ms = float(speed_limit_target_ms)
-
+    # Stock cruise state gates (Unity-like).
     stock_state = str(getattr(CS, "stock_cruise_state", "") or "")
-    stock_enabled = (stock_state == "ENABLED")
-    stock_active = (stock_state in ("ENABLED", "OVERRIDE"))
-    stock_standby = (stock_state == "STANDBY")
-
-    v_ego_ms = float(getattr(getattr(CS, "out", None), "vEgo", 0.0) or 0.0)
-    current_set_ms = float(getattr(CS, "stock_cruise_set_speed_ms", 0.0) or 0.0)
-    src = str(getattr(CS, "_cruise_set_src", "none") or "none")
-
-    # Auto-(re)engage in STANDBY (Unity outcome): wait for driver accelerator press, then SET(current).
-
-
-    # This avoids time-based auto re-engage after braking.
-
-
-    gas_pressed = bool(getattr(getattr(CS, "out", None), "gasPressed", False))
-
-
-    gas_edge = gas_pressed and (not bool(self._gas_prev))
-
-
-    self._gas_prev = bool(gas_pressed)
-
-
-
-    if enabled and stock_standby and (v_ego_ms >= self.MIN_CRUISE_SPEED_MS):
-
-
-      # Track our smoothing target to current speed (capped by speed limit) so we don't step when we do engage.
-
-
-      try:
-
-
-        engage_target = float(min(speed_limit_target_ms, max(v_ego_ms, float(self.MIN_CRUISE_SPEED_MS))))
-
-
-        self._smooth_target_ms = float(engage_target)
-
-
-      except Exception:
-
-
-        pass
-
-
-
-      # Only engage when the driver requests it via accelerator press.
-
-
-      if gas_edge and ((now - int(self._last_brake_ms)) > 250):
-
-
-        if self.acc._no_human_action_for(now_ms=now, milliseconds=1000) and self.acc._no_automated_action_for(now_ms=now, milliseconds=400):
-
-
-          cloudlog.info("[XNOR_CRUISE_SYNC] autoengage: STANDBY + gas -> SET(current) (Unity)")
-
-
-          self.acc.automated_action_time_ms = int(now)
-
-
-          return LongDecision(int(CruiseButtons.DECEL_SET), "autoengage_set_current_gas")
-
-
-
-      return LongDecision(None, "gated: standby_wait_gas")
-
+    stock_active = stock_state in ("ENABLED", "OVERRIDE")
     if not stock_active:
-      return LongDecision(None, f"gated: stock_state={stock_state}")
+      return LongDecision(None, f"gated: stock_state={stock_state or 'UNKNOWN'}")
 
-    one_u_ms = float(CV.MPH_TO_MS if speed_units == "MPH" else CV.KPH_TO_MS)
-
-    # stock_active rising edge: start a short vEgo-align window (Unity outcome).
-    # Goal: avoid "resume last set speed" surges by first aligning set-speed to *current* vEgo,
-    # then letting normal speed-limit matching take over smoothly.
-    if stock_active and (not bool(self._stock_active_prev)):
-      self._engage_override_until_ms = int(now) + 1500
-      try:
-        # Allow immediate correction (do not wait for the 3s human pause).
-        self.acc.human_action_time_ms = min(int(getattr(self.acc, "human_action_time_ms", 0)), int(now) - 3001)
-      except Exception:
-        pass
-
-      engage_target_ms = float(min(speed_limit_target_ms, max(v_ego_ms, float(self.MIN_CRUISE_SPEED_MS))))
-      self._smooth_target_ms = float(engage_target_ms)
-
-    self._stock_active_prev = bool(stock_active)
-
-    # Fallback for 1.5s after enable: bias desired toward current vEgo (capped by speed limit).
-    if int(now) < int(self._engage_override_until_ms):
-      if (v_ego_ms >= self.MIN_CRUISE_SPEED_MS) and (abs(current_set_ms - v_ego_ms) > (0.6 * one_u_ms)):
-        desired_ms = float(min(speed_limit_target_ms, max(v_ego_ms, float(self.MIN_CRUISE_SPEED_MS))))
-        src = f"{src}|engage_to_vEgo"
-      else:
-        self._engage_override_until_ms = 0
-
-    # Smooth ramp of desired target.
-    if self._smooth_target_ms is None:
-      base = current_set_ms if current_set_ms > 0.1 else max(v_ego_ms, float(self.MIN_CRUISE_SPEED_MS))
-      self._smooth_target_ms = float(base)
-
-    dt_s = 0.2  # 5Hz
-    up_msps = 2.0 * (CV.MPH_TO_MS if speed_units == "MPH" else CV.KPH_TO_MS)
-    down_msps = 3.0 * (CV.MPH_TO_MS if speed_units == "MPH" else CV.KPH_TO_MS)
-
-    if desired_ms > float(self._smooth_target_ms):
-      self._smooth_target_ms = float(min(desired_ms, float(self._smooth_target_ms) + up_msps * dt_s))
-    else:
-      self._smooth_target_ms = float(max(desired_ms, float(self._smooth_target_ms) - down_msps * dt_s))
-
-    desired_ms = float(self._smooth_target_ms)
+    cs_out = getattr(CS, "out", None)
+    v_ego_ms = float(getattr(cs_out, "vEgo", 0.0) or 0.0)
+    current_set_ms = float(getattr(CS, "stock_cruise_set_speed_ms", 0.0) or 0.0)
 
     try:
+      cruise_buttons = int(getattr(CS, "cruise_buttons", int(CruiseButtons.IDLE)) or 0)
+    except Exception:
+      cruise_buttons = int(CruiseButtons.IDLE)
+
+    # Poll longitudinalPlan and clamp desired target to it (lead-safe).
+    self._poll_plan_and_lead(now_ns=now_ns)
+    lp_fresh = (self._lp_target_ms is not None) and (int(self._lp_last_ns) > 0) and ((now_ns - int(self._lp_last_ns)) < 1_500_000_000)
+
+    desired_ms = float(speed_limit_target_ms)
+    src = "sl"
+    if lp_fresh:
+      desired_ms = float(min(desired_ms, float(self._lp_target_ms or desired_ms)))
+      src = "sl+lp"
+
+    if (not lp_fresh) and bool(getattr(self, "_lead_present", False)):
+      # Safety: if we can't see longitudinalPlan but radar reports a lead, don't increase set speed.
+      desired_ms = float(min(desired_ms, current_set_ms))
+      src = "sl+lead_hold"
+    # When longitudinalPlan is fresh, bypass smoothing for responsive lead handling.
+    if lp_fresh:
+      self._smooth_target_ms = float(desired_ms)
+    else:
+      # Smooth ramp for speed-limit target when longitudinalPlan is stale.
+      if self._smooth_target_ms is None or not math.isfinite(self._smooth_target_ms):
+        base = current_set_ms if current_set_ms > 0.1 else max(v_ego_ms, float(self.MIN_CRUISE_SPEED_MS))
+        self._smooth_target_ms = float(min(speed_limit_target_ms, max(base, float(self.MIN_CRUISE_SPEED_MS))))
+
+      dt_s = 0.2  # 5 Hz
+      step_ms = self._uom_step_ms(speed_units)
+      # Faster convergence than before; ACCController already rate-limits pulses.
+      up_msps = 5.0 * step_ms
+      down_msps = 6.0 * step_ms
+
+      if desired_ms > float(self._smooth_target_ms):
+        self._smooth_target_ms = float(min(desired_ms, float(self._smooth_target_ms) + up_msps * dt_s))
+      else:
+        # For decreases, converge quickly to avoid closing on a slowing lead when plan is unavailable.
+        self._smooth_target_ms = float(max(desired_ms, float(self._smooth_target_ms) - down_msps * dt_s))
+
+    desired_ms = float(self._smooth_target_ms if self._smooth_target_ms is not None else desired_ms)
+    # Run ACC decision logic.
+    try:
       decision: AccDecision = self.acc.update(
+        now_ms=now,
+        enabled=bool(enabled),
+        stock_cruise_enabled=True,
+        stock_cruise_state=stock_state,
+        speed_units=speed_units,
+        v_ego_ms=v_ego_ms,
+        current_set_speed_ms=current_set_ms,
+        desired_speed_ms=desired_ms,
+        cruise_buttons=cruise_buttons,
+      )
+    except TypeError:
+      # Back-compat with older ACCController signature.
+      decision = self.acc.update(
         now_ms=now,
         enabled=bool(enabled),
         stock_cruise_enabled=True,
@@ -246,27 +211,17 @@ class LongController:
         desired_speed_ms=desired_ms,
         cruise_buttons=cruise_buttons,
       )
-    except TypeError:
-      decision = self.acc.update(
-        now_ms=now,
-        enabled=bool(enabled),
-        speed_units=speed_units,
-        v_ego_ms=v_ego_ms,
-        current_set_speed_ms=current_set_ms,
-        desired_speed_ms=desired_ms,
-        cruise_buttons=cruise_buttons,
-      )
 
     if decision.button is None or int(decision.button) == int(CruiseButtons.IDLE):
-      return LongDecision(None, decision.reason)
+      return LongDecision(None, f"{decision.reason} src={src}")
 
     kph_to_u = CV.KPH_TO_MPH if speed_units == "MPH" else 1.0
     msg = (
-      f"[XNOR_CRUISE_SYNC] uom={speed_units} "
+      f"[XNOR_CRUISE_SYNC] src={src} uom={speed_units} "
       f"tgt={decision.target_kph*kph_to_u:.1f} "
       f"cur={decision.current_kph*kph_to_u:.1f} "
       f"est={decision.est_kph*kph_to_u:.1f} "
-      f"btn={int(decision.button)} reason={decision.reason} src={src}"
+      f"btn={int(decision.button)} reason={decision.reason}"
     )
     cloudlog.info(msg)
     return LongDecision(int(decision.button), msg)

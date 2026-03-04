@@ -17,11 +17,43 @@ from opendbc.car.tesla.values import DBC, CANBUS, GEAR_MAP, STEER_THRESHOLD, CAR
 ButtonType = structs.CarState.ButtonEvent.Type
 
 
+def _safe_stw_tx_bus(bus: int | None) -> int:
+  """Return a TX-capable bus for STW action injection.
+
+  Some setups mirror STW_ACTN_RQ on secondary panda sources (e.g. 128+bus).
+  These src values are valid for RX, but *not necessarily* valid TX targets in
+  this port (CarController typically only packs/sends on primary buses).
+
+  We:
+    - map src>=128 -> (src-128)
+    - clamp to known CANBUS values
+    - fall back to CANBUS.party
+  """
+  if bus is None:
+    return int(CANBUS.party)
+  try:
+    b = int(bus)
+  except Exception:
+    return int(CANBUS.party)
+
+  if b >= 128:
+    b -= 128
+
+  valid = {
+    int(getattr(CANBUS, "party", 0)),
+    int(getattr(CANBUS, "chassis", getattr(CANBUS, "party", 0))),
+    int(getattr(CANBUS, "powertrain", getattr(CANBUS, "party", 0))),
+    int(getattr(CANBUS, "autopilot_party", getattr(CANBUS, "party", 0))),
+    int(getattr(CANBUS, "autopilot_powertrain", getattr(CANBUS, "autopilot_party", getattr(CANBUS, "party", 0)))),
+  }
+  return int(b) if int(b) in valid else int(CANBUS.party)
+
+
 @dataclass
 class _TinklaConfig:
   autopilot_disabled: bool = False
   hands_on_level: float = 2.0
-  adjust_acc_with_speed_limit: bool = False
+  adjust_acc_with_speed_limit: bool = True
   speed_limit_offset: float = 0.0
   speed_limit_use_relative: bool = False
   enable_alc: bool = True
@@ -32,11 +64,15 @@ class _TinklaConfig:
 
 
 class CarState(CarStateBase):
+  DOUBLE_PULL_WINDOW_MS = 750
   def __init__(self, CP):
     super().__init__(CP)
     self.msg_stw_actn_req = None
     self.stw_actn_bus = int(CANBUS.party)
     self.can_define = CANDefine(DBC[CP.carFingerprint][Bus.party])
+    # Default to a safe (long) follow distance until we read a valid stalk distance request.
+    self._last_follow_distance_s = 6
+    self.cruise_distance = 255
 
     if self.CP.carFingerprint in LEGACY_CARS:
       if self.CP.carFingerprint == CAR.TESLA_MODEL_S_HW3:
@@ -73,6 +109,8 @@ class CarState(CarStateBase):
     self.cruise_buttons = 0
     # Unity parity: double-pull to enable adaptive speed matching
     self.enable_adaptive_cruise = False
+    self._prev_enable_adaptive_cruise = False
+    self.acc_speed_max_ms = 0.0
     self._last_cruise_stalk_pull_ms = 0
     self._prev_pull_button = 0
     self._xnor_last_virtual_btn = 0
@@ -190,11 +228,11 @@ class CarState(CarStateBase):
 
       if not is_virtual:
         last_ms = int(getattr(self, "_last_cruise_stalk_pull_ms", 0) or 0)
-        double_pull = (int(now_ms) - last_ms) <= 750
+        double_pull = (int(now_ms) - last_ms) <= int(self.DOUBLE_PULL_WINDOW_MS)
         self._last_cruise_stalk_pull_ms = int(now_ms)
 
         stock_state = str(getattr(self, "stock_cruise_state", "") or "")
-        ready = (stock_state in ("ENABLED", "STANDBY")) and (float(v_ego_ms) > (17.1 * CV.MPH_TO_MS))
+        ready = (stock_state in ("ENABLED", "STANDBY", "OVERRIDE", "STANDSTILL")) and (float(v_ego_ms) > (17.1 * CV.MPH_TO_MS))
 
         if ready and (not bool(getattr(self, "enable_adaptive_cruise", False))):
           if double_pull:
@@ -205,7 +243,7 @@ class CarState(CarStateBase):
 
     # auto-disable when cruise not ready
     stock_state = str(getattr(self, "stock_cruise_state", "") or "")
-    if (stock_state not in ("ENABLED", "STANDBY")) or (float(v_ego_ms) <= (17.1 * CV.MPH_TO_MS)):
+    if (stock_state not in ("ENABLED", "STANDBY", "OVERRIDE", "STANDSTILL")) or (float(v_ego_ms) <= (17.1 * CV.MPH_TO_MS)):
       self.enable_adaptive_cruise = False
 
     self._prev_pull_button = int(btn)
@@ -483,26 +521,69 @@ class CarState(CarStateBase):
     # Unity parity: store last STW_ACTN_RQ for virtual stalk + tap-to-ALC
     self.speed_units = speed_units if speed_units in ("KPH", "MPH") else "MPH"
 
-    stw = None
-    stw_bus = None
+    # Prefer the STW_ACTN_RQ instance that actually carries a changing follow-distance.
+    # Some harnesses/bus layouts mirror STW_ACTN_RQ onto multiple buses; a mirrored copy may pin DTR_Dist_Rq.
+    stw_candidates = []
     for bk in (Bus.party, Bus.chassis, Bus.pt, Bus.ap_party, Bus.ap_pt):
       _cp = can_parsers.get(bk)
       if _cp is None:
         continue
       try:
-        stw = _cp.vl["STW_ACTN_RQ"]
-        stw_bus = int(getattr(_cp, "bus", CANBUS.party))
-        break
+        _stw = _cp.vl["STW_ACTN_RQ"]
       except KeyError:
         continue
+      _bus = int(getattr(_cp, "bus", CANBUS.party))
+      _dtr = _stw.get("DTR_Dist_Rq", None)
+      try:
+        _dtr_i = int(_dtr) if _dtr is not None else None
+      except Exception:
+        _dtr_i = None
+      stw_candidates.append((_stw, _bus, _dtr_i))
+
+    stw = None
+    stw_bus = None
+    if stw_candidates:
+      # 1) If any candidate shows a *change* vs last frame and is not SNA, pick it.
+      changed = [c for c in stw_candidates if (c[2] is not None and c[2] != 255 and c[2] != getattr(self, "cruise_distance", 255))]
+      if changed:
+        stw, stw_bus, _ = changed[0]
+      else:
+        # 2) Otherwise, pick the first non-SNA distance candidate (if any).
+        non_sna = [c for c in stw_candidates if (c[2] is not None and c[2] != 255)]
+        if non_sna:
+          stw, stw_bus, _ = non_sna[0]
+        else:
+          # 3) Fallback: first available STW_ACTN_RQ.
+          stw, stw_bus, _ = stw_candidates[0]
+
     if stw is not None:
       self.msg_stw_actn_req = copy.copy(stw)
       if stw_bus is not None:
-        self.stw_actn_bus = int(stw_bus)
+        self.stw_actn_bus = _safe_stw_tx_bus(int(stw_bus))
       self.cruise_buttons = int(stw.get("SpdCtrlLvr_Stat", 0))
+      # Unity parity: publish followDistanceS from stalk distance setting (DTR_Dist_Rq).
+      # Keep last valid value if the stalk message is missing/SNA this frame.
+      ret.followDistanceS = self._last_follow_distance_s
+
+      dtr_raw = stw.get("DTR_Dist_Rq", 255)
+      try:
+        dtr = int(dtr_raw) if dtr_raw is not None else 255
+      except (ValueError, TypeError):
+        dtr = 255
+
+      if dtr != 255:
+        # pos1=0, pos2=33, pos3=66, pos4=100, pos5=133, pos6=166, pos7=200, SNA=255
+        self.cruise_distance = dtr
+        follow_s = int(dtr / 33)
+        if 0 <= follow_s <= 6:
+          self._last_follow_distance_s = follow_s
+          ret.followDistanceS = follow_s
+
+
       raw_ts = int(stw.get("TurnIndLvr_Stat", 0))
       self.turnSignalStalkState = 0 if raw_ts == 3 else raw_ts
     else:
+      ret.followDistanceS = self._last_follow_distance_s
       self.cruise_buttons = 0
       self.turnSignalStalkState = 0
       self.tap_direction = 0
@@ -606,12 +687,32 @@ class CarState(CarStateBase):
         e.type = t
         e.pressed = pressed
         return e
+
+      # XNOR/Unity parity:
+      # - Virtual decel/cancel presses (issued by our LONG/ACC stalk logic) must NOT lower vCruise,
+      #   otherwise the planner ceiling collapses and we never "resume" when the lead clears.
+      now_ms = int(time.monotonic_ns() // 1_000_000)
+      virt_btn = int(getattr(self, "_xnor_last_virtual_btn", 0) or 0)
+      virt_ms = int(getattr(self, "_xnor_last_virtual_ms", 0) or 0)
+      virt_prev = (prev == virt_btn) and (abs(now_ms - virt_ms) <= 1200)
+
       accel_vals = (4, 16)
       decel_vals = (8, 32)
-      if (prev in accel_vals) and (cur not in accel_vals): ret.buttonEvents.append(_be(ButtonType.accelCruise, False))
-      if (prev in decel_vals) and (cur not in decel_vals): ret.buttonEvents.append(_be(ButtonType.decelCruise, False))
-      if (prev == 1) and (cur != 1): ret.buttonEvents.append(_be(ButtonType.cancel, False))
-      if (prev == 2) and (cur != 2): ret.buttonEvents.append(_be(ButtonType.resumeCruise, False))
+
+      # Allow virtual accel/resume to raise vCruise toward the speed limit ceiling.
+      if (prev in accel_vals) and (cur not in accel_vals):
+        ret.buttonEvents.append(_be(ButtonType.accelCruise, False))
+
+      # Suppress ONLY virtual decel/cancel so vCruise stays at the max ceiling (Unity behavior).
+      if (not virt_prev) and (prev in decel_vals) and (cur not in decel_vals):
+        ret.buttonEvents.append(_be(ButtonType.decelCruise, False))
+
+      if (not virt_prev) and (prev == 1) and (cur != 1):
+        ret.buttonEvents.append(_be(ButtonType.cancel, False))
+
+      if (prev == 2) and (cur != 2):
+        ret.buttonEvents.append(_be(ButtonType.resumeCruise, False))
+
       self._prev_cruise_buttons = cur
     except Exception:
       pass
@@ -626,6 +727,60 @@ class CarState(CarStateBase):
     except Exception:
 
 
+      pass
+
+
+    # Unity parity: separate max cruise (planner/UI) from actual stock set speed when adaptive is enabled.
+    try:
+      prev_adapt = bool(getattr(self, "_prev_enable_adaptive_cruise", False))
+      now_adapt = bool(getattr(self, "enable_adaptive_cruise", False) or getattr(self, "enableACC", False))
+      uom = str(getattr(self, "speed_units", "MPH") or "MPH")
+      use_sl = bool(getattr(self._tinkla, "adjust_acc_with_speed_limit", False))
+      sl_target_ms = float(self._calc_speed_limit_target_ms(uom)) if use_sl else 0.0
+
+      # Unity parity: maintain a separate max cruise (planner/UI ceiling) so following a lead doesn't
+      # permanently lower vCruise.
+      if now_adapt:
+        actual_set_ms = float(getattr(self, "stock_cruise_set_speed_ms", 0.0) or 0.0)
+        if actual_set_ms <= 0.0:
+          actual_set_ms = float(ret.cruiseState.speed or 0.0)
+
+        if not prev_adapt:
+          # On engage, seed max from speed-limit (if available) else current set speed.
+          seed_ms = float(sl_target_ms) if sl_target_ms > 0.0 else float(actual_set_ms)
+          self.acc_speed_max_ms = float(max(float(ret.vEgoRaw), seed_ms, float(getattr(self, "acc_speed_max_ms", 0.0) or 0.0)))
+        else:
+          if sl_target_ms > 0.0:
+            # When speed-limit matching is active, keep max aligned to the current limit.
+            self.acc_speed_max_ms = float(max(float(ret.vEgoRaw), float(sl_target_ms)))
+          else:
+            # No valid limit: hold prior max (but never below current speed).
+            self.acc_speed_max_ms = float(max(float(ret.vEgoRaw), float(getattr(self, "acc_speed_max_ms", 0.0) or 0.0)))
+      else:
+        actual_set_ms = float(getattr(self, "stock_cruise_set_speed_ms", 0.0) or 0.0)
+        if actual_set_ms <= 0.0:
+          actual_set_ms = float(ret.cruiseState.speed or 0.0)
+        self.acc_speed_max_ms = 0.0
+
+      # Publish: cruiseState.speed = max cruise; cruiseState.speedCluster = actual Tesla set speed.
+      if now_adapt and (float(self.acc_speed_max_ms) > 0.1):
+        ret.cruiseState.speedCluster = max(float(actual_set_ms), 1e-3)
+        ret.cruiseState.speed = max(float(self.acc_speed_max_ms), 1e-3)
+
+        # XNOR longitudinal planner uses carState.vCruise (kph). Keep it at the ceiling while adaptive is enabled.
+
+        try:
+
+          ret.vCruise = float(self.acc_speed_max_ms) * CV.MS_TO_KPH
+
+        except Exception:
+
+          pass
+      else:
+        ret.cruiseState.speedCluster = max(float(ret.cruiseState.speed or 0.0), 1e-3)
+
+      self._prev_enable_adaptive_cruise = bool(now_adapt)
+    except Exception:
       pass
 
 
@@ -738,26 +893,65 @@ class CarState(CarStateBase):
     # Speed limit best-effort (needed for speed-limit matching)
     self._update_speed_limit(can_parsers)
 
-    stw = None
-    stw_bus = None
+    # Prefer the STW_ACTN_RQ instance that actually carries a changing follow-distance.
+    # Some harnesses/bus layouts mirror STW_ACTN_RQ onto multiple buses; a mirrored copy may pin DTR_Dist_Rq.
+    stw_candidates = []
     for bk in (Bus.party, Bus.chassis, Bus.pt, Bus.ap_party, Bus.ap_pt):
       _cp = can_parsers.get(bk)
       if _cp is None:
         continue
       try:
-        stw = _cp.vl["STW_ACTN_RQ"]
-        stw_bus = int(getattr(_cp, "bus", CANBUS.party))
-        break
+        _stw = _cp.vl["STW_ACTN_RQ"]
       except KeyError:
         continue
+      _bus = int(getattr(_cp, "bus", CANBUS.party))
+      _dtr = _stw.get("DTR_Dist_Rq", None)
+      try:
+        _dtr_i = int(_dtr) if _dtr is not None else None
+      except Exception:
+        _dtr_i = None
+      stw_candidates.append((_stw, _bus, _dtr_i))
+
+    stw = None
+    stw_bus = None
+    if stw_candidates:
+      changed = [c for c in stw_candidates if (c[2] is not None and c[2] != 255 and c[2] != getattr(self, "cruise_distance", 255))]
+      if changed:
+        stw, stw_bus, _ = changed[0]
+      else:
+        non_sna = [c for c in stw_candidates if (c[2] is not None and c[2] != 255)]
+        if non_sna:
+          stw, stw_bus, _ = non_sna[0]
+        else:
+          stw, stw_bus, _ = stw_candidates[0]
+
     if stw is not None:
       self.msg_stw_actn_req = copy.copy(stw)
       if stw_bus is not None:
-        self.stw_actn_bus = int(stw_bus)
+        self.stw_actn_bus = _safe_stw_tx_bus(int(stw_bus))
       self.cruise_buttons = int(stw.get("SpdCtrlLvr_Stat", 0))
+      # Unity parity: publish followDistanceS from stalk distance setting (DTR_Dist_Rq).
+      # Keep last valid value if the stalk message is missing/SNA this frame.
+      ret.followDistanceS = int(getattr(self, "_last_follow_distance_s", 6))
+
+      dtr_raw = stw.get("DTR_Dist_Rq", 255)
+      try:
+        dtr = int(dtr_raw) if dtr_raw is not None else 255
+      except (ValueError, TypeError):
+        dtr = 255
+
+      if dtr != 255:
+        # pos1=0, pos2=33, pos3=66, pos4=100, pos5=133, pos6=166, pos7=200, SNA=255
+        self.cruise_distance = dtr
+        follow_s = int(dtr / 33)
+        if 0 <= follow_s <= 6:
+          self._last_follow_distance_s = follow_s
+          ret.followDistanceS = follow_s
+
       raw_ts = int(stw.get("TurnIndLvr_Stat", 0))
       self.turnSignalStalkState = 0 if raw_ts == 3 else raw_ts
     else:
+      ret.followDistanceS = int(getattr(self, "_last_follow_distance_s", 6))
       self.cruise_buttons = 0
       self.turnSignalStalkState = 0
       self.tap_direction = 0
