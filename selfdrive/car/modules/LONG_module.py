@@ -94,11 +94,42 @@ class LongController:
       self._lead_drel = 0.0
       if bool(self._sm.valid.get("radarState", False)):
         rs = self._sm["radarState"]
-        lead = getattr(rs, "leadOne", None)
-        if lead is not None and bool(getattr(lead, "status", False)):
+        lead_one = getattr(rs, "leadOne", None)
+        lead_two = getattr(rs, "leadTwo", None)
+
+        def _as_tuple(lead) -> tuple[bool, float, float, float, float]:
+          if lead is None or not bool(getattr(lead, "status", False)):
+            return False, 0.0, 0.0, 0.0, 0.0
+          d_rel = float(getattr(lead, "dRel", 0.0) or 0.0)
+          v_rel = float(getattr(lead, "vRel", 0.0) or 0.0)
+          y_rel = float(getattr(lead, "yRel", 0.0) or 0.0)
+          model_prob = float(getattr(lead, "modelProb", 0.0) or 0.0)
+          return d_rel > 0.0, d_rel, v_rel, y_rel, model_prob
+
+        ok1, d1, v1, y1, p1 = _as_tuple(lead_one)
+        ok2, d2, v2, y2, p2 = _as_tuple(lead_two)
+
+        # Default: use leadOne, but if leadTwo is clearly more relevant (closer and/or closing more), use it.
+        choose_two = False
+        if ok2 and (not ok1):
+          choose_two = True
+        elif ok1 and ok2:
+          # Only switch when leadTwo is clearly "more dangerous" to avoid regressions.
+          if (d2 < (d1 - 4.0)) and (v2 < (v1 - 0.5)):
+            choose_two = True
+          elif (d2 < (d1 - 8.0)):
+            choose_two = True
+          elif (p2 > (p1 + 0.35)) and (d2 < (d1 - 3.0)):
+            choose_two = True
+
+        if choose_two:
           self._lead_present = True
-          self._lead_vrel = float(getattr(lead, "vRel", 0.0) or 0.0)
-          self._lead_drel = float(getattr(lead, "dRel", 0.0) or 0.0)
+          self._lead_drel = d2
+          self._lead_vrel = v2
+        elif ok1:
+          self._lead_present = True
+          self._lead_drel = d1
+          self._lead_vrel = v1
     except Exception:
       pass
       return
@@ -182,11 +213,11 @@ class LongController:
       lead_drel = float(getattr(self, "_lead_drel", 0.0) or 0.0)
       lead_vrel = float(getattr(self, "_lead_vrel", 0.0) or 0.0)
 
-      # Only allow speeding up with a lead if the planner is not asking us to slow down already.
-      planner_ok_to_accel = (not lp_fresh) or (float(self._lp_target_ms or 0.0) >= (float(v_ego_ms) - 0.25))
+      # Allow lead pull-away accel unless the planner is demanding a clear decel right now.
+      planner_demands_decel = bool(lp_fresh and (float(self._lp_target_ms or 0.0) < (float(v_ego_ms) - 0.80)))
 
       # Lead pulling away and gap comfortably above target: raise toward lead speed (never above limit).
-      if planner_ok_to_accel and (lead_vrel > 0.30) and (lead_drel > (desired_gap_m + 6.0)):
+      if (not planner_demands_decel) and (lead_vrel > 0.30) and (lead_drel > (desired_gap_m + 6.0)):
         pull_target_ms = float(min(float(speed_limit_target_ms), float(lead_speed_ms)))
         if pull_target_ms > desired_ms:
           desired_ms = pull_target_ms

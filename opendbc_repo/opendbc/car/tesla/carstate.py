@@ -40,6 +40,8 @@ class CarState(CarStateBase):
     # Follow-distance (DTR_Dist_Rq) can be intermittently missing/SNA; keep last valid.
     self.cruise_distance = int(getattr(self, "cruise_distance", 255))
     self._last_follow_distance_s = int(getattr(self, "_last_follow_distance_s", 6))
+    # Remember which STW_ACTN_RQ bus actually carries valid DTR_Dist_Rq, to avoid mirrored/pinned copies.
+    self._follow_stw_bus = getattr(self, "_follow_stw_bus", None)
     self.can_define = CANDefine(DBC[CP.carFingerprint][Bus.party])
 
     if self.CP.carFingerprint in LEGACY_CARS:
@@ -511,18 +513,29 @@ class CarState(CarStateBase):
     stw = None
     stw_bus = None
     if stw_candidates:
-      # 1) If any candidate shows a *change* vs last frame and is not SNA, pick it.
-      changed = [c for c in stw_candidates if (c[2] is not None and c[2] != 255 and c[2] != getattr(self, "cruise_distance", 255))]
-      if changed:
-        stw, stw_bus, _ = changed[0]
-      else:
-        # 2) Otherwise, pick the first non-SNA distance candidate (if any).
-        non_sna = [c for c in stw_candidates if (c[2] is not None and c[2] != 255)]
-        if non_sna:
-          stw, stw_bus, _ = non_sna[0]
+      # Prefer a previously-working bus for follow-distance, if still available.
+      follow_bus = getattr(self, "_follow_stw_bus", None)
+      if follow_bus is not None:
+        for _stw, _bus, _dtr_i in stw_candidates:
+          if int(_bus) == int(follow_bus):
+            stw = _stw
+            stw_bus = _bus
+            break
+
+      # Otherwise pick the STW_ACTN_RQ instance that actually carries a changing follow-distance.
+      if stw is None:
+        # 1) If any candidate shows a *change* vs last frame and is not SNA, pick it.
+        changed = [c for c in stw_candidates if (c[2] is not None and c[2] != 255 and c[2] != getattr(self, "cruise_distance", 255))]
+        if changed:
+          stw, stw_bus, _ = changed[0]
         else:
-          # 3) Fallback: first available STW_ACTN_RQ.
-          stw, stw_bus, _ = stw_candidates[0]
+          # 2) Otherwise, pick the first non-SNA dtr candidate (if any).
+          non_sna = [c for c in stw_candidates if (c[2] is not None and c[2] != 255)]
+          if non_sna:
+            stw, stw_bus, _ = non_sna[0]
+          else:
+            # 3) Fallback: first available STW_ACTN_RQ.
+            stw, stw_bus, _ = stw_candidates[0]
 
     if stw is not None:
       # Seed virtual stalk from a known-good party-bus STW frame when available.
@@ -547,6 +560,8 @@ class CarState(CarStateBase):
         dtr = 255
 
       if dtr != 255:
+        # Remember the bus that carries valid follow-distance.
+        self._follow_stw_bus = int(stw_bus) if stw_bus is not None else getattr(self, "_follow_stw_bus", None)
         # pos1=0, pos2=33, pos3=66, pos4=100, pos5=133, pos6=166, pos7=200, SNA=255
         self.cruise_distance = dtr
         follow_s = int(dtr / 33)
