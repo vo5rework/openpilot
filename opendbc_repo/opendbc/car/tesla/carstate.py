@@ -17,38 +17,6 @@ from opendbc.car.tesla.values import DBC, CANBUS, GEAR_MAP, STEER_THRESHOLD, CAR
 ButtonType = structs.CarState.ButtonEvent.Type
 
 
-def _safe_stw_tx_bus(bus: int | None) -> int:
-  """Return a TX-capable bus for STW action injection.
-
-  Some setups mirror STW_ACTN_RQ on secondary panda sources (e.g. 128+bus).
-  These src values are valid for RX, but *not necessarily* valid TX targets in
-  this port (CarController typically only packs/sends on primary buses).
-
-  We:
-    - map src>=128 -> (src-128)
-    - clamp to known CANBUS values
-    - fall back to CANBUS.party
-  """
-  if bus is None:
-    return int(CANBUS.party)
-  try:
-    b = int(bus)
-  except Exception:
-    return int(CANBUS.party)
-
-  if b >= 128:
-    b -= 128
-
-  valid = {
-    int(getattr(CANBUS, "party", 0)),
-    int(getattr(CANBUS, "chassis", getattr(CANBUS, "party", 0))),
-    int(getattr(CANBUS, "powertrain", getattr(CANBUS, "party", 0))),
-    int(getattr(CANBUS, "autopilot_party", getattr(CANBUS, "party", 0))),
-    int(getattr(CANBUS, "autopilot_powertrain", getattr(CANBUS, "autopilot_party", getattr(CANBUS, "party", 0)))),
-  }
-  return int(b) if int(b) in valid else int(CANBUS.party)
-
-
 @dataclass
 class _TinklaConfig:
   autopilot_disabled: bool = False
@@ -559,11 +527,22 @@ class CarState(CarStateBase):
     if stw is not None:
       self.msg_stw_actn_req = copy.copy(stw)
       if stw_bus is not None:
-        self.stw_actn_bus = _safe_stw_tx_bus(int(stw_bus))
+        # Keep the read bus for diagnostics
+        self.stw_actn_read_bus = int(stw_bus)
+        # TX bus must be on a real bus (mirrored busses like 130 cause CAN errors)
+        tx_bus = int(stw_bus)
+        if tx_bus >= 128:
+          tx_bus -= 128
+        if tx_bus not in (int(CANBUS.party), int(CANBUS.radar), int(CANBUS.autopilot_party)):
+          tx_bus = int(CANBUS.party)
+        self.stw_actn_bus = tx_bus
       self.cruise_buttons = int(stw.get("SpdCtrlLvr_Stat", 0))
       # Unity parity: publish followDistanceS from stalk distance setting (DTR_Dist_Rq).
       # Keep last valid value if the stalk message is missing/SNA this frame.
-      ret.followDistanceS = self._last_follow_distance_s
+      try:
+        ret.followDistanceS = self._last_follow_distance_s
+      except AttributeError:
+        pass
 
       dtr_raw = stw.get("DTR_Dist_Rq", 255)
       try:
@@ -577,13 +556,19 @@ class CarState(CarStateBase):
         follow_s = int(dtr / 33)
         if 0 <= follow_s <= 6:
           self._last_follow_distance_s = follow_s
-          ret.followDistanceS = follow_s
+          try:
+            ret.followDistanceS = follow_s
+          except AttributeError:
+            pass
 
 
       raw_ts = int(stw.get("TurnIndLvr_Stat", 0))
       self.turnSignalStalkState = 0 if raw_ts == 3 else raw_ts
     else:
-      ret.followDistanceS = self._last_follow_distance_s
+      try:
+        ret.followDistanceS = self._last_follow_distance_s
+      except AttributeError:
+        pass
       self.cruise_buttons = 0
       self.turnSignalStalkState = 0
       self.tap_direction = 0
@@ -928,11 +913,22 @@ class CarState(CarStateBase):
     if stw is not None:
       self.msg_stw_actn_req = copy.copy(stw)
       if stw_bus is not None:
-        self.stw_actn_bus = _safe_stw_tx_bus(int(stw_bus))
+        # Keep the read bus for diagnostics
+        self.stw_actn_read_bus = int(stw_bus)
+        # TX bus must be on a real bus (mirrored busses like 130 cause CAN errors)
+        tx_bus = int(stw_bus)
+        if tx_bus >= 128:
+          tx_bus -= 128
+        if tx_bus not in (int(CANBUS.party), int(CANBUS.radar), int(CANBUS.autopilot_party)):
+          tx_bus = int(CANBUS.party)
+        self.stw_actn_bus = tx_bus
       self.cruise_buttons = int(stw.get("SpdCtrlLvr_Stat", 0))
       # Unity parity: publish followDistanceS from stalk distance setting (DTR_Dist_Rq).
       # Keep last valid value if the stalk message is missing/SNA this frame.
-      ret.followDistanceS = int(getattr(self, "_last_follow_distance_s", 6))
+      try:
+        ret.followDistanceS = int(getattr(self, "_last_follow_distance_s", 6))
+      except AttributeError:
+        pass
 
       dtr_raw = stw.get("DTR_Dist_Rq", 255)
       try:
@@ -946,12 +942,18 @@ class CarState(CarStateBase):
         follow_s = int(dtr / 33)
         if 0 <= follow_s <= 6:
           self._last_follow_distance_s = follow_s
-          ret.followDistanceS = follow_s
+          try:
+            ret.followDistanceS = follow_s
+          except AttributeError:
+            pass
 
       raw_ts = int(stw.get("TurnIndLvr_Stat", 0))
       self.turnSignalStalkState = 0 if raw_ts == 3 else raw_ts
     else:
-      ret.followDistanceS = int(getattr(self, "_last_follow_distance_s", 6))
+      try:
+        ret.followDistanceS = int(getattr(self, "_last_follow_distance_s", 6))
+      except AttributeError:
+        pass
       self.cruise_buttons = 0
       self.turnSignalStalkState = 0
       self.tap_direction = 0

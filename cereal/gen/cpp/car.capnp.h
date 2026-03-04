@@ -1013,6 +1013,8 @@ public:
 
   inline bool getBlockPcmEnable() const;
 
+  inline  ::uint8_t getFollowDistanceS() const;
+
 private:
   ::capnp::_::StructReader _reader;
   template <typename, ::capnp::Kind>
@@ -1249,6 +1251,9 @@ public:
 
   inline bool getBlockPcmEnable();
   inline void setBlockPcmEnable(bool value);
+
+  inline  ::uint8_t getFollowDistanceS();
+  inline void setFollowDistanceS( ::uint8_t value);
 
 private:
   ::capnp::_::StructBuilder _builder;
@@ -5285,6 +5290,20 @@ inline bool CarState::Builder::getBlockPcmEnable() {
 inline void CarState::Builder::setBlockPcmEnable(bool value) {
   _builder.setDataField<bool>(
       ::capnp::bounded<371>() * ::capnp::ELEMENTS, value);
+}
+
+inline  ::uint8_t CarState::Reader::getFollowDistanceS() const {
+  return _reader.getDataField< ::uint8_t>(
+      ::capnp::bounded<47>() * ::capnp::ELEMENTS);
+}
+
+inline  ::uint8_t CarState::Builder::getFollowDistanceS() {
+  return _builder.getDataField< ::uint8_t>(
+      ::capnp::bounded<47>() * ::capnp::ELEMENTS);
+}
+inline void CarState::Builder::setFollowDistanceS( ::uint8_t value) {
+  _builder.setDataField< ::uint8_t>(
+      ::capnp::bounded<47>() * ::capnp::ELEMENTS, value);
 }
 
 inline float CarState::WheelSpeeds::Reader::getFl() const {

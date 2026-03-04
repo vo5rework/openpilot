@@ -219,6 +219,9 @@ struct CarState {
   rightBlinker @21 :Bool;
   genericToggle @23 :Bool;
 
+  # Tesla follow distance setting (0..6). 255 means unknown/SNA.
+  followDistanceS @61 :UInt8;
+
   # lock info
   doorOpen @24 :Bool;           # ideally includes all doors
   seatbeltUnlatched @25 :Bool;  # driver seatbelt
