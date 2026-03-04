@@ -164,6 +164,40 @@ class LongController:
       # Safety: if we can't see longitudinalPlan but radar reports a lead, don't increase set speed.
       desired_ms = float(min(desired_ms, current_set_ms))
       src = "sl+lead_hold"
+
+    # Unity parity: if the planner ceiling is limited by stock set speed, we still need to
+    # speed back up with the lead as the gap opens (and slow down if we close) while a lead exists.
+    # This logic is intentionally conservative and only applies when radar reports a valid lead.
+    if bool(getattr(self, "_lead_present", False)) and (v_ego_ms > 0.1):
+      try:
+        fd = int(getattr(cs_out, "followDistanceS", 255) or 255)
+      except Exception:
+        fd = 255
+      if not (0 <= fd <= 6):
+        fd = 3  # mid default when unknown
+      t_follow = 0.7 + (0.2 * float(fd))
+      desired_gap_m = max(5.0, float(v_ego_ms) * t_follow)
+
+      lead_speed_ms = max(0.0, float(v_ego_ms) + float(getattr(self, "_lead_vrel", 0.0) or 0.0))
+      lead_drel = float(getattr(self, "_lead_drel", 0.0) or 0.0)
+      lead_vrel = float(getattr(self, "_lead_vrel", 0.0) or 0.0)
+
+      # Only allow speeding up with a lead if the planner is not asking us to slow down already.
+      planner_ok_to_accel = (not lp_fresh) or (float(self._lp_target_ms or 0.0) >= (float(v_ego_ms) - 0.25))
+
+      # Lead pulling away and gap comfortably above target: raise toward lead speed (never above limit).
+      if planner_ok_to_accel and (lead_vrel > 0.30) and (lead_drel > (desired_gap_m + 6.0)):
+        pull_target_ms = float(min(float(speed_limit_target_ms), float(lead_speed_ms)))
+        if pull_target_ms > desired_ms:
+          desired_ms = pull_target_ms
+          src = f"{src}+lead_pull"
+
+      # Lead slowing and gap below target: lower toward lead speed (never below min cruise).
+      if (lead_vrel < -0.30) and (lead_drel < (desired_gap_m + 2.0)):
+        brake_target_ms = float(max(float(self.MIN_CRUISE_SPEED_MS), float(lead_speed_ms)))
+        if brake_target_ms < desired_ms:
+          desired_ms = brake_target_ms
+          src = f"{src}+lead_brake"
     # When longitudinalPlan is fresh, bypass smoothing for responsive lead handling.
     if lp_fresh:
       self._smooth_target_ms = float(desired_ms)

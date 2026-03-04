@@ -868,41 +868,74 @@ class CarState(CarStateBase):
     # Speed limit best-effort (needed for speed-limit matching)
     self._update_speed_limit(can_parsers)
 
-    stw = None
-    stw_bus = None
+    stw_candidates = []
     for bk in (Bus.party, Bus.chassis, Bus.pt, Bus.ap_party, Bus.ap_pt):
       _cp = can_parsers.get(bk)
       if _cp is None:
         continue
       try:
-        stw = _cp.vl["STW_ACTN_RQ"]
-        stw_bus = int(getattr(_cp, "bus", CANBUS.party))
-        break
+        _stw = _cp.vl["STW_ACTN_RQ"]
       except KeyError:
         continue
+      _bus = int(getattr(_cp, "bus", CANBUS.party))
+      _dtr = _stw.get("DTR_Dist_Rq", None)
+      try:
+        _dtr_i = int(_dtr) if _dtr is not None else None
+      except Exception:
+        _dtr_i = None
+      stw_candidates.append((_stw, _bus, _dtr_i))
+
+    stw = None
+    if stw_candidates:
+      # Prefer the instance that actually carries a changing follow-distance.
+      changed = [c for c in stw_candidates if (c[2] is not None and c[2] != 255 and c[2] != getattr(self, "cruise_distance", 255))]
+      if changed:
+        stw, _stw_bus, _ = changed[0]
+      else:
+        non_sna = [c for c in stw_candidates if (c[2] is not None and c[2] != 255)]
+        if non_sna:
+          stw, _stw_bus, _ = non_sna[0]
+        else:
+          stw, _stw_bus, _ = stw_candidates[0]
+
     if stw is not None:
-      self.msg_stw_actn_req = copy.copy(stw)
+      # Seed virtual stalk from a known-good party-bus STW frame when available.
+      stw_seed = stw
+      for _stw, _bus, _dtr_i in stw_candidates:
+        if int(_bus) == int(CANBUS.party):
+          stw_seed = _stw
+          break
+
+      self.msg_stw_actn_req = copy.copy(stw_seed)
       # Never transmit on CANBUS.radar (bus 1). Keep TX on CANBUS.party to avoid CAN errors.
       self.stw_actn_bus = int(CANBUS.party)
-      self.cruise_buttons = int(stw.get("SpdCtrlLvr_Stat", 0))
-      # Unity parity: publish followDistanceS from stalk distance setting (DTR_Dist_Rq).
-      ret.followDistanceS = 255
-      try:
-        dtr = stw.get("DTR_Dist_Rq", 255)
-        self.cruise_distance = int(dtr) if dtr is not None else 255
-        if self.cruise_distance != 255:
-          # pos1=0, pos2=33, pos3=66, pos4=100, pos5=133, pos6=166, pos7=200, SNA=255
-          ret.followDistanceS = int(self.cruise_distance / 33)
-      except Exception:
-        self.cruise_distance = 255
+      self.cruise_buttons = int(stw_seed.get("SpdCtrlLvr_Stat", 0))
 
-      raw_ts = int(stw.get("TurnIndLvr_Stat", 0))
+      # Unity parity: publish followDistanceS from stalk distance setting (DTR_Dist_Rq).
+      # Keep last valid value if the stalk message is missing/SNA this frame.
+      ret.followDistanceS = int(getattr(self, "_last_follow_distance_s", 6))
+
+      dtr_raw = stw.get("DTR_Dist_Rq", 255)
+      try:
+        dtr = int(dtr_raw) if dtr_raw is not None else 255
+      except Exception:
+        dtr = 255
+
+      self.cruise_distance = dtr
+      follow_s = int(dtr / 33) if dtr != 255 else 255
+      if 0 <= follow_s <= 6:
+        self._last_follow_distance_s = follow_s
+        ret.followDistanceS = follow_s
+
+      raw_ts = int(stw_seed.get("TurnIndLvr_Stat", 0))
       self.turnSignalStalkState = 0 if raw_ts == 3 else raw_ts
     else:
+      ret.followDistanceS = int(getattr(self, "_last_follow_distance_s", 6))
       self.cruise_buttons = 0
       self.turnSignalStalkState = 0
       self.tap_direction = 0
       self.blinker_controller.tap_direction = 0
+
 
 
     if self.autopilot_disabled:
