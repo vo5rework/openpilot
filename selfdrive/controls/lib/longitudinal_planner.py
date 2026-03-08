@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+import inspect
 import math
 import numpy as np
 
@@ -7,45 +8,69 @@ from opendbc.car.interfaces import ACCEL_MIN, ACCEL_MAX
 from openpilot.common.constants import CV
 from openpilot.common.filter_simple import FirstOrderFilter
 from openpilot.common.realtime import DT_MDL
-from openpilot.selfdrive.modeld.constants import ModelConstants
+from openpilot.common.swaglog import cloudlog
+from openpilot.selfdrive.car.cruise import V_CRUISE_MAX, V_CRUISE_UNSET
+from openpilot.selfdrive.controls.lib.drive_helpers import CONTROL_N, get_accel_from_plan
 from openpilot.selfdrive.controls.lib.longcontrol import LongCtrlState
 from openpilot.selfdrive.controls.lib.longitudinal_mpc_lib.long_mpc import LongitudinalMpc
 from openpilot.selfdrive.controls.lib.longitudinal_mpc_lib.long_mpc import T_IDXS as T_IDXS_MPC
-from openpilot.selfdrive.controls.lib.drive_helpers import CONTROL_N, get_accel_from_plan
-from openpilot.selfdrive.car.cruise import V_CRUISE_MAX, V_CRUISE_UNSET
-from openpilot.common.swaglog import cloudlog
-from openpilot.common.params import Params
+from openpilot.selfdrive.modeld.constants import ModelConstants
 
-LON_MPC_STEP = 0.2  # first step is 0.2s
+LON_MPC_STEP = 0.2
 A_CRUISE_MAX_VALS = [1.6, 1.2, 0.8, 0.6]
-A_CRUISE_MAX_BP = [0., 10.0, 25., 40.]
+A_CRUISE_MAX_BP = [0.0, 10.0, 25.0, 40.0]
 CONTROL_N_T_IDX = ModelConstants.T_IDXS[:CONTROL_N]
 ALLOW_THROTTLE_THRESHOLD = 0.4
 MIN_ALLOW_THROTTLE_SPEED = 2.5
+MAX_VEL_ERR = 5.0
 
-# Lookup table for turns
 _A_TOTAL_MAX_V = [1.7, 3.2]
-_A_TOTAL_MAX_BP = [20., 40.]
+_A_TOTAL_MAX_BP = [20.0, 40.0]
+
+CURVE_PEAK_THRESHOLD = 0.0020
+AREA_THRESHOLD = 0.012
+VISION_CURVE_TARGET_LAT_A = 2.1
 
 
-def get_max_accel(v_ego):
-  return np.interp(v_ego, A_CRUISE_MAX_BP, A_CRUISE_MAX_VALS)
-
-def get_coast_accel(pitch):
-  return np.sin(pitch) * -5.65 - 0.3  # fitted from data using xx/projects/allow_throttle/compute_coast_accel.py
+def get_max_accel(v_ego: float) -> float:
+  return float(np.interp(v_ego, A_CRUISE_MAX_BP, A_CRUISE_MAX_VALS))
 
 
-def limit_accel_in_turns(v_ego, angle_steers, a_target, CP):
-  """
-  This function returns a limited long acceleration allowed, depending on the existing lateral acceleration
-  this should avoid accelerating when losing the target in turns
-  """
-  # FIXME: This function to calculate lateral accel is incorrect and should use the VehicleModel
-  # The lookup table for turns should also be updated if we do this
+def get_coast_accel(pitch: float) -> float:
+  return float(np.sin(pitch) * -5.65 - 0.3)
+
+
+def get_speed_error(model_msg, v_ego: float) -> float:
+  try:
+    temporal_pose = getattr(model_msg, "temporalPose", None)
+    if temporal_pose is not None:
+      trans = getattr(temporal_pose, "trans", [])
+      if len(trans):
+        vel_err = np.clip(float(trans[0]) - float(v_ego), -MAX_VEL_ERR, MAX_VEL_ERR)
+        return float(vel_err)
+  except Exception:
+    pass
+  try:
+    if len(model_msg.velocity.x):
+      vel_err = np.clip(float(model_msg.velocity.x[0]) - float(v_ego), -MAX_VEL_ERR, MAX_VEL_ERR)
+      return float(vel_err)
+  except Exception:
+    pass
+  return 0.0
+
+
+def _rate_limited_filter(filt: FirstOrderFilter, new_x: float, rc_up: float, rc_down: float) -> float:
+  if new_x < filt.x:
+    filt.update_alpha(rc_down)
+  else:
+    filt.update_alpha(rc_up)
+  return float(filt.update(new_x))
+
+
+def limit_accel_in_turns(v_ego: float, angle_steers: float, a_target, CP):
   a_total_max = np.interp(v_ego, _A_TOTAL_MAX_BP, _A_TOTAL_MAX_V)
   a_y = v_ego ** 2 * angle_steers * CV.DEG_TO_RAD / (CP.steerRatio * CP.wheelbase)
-  a_x_allowed = math.sqrt(max(a_total_max ** 2 - a_y ** 2, 0.))
-
+  a_x_allowed = math.sqrt(max(a_total_max ** 2 - a_y ** 2, 0.0))
   return [a_target[0], min(a_target[1], a_x_allowed)]
 
 
@@ -53,17 +78,16 @@ class LongitudinalPlanner:
   def __init__(self, CP, init_v=0.0, init_a=0.0, dt=DT_MDL):
     self.CP = CP
     self.mpc = LongitudinalMpc(dt=dt)
-    # TODO remove mpc modes when TR released
-    self.mpc.mode = 'acc'
+    mpc_update_params = tuple(inspect.signature(self.mpc.update).parameters.keys())
+    self._mpc_update_first_param = mpc_update_params[0] if len(mpc_update_params) > 0 else ""
+    self._mpc_update_accepts_carstate = "carstate" in mpc_update_params
+    self._mpc_update_accepts_t_follow_override = "t_follow_override" in mpc_update_params
+    set_weights_params = tuple(inspect.signature(self.mpc.set_weights).parameters.keys())
+    self._mpc_set_weights_accepts_custom = "weights" in set_weights_params
+    self.mpc.mode = "acc"
     self.fcw = False
     self.dt = dt
     self.allow_throttle = True
-
-
-
-    self._tinkla_params = Params()
-    self._t_follow_override: float | None = None
-
 
     self.a_desired = init_a
     self.v_desired_filter = FirstOrderFilter(init_v, 2.0, self.dt)
@@ -76,112 +100,185 @@ class LongitudinalPlanner:
     self.j_desired_trajectory = np.zeros(CONTROL_N)
     self.solverExecutionTime = 0.0
 
+    self.v_turn_filter = FirstOrderFilter(init_v, 0.2, self.dt)
+    self.curve_detected = False
+    self.v_model_error = 0.0
+
   @staticmethod
-  def parse_model(model_msg):
-    if (len(model_msg.position.x) == ModelConstants.IDX_N and
-      len(model_msg.velocity.x) == ModelConstants.IDX_N and
-      len(model_msg.acceleration.x) == ModelConstants.IDX_N):
-      x = np.interp(T_IDXS_MPC, ModelConstants.T_IDXS, model_msg.position.x)
-      v = np.interp(T_IDXS_MPC, ModelConstants.T_IDXS, model_msg.velocity.x)
+  def parse_model(model_msg, model_error: float, v_ego: float, v_turn_filter: FirstOrderFilter):
+    x = np.zeros(len(T_IDXS_MPC))
+    v = np.zeros(len(T_IDXS_MPC))
+    a = np.zeros(len(T_IDXS_MPC))
+    j = np.zeros(len(T_IDXS_MPC))
+
+    if (
+      len(model_msg.position.x) == ModelConstants.IDX_N
+      and len(model_msg.velocity.x) == ModelConstants.IDX_N
+      and len(model_msg.acceleration.x) == ModelConstants.IDX_N
+    ):
+      x = np.interp(T_IDXS_MPC, ModelConstants.T_IDXS, model_msg.position.x) - model_error * T_IDXS_MPC
+      v_raw = np.interp(T_IDXS_MPC, ModelConstants.T_IDXS, model_msg.velocity.x)
       a = np.interp(T_IDXS_MPC, ModelConstants.T_IDXS, model_msg.acceleration.x)
-      j = np.zeros(len(T_IDXS_MPC))
-    else:
-      x = np.zeros(len(T_IDXS_MPC))
-      v = np.zeros(len(T_IDXS_MPC))
-      a = np.zeros(len(T_IDXS_MPC))
-      j = np.zeros(len(T_IDXS_MPC))
-    if len(model_msg.meta.disengagePredictions.gasPressProbs) > 1:
-      throttle_prob = model_msg.meta.disengagePredictions.gasPressProbs[1]
-    else:
-      throttle_prob = 1.0
-    return x, v, a, j, throttle_prob
+
+      v_corrected = np.maximum(v_raw, max(0.0, v_ego - 1.5)) - model_error
+
+      if len(model_msg.orientationRate.z) == ModelConstants.IDX_N:
+        raw_curv = np.abs(np.interp(T_IDXS_MPC, ModelConstants.T_IDXS, model_msg.orientationRate.z)) / np.clip(v_corrected, 0.3, 100.0)
+        num_idx = len(raw_curv)
+        far_start = min(10, max(0, num_idx - 1))
+        far_end = min(32, num_idx)
+        far_curv_peak = float(np.max(raw_curv[far_start:far_end])) if far_end > far_start else 0.0
+        anticipatory_slowdown = float(np.interp(far_curv_peak, [0.0008, 0.003], [1.0, 0.78]))
+
+        curve_area = float(np.sum(raw_curv[:25]) * LON_MPC_STEP)
+        max_curv_ahead = float(np.max(raw_curv[2:20])) if num_idx > 2 else 0.0
+        curve_detected = (curve_area > AREA_THRESHOLD) or (max_curv_ahead > CURVE_PEAK_THRESHOLD)
+
+        if curve_detected:
+          lat_stress_factor = float((v_ego ** 2) * max_curv_ahead)
+          torque_multiplier = float(np.interp(lat_stress_factor, [0.015, 0.05], [1.0, 0.65]))
+          dynamic_multiplier = float(np.interp(max_curv_ahead, [0.0015, 0.008], [1.0, 0.70]))
+          max_v_curve = dynamic_multiplier * torque_multiplier * anticipatory_slowdown * math.sqrt(max(VISION_CURVE_TARGET_LAT_A / (max_curv_ahead + 1e-4), 0.0))
+
+          if hasattr(v_turn_filter, "k"):
+            try:
+              v_turn_filter.k = 15.0 if max_v_curve < float(v_turn_filter.x) else 0.3
+              v_curve = float(v_turn_filter.update(max_v_curve))
+            except Exception:
+              v_curve = _rate_limited_filter(v_turn_filter, max_v_curve, rc_up=0.3, rc_down=0.05)
+          else:
+            v_curve = _rate_limited_filter(v_turn_filter, max_v_curve, rc_up=0.3, rc_down=0.05)
+
+          v = np.minimum(v_curve, v_corrected)
+          return x, v, a, j, True
+
+        v = v_corrected
+        if anticipatory_slowdown < 1.0:
+          v = np.minimum(v * anticipatory_slowdown, v)
+
+        return x, v, a, j, bool(anticipatory_slowdown < 0.98)
+
+      v = v_corrected
+
+    return x, v, a, j, False
+
 
   def update(self, sm):
-    mode = 'blended' if sm['selfdriveState'].experimentalMode else 'acc'
+    controls_state = sm["controlsState"]
+    selfdrive_state = sm["selfdriveState"]
 
-    if len(sm['carControl'].orientationNED) == 3:
-      accel_coast = get_coast_accel(sm['carControl'].orientationNED[1])
+    experimental_mode = bool(getattr(controls_state, "experimentalMode", getattr(selfdrive_state, "experimentalMode", False)))
+    enabled_state = bool(getattr(controls_state, "enabled", getattr(selfdrive_state, "enabled", False)))
+    personality = getattr(selfdrive_state, "personality", getattr(self, "personality", 0))
+
+    mode = "blended" if experimental_mode else "acc"
+
+    if len(sm["carControl"].orientationNED) == 3:
+      accel_coast = get_coast_accel(sm["carControl"].orientationNED[1])
     else:
       accel_coast = ACCEL_MAX
 
-    v_ego = sm['carState'].vEgo
-    v_cruise_kph = min(sm['carState'].vCruise, V_CRUISE_MAX)
+    v_ego = sm["carState"].vEgo
+
+    controls_v_cruise = float(getattr(controls_state, "vCruise", 0.0) or 0.0)
+    if 0.1 < controls_v_cruise < float(V_CRUISE_UNSET):
+      v_cruise_kph = min(controls_v_cruise, float(V_CRUISE_MAX))
+    else:
+      v_cruise_kph = min(float(sm["carState"].vCruise), float(V_CRUISE_MAX))
     v_cruise = v_cruise_kph * CV.KPH_TO_MS
-    v_cruise_initialized = sm['carState'].vCruise != V_CRUISE_UNSET
+    v_cruise_initialized = (v_cruise_kph > 0.1) and (v_cruise_kph < float(V_CRUISE_UNSET))
 
-    long_control_off = sm['controlsState'].longControlState == LongCtrlState.off
-    force_slow_decel = sm['controlsState'].forceDecel
+    long_control_off = controls_state.longControlState == LongCtrlState.off
+    force_slow_decel = bool(getattr(controls_state, "forceDecel", False))
 
-    # Reset current state when not engaged, or user is controlling the speed
-    reset_state = long_control_off if self.CP.openpilotLongitudinalControl else not sm['selfdriveState'].enabled
-    # PCM cruise speed may be updated a few cycles later, check if initialized
-    reset_state = reset_state or not v_cruise_initialized
+    reset_state = long_control_off if self.CP.openpilotLongitudinalControl else not enabled_state
+    if self.CP.brand != "tesla":
+      reset_state = reset_state or not v_cruise_initialized
+    prev_accel_constraint = not (reset_state or sm["carState"].standstill)
 
-    # No change cost when user is controlling the speed, or when standstill
-    prev_accel_constraint = not (reset_state or sm['carState'].standstill)
-
-    if mode == 'acc':
+    if mode == "acc":
       accel_clip = [ACCEL_MIN, get_max_accel(v_ego)]
-      steer_angle_without_offset = sm['carState'].steeringAngleDeg - sm['liveParameters'].angleOffsetDeg
-      accel_clip = limit_accel_in_turns(v_ego, steer_angle_without_offset, accel_clip, self.CP)
+      steer_angle_without_offset = sm["carState"].steeringAngleDeg - sm["liveParameters"].angleOffsetDeg
+      accel_clip_turns = limit_accel_in_turns(v_ego, steer_angle_without_offset, accel_clip, self.CP)
     else:
       accel_clip = [ACCEL_MIN, ACCEL_MAX]
+      accel_clip_turns = list(accel_clip)
 
     if reset_state:
       self.v_desired_filter.x = v_ego
-      # Clip aEgo to cruise limits to prevent large accelerations when becoming active
-      self.a_desired = np.clip(sm['carState'].aEgo, accel_clip[0], accel_clip[1])
+      self.a_desired = np.clip(sm["carState"].aEgo, accel_clip[0], accel_clip[1])
 
-    # Prevent divergence, smooth in current v_ego
     self.v_desired_filter.x = max(0.0, self.v_desired_filter.update(v_ego))
-    x, v, a, j, throttle_prob = self.parse_model(sm['modelV2'])
-    # Don't clip at low speeds since throttle_prob doesn't account for creep
+    self.v_model_error = get_speed_error(sm["modelV2"], v_ego)
+    x, v, a, j, self.curve_detected = self.parse_model(sm["modelV2"], self.v_model_error, v_ego, self.v_turn_filter)
+
+    throttle_prob = 1.0
+    try:
+      if len(sm["modelV2"].meta.disengagePredictions.gasPressProbs) > 1:
+        throttle_prob = float(sm["modelV2"].meta.disengagePredictions.gasPressProbs[1])
+    except Exception:
+      throttle_prob = 1.0
     self.allow_throttle = throttle_prob > ALLOW_THROTTLE_THRESHOLD or v_ego <= MIN_ALLOW_THROTTLE_SPEED
 
     if not self.allow_throttle:
-      clipped_accel_coast = max(accel_coast, accel_clip[0])
-      clipped_accel_coast_interp = np.interp(v_ego, [MIN_ALLOW_THROTTLE_SPEED, MIN_ALLOW_THROTTLE_SPEED*2], [accel_clip[1], clipped_accel_coast])
-      accel_clip[1] = min(accel_clip[1], clipped_accel_coast_interp)
+      clipped_accel_coast = max(accel_coast, accel_clip_turns[0])
+      clipped_accel_coast_interp = np.interp(
+        v_ego,
+        [MIN_ALLOW_THROTTLE_SPEED, MIN_ALLOW_THROTTLE_SPEED * 2.0],
+        [accel_clip_turns[1], clipped_accel_coast],
+      )
+      accel_clip_turns[1] = min(accel_clip_turns[1], clipped_accel_coast_interp)
 
     if force_slow_decel:
       v_cruise = 0.0
-    if self.CP.brand == "tesla" and sm.frame % 50 == 0:
-      val = self._tinkla_params.get("TinklaFollowDistance", return_default=True)
-      try:
-        if isinstance(val, (bytes, bytearray)):
-          val = val.decode()
-        self._t_follow_override = float(val) if val is not None else None
-      except (TypeError, ValueError):
-        self._t_follow_override = None
-      if self._t_follow_override is not None:
-        self._t_follow_override = float(max(0.5, min(3.0, self._t_follow_override)))
 
+    if self.curve_detected and self._mpc_set_weights_accepts_custom:
+      self.mpc.set_weights(prev_accel_constraint, personality=personality, weights=[2.0, 5.0, 40.0])
+    else:
+      self.mpc.set_weights(prev_accel_constraint, personality=personality)
 
-    self.mpc.set_weights(prev_accel_constraint, personality=sm['selfdriveState'].personality)
+    if hasattr(self.mpc, "set_accel_limits"):
+      if self.curve_detected:
+        self.mpc.set_accel_limits(accel_clip_turns[0], min(self.a_desired - 0.3, -0.1))
+      else:
+        self.mpc.set_accel_limits(accel_clip_turns[0], accel_clip_turns[1])
+
     self.mpc.set_cur_state(self.v_desired_filter.x, self.a_desired)
-    self.mpc.update(sm['radarState'], v_cruise, x, v, a, j, personality=sm['selfdriveState'].personality, t_follow_override=self._t_follow_override)
+
+    v_target = v if self.curve_detected else np.maximum(v, max(0.0, float(v_cruise) - 0.1))
+
+    if self._mpc_update_first_param == "carstate":
+      self.mpc.update(sm["carState"], sm["radarState"], v_cruise, x, v_target, a, j, personality=personality)
+    else:
+      update_kwargs = {"personality": personality}
+      if self._mpc_update_accepts_carstate:
+        update_kwargs["carstate"] = sm["carState"]
+      self.mpc.update(sm["radarState"], v_cruise, x, v_target, a, j, **update_kwargs)
 
     self.v_desired_trajectory = np.interp(CONTROL_N_T_IDX, T_IDXS_MPC, self.mpc.v_solution)
     self.a_desired_trajectory = np.interp(CONTROL_N_T_IDX, T_IDXS_MPC, self.mpc.a_solution)
     self.j_desired_trajectory = np.interp(CONTROL_N_T_IDX, T_IDXS_MPC[:-1], self.mpc.j_solution)
 
-    # TODO counter is only needed because radar is glitchy, remove once radar is gone
-    self.fcw = self.mpc.crash_cnt > 2 and not sm['carState'].standstill
+    self.fcw = self.mpc.crash_cnt > 2 and not sm["carState"].standstill
     if self.fcw:
       cloudlog.info("FCW triggered")
 
-    # Interpolate 0.05 seconds and save as starting point for next iteration
     a_prev = self.a_desired
     self.a_desired = float(np.interp(self.dt, CONTROL_N_T_IDX, self.a_desired_trajectory))
     self.v_desired_filter.x = self.v_desired_filter.x + self.dt * (self.a_desired + a_prev) / 2.0
 
-    action_t =  self.CP.longitudinalActuatorDelay + DT_MDL
-    output_a_target_mpc, output_should_stop_mpc = get_accel_from_plan(self.v_desired_trajectory, self.a_desired_trajectory, CONTROL_N_T_IDX,
-                                                                        action_t=action_t, vEgoStopping=self.CP.vEgoStopping)
-    output_a_target_e2e = sm['modelV2'].action.desiredAcceleration
-    output_should_stop_e2e = sm['modelV2'].action.shouldStop
+    action_t = self.CP.longitudinalActuatorDelay + DT_MDL
+    output_a_target_mpc, output_should_stop_mpc = get_accel_from_plan(
+      self.v_desired_trajectory,
+      self.a_desired_trajectory,
+      CONTROL_N_T_IDX,
+      action_t=action_t,
+      vEgoStopping=self.CP.vEgoStopping,
+    )
+    output_a_target_e2e = sm["modelV2"].action.desiredAcceleration
+    output_should_stop_e2e = sm["modelV2"].action.shouldStop
 
-    if mode == 'acc':
+    if mode == "acc":
       output_a_target = output_a_target_mpc
       self.output_should_stop = output_should_stop_mpc
     else:
@@ -189,25 +286,25 @@ class LongitudinalPlanner:
       self.output_should_stop = output_should_stop_e2e or output_should_stop_mpc
 
     for idx in range(2):
-      accel_clip[idx] = np.clip(accel_clip[idx], self.prev_accel_clip[idx] - 0.05, self.prev_accel_clip[idx] + 0.05)
-    self.output_a_target = np.clip(output_a_target, accel_clip[0], accel_clip[1])
-    self.prev_accel_clip = accel_clip
+      accel_clip_turns[idx] = np.clip(accel_clip_turns[idx], self.prev_accel_clip[idx] - 0.05, self.prev_accel_clip[idx] + 0.05)
+    self.output_a_target = np.clip(output_a_target, accel_clip_turns[0], accel_clip_turns[1])
+    self.prev_accel_clip = accel_clip_turns
+
 
   def publish(self, sm, pm):
-    plan_send = messaging.new_message('longitudinalPlan')
-
-    plan_send.valid = sm.all_checks(service_list=['carState', 'controlsState', 'selfdriveState', 'radarState'])
+    plan_send = messaging.new_message("longitudinalPlan")
+    plan_send.valid = sm.all_checks(service_list=["carState", "controlsState", "selfdriveState", "radarState"])
 
     longitudinalPlan = plan_send.longitudinalPlan
-    longitudinalPlan.modelMonoTime = sm.logMonoTime['modelV2']
-    longitudinalPlan.processingDelay = (plan_send.logMonoTime / 1e9) - sm.logMonoTime['modelV2']
+    longitudinalPlan.modelMonoTime = sm.logMonoTime["modelV2"]
+    longitudinalPlan.processingDelay = (plan_send.logMonoTime / 1e9) - sm.logMonoTime["modelV2"]
     longitudinalPlan.solverExecutionTime = self.mpc.solve_time
 
     longitudinalPlan.speeds = self.v_desired_trajectory.tolist()
     longitudinalPlan.accels = self.a_desired_trajectory.tolist()
     longitudinalPlan.jerks = self.j_desired_trajectory.tolist()
 
-    longitudinalPlan.hasLead = sm['radarState'].leadOne.status
+    longitudinalPlan.hasLead = sm["radarState"].leadOne.status
     longitudinalPlan.longitudinalPlanSource = self.mpc.source
     longitudinalPlan.fcw = self.fcw
 
@@ -216,4 +313,4 @@ class LongitudinalPlanner:
     longitudinalPlan.allowBrake = True
     longitudinalPlan.allowThrottle = bool(self.allow_throttle)
 
-    pm.send('longitudinalPlan', plan_send)
+    pm.send("longitudinalPlan", plan_send)
