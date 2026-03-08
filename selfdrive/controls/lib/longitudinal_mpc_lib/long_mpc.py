@@ -350,19 +350,26 @@ class LongitudinalMpc:
     self.cruise_min_a = float(min_a)
     self.max_a = float(max_a)
 
-  def update(self, carstate, radarstate, v_cruise, x, v, a, j, personality=log.LongitudinalPersonality.standard):
-    # Tesla Unity parity: honor the live stalk follow-distance whenever carState provides it.
-    follow_distance_s = 255
-    if carstate is not None:
+  def update(self, radarstate, v_cruise, x, v, a, j, personality=log.LongitudinalPersonality.standard, t_follow_override=None, carstate=None):
+    # Tesla/XNOR compatibility: honor an explicit t_follow_override first,
+    # otherwise use live stalk follow-distance when carState is available.
+    if t_follow_override is not None:
       try:
-        follow_distance_s = int(getattr(carstate, "followDistanceS", 255))
+        t_follow = float(t_follow_override)
       except (TypeError, ValueError):
-        follow_distance_s = 255
-
-    if 0 <= follow_distance_s <= 6:
-      t_follow = 0.7 + float(follow_distance_s) * 0.2
+        t_follow = get_T_FOLLOW(personality)
     else:
-      t_follow = get_T_FOLLOW(personality)
+      follow_distance_s = 255
+      if carstate is not None:
+        try:
+          follow_distance_s = int(getattr(carstate, "followDistanceS", 255))
+        except (TypeError, ValueError):
+          follow_distance_s = 255
+
+      if 0 <= follow_distance_s <= 6:
+        t_follow = 0.7 + float(follow_distance_s) * 0.2
+      else:
+        t_follow = get_T_FOLLOW(personality)
     v_ego = self.x0[1]
     self.status = radarstate.leadOne.status or radarstate.leadTwo.status
 
