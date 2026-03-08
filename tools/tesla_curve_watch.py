@@ -1,306 +1,315 @@
-#!/usr/bin/env python3
-"""
-tools/tesla_curve_watch.py
-
-Live curve watcher for Tesla/XNOR/OpenPilot longitudinal turn tracing.
-
-Logs the same family of metrics used by the Unity/XNOR planner curve path:
-- curve_area
-- max_curv_ahead
-- far_curv_peak
-- anticipatory_slowdown
-- curve_detected
-- max_v_curve
-- filtered curve speed
-- current lead / plan / cruise state
-
-This does not change behavior. It only watches and exports CSV.
-"""
-
 from __future__ import annotations
 
 import argparse
-import csv
 import math
-import signal
-import sys
+import os
 import time
-from dataclasses import dataclass
-from pathlib import Path
-from typing import Iterable, List
-
-import numpy as np
 
 from cereal import messaging
-from openpilot.selfdrive.modeld.constants import ModelConstants
-from openpilot.selfdrive.controls.lib.longcontrol import LongCtrlState
-from openpilot.common.conversions import Conversions as CV
 
 
-AREA_THRESHOLD = 0.012
-CURVE_PEAK_THRESHOLD = 0.0020
-VISION_CURVE_TARGET_LAT_A = 2.1
-
-T_IDXS_MPC = np.array([0.0, 0.2, 0.4, 0.6, 0.8, 1.0, 1.2, 1.4, 1.6, 1.8,
-                       2.0, 2.2, 2.4, 2.6, 2.8, 3.0, 3.2, 3.4, 3.6, 3.8])
-
-
-@dataclass
-class FirstOrderFilterLite:
-    x: float
-    rc: float
-    dt: float
-
-    def update(self, new_x: float) -> float:
-        alpha = self.dt / (self.rc + self.dt) if self.rc > 0.0 else 1.0
-        self.x = self.x + alpha * (new_x - self.x)
-        return self.x
+def _float(x, default: float = 0.0) -> float:
+  try:
+    if x is None:
+      return default
+    return float(x)
+  except Exception:
+    return default
 
 
-def _safe_len(seq: object) -> int:
+def _int(x, default: int = 0) -> int:
+  try:
+    if x is None:
+      return default
+    return int(x)
+  except Exception:
+    return default
+
+
+def _bool(x) -> int:
+  try:
+    return int(bool(x))
+  except Exception:
+    return 0
+
+
+def _list_floats(seq) -> list[float]:
+  try:
+    return [float(x) for x in seq]
+  except Exception:
+    return []
+
+
+def _lead_fields(lead) -> tuple[int, float, float, float]:
+  if lead is None:
+    return 0, 0.0, 0.0, 0.0
+  status = int(bool(getattr(lead, "status", False)))
+  d_rel = _float(getattr(lead, "dRel", 0.0))
+  v_rel = _float(getattr(lead, "vRel", 0.0))
+  y_rel = _float(getattr(lead, "yRel", 0.0))
+  return status, d_rel, v_rel, y_rel
+
+
+def _exp_mode(ctrl, selfdrive_state) -> int:
+  v = None
+  try:
+    v = getattr(ctrl, "experimentalMode", None)
+  except Exception:
+    v = None
+  if v is None:
     try:
-        return len(seq)  # type: ignore[arg-type]
+      v = getattr(selfdrive_state, "experimentalMode", None)
     except Exception:
-        return 0
+      v = None
+  return _bool(v)
 
 
-def _safe_list(seq: object) -> list:
-    try:
-        return list(seq)  # type: ignore[arg-type]
-    except Exception:
-        return []
+def _v_cruise(ctrl, car_state) -> float:
+  v = _float(getattr(ctrl, "vCruise", 0.0), 0.0)
+  if v > 0.0:
+    return v
+  return _float(getattr(car_state, "vCruise", 0.0), 0.0)
 
 
-def _rate_limited_update(filt: FirstOrderFilterLite, target: float, rc_up: float, rc_down: float) -> float:
-    filt.rc = rc_down if target < filt.x else rc_up
-    return filt.update(target)
+class CurveWatch:
+  def __init__(self, target_lat_accel: float, area_threshold: float, peak_threshold: float,
+               far_peak_threshold: float, fall_gain: float, rise_gain: float) -> None:
+    self.target_lat_accel = float(target_lat_accel)
+    self.area_threshold = float(area_threshold)
+    self.peak_threshold = float(peak_threshold)
+    self.far_peak_threshold = float(far_peak_threshold)
+    self.fall_gain = float(fall_gain)
+    self.rise_gain = float(rise_gain)
+    self.v_turn_filter = 0.0
+    self.last_curve_detected = 0
 
+  def compute(self, model, v_ego: float) -> dict[str, float | int]:
+    orient = getattr(model, "orientationRate", None)
+    vel = getattr(model, "velocity", None)
 
-def _get_speed_error(model_msg, v_ego: float) -> float:
-    try:
-        temporal_pose = getattr(model_msg, "temporalPose", None)
-        if temporal_pose is not None:
-            trans = getattr(temporal_pose, "trans", [])
-            if _safe_len(trans):
-                return float(np.clip(float(trans[0]) - float(v_ego), -5.0, 5.0))
-    except Exception:
-        pass
+    z = []
+    vx = []
+    if orient is not None:
+      try:
+        z = _list_floats(getattr(orient, "z", []))
+      except Exception:
+        z = []
+    if vel is not None:
+      try:
+        vx = _list_floats(getattr(vel, "x", []))
+      except Exception:
+        vx = []
 
-    try:
-        vel_x = getattr(model_msg.velocity, "x", [])
-        if _safe_len(vel_x):
-            return float(np.clip(float(vel_x[0]) - float(v_ego), -5.0, 5.0))
-    except Exception:
-        pass
-
-    return 0.0
-
-
-def compute_curve_metrics(model_msg, v_ego: float, model_error: float, v_turn_filter: FirstOrderFilterLite) -> dict:
-    metrics = {
-        "model_points_ok": 0,
-        "orientation_points_ok": 0,
+    n = min(len(z), len(vx))
+    if n <= 0:
+      return {
+        "model_ok": 0,
+        "orientation_points": len(z),
+        "velocity_points": len(vx),
         "curve_area": 0.0,
         "max_curv_ahead": 0.0,
         "far_curv_peak": 0.0,
         "anticipatory_slowdown": 1.0,
         "curve_detected": 0,
         "max_v_curve": 0.0,
-        "v_curve_filtered": float(v_turn_filter.x),
-        "v_corrected_0": 0.0,
-    }
+        "v_curve_filtered": self.v_turn_filter,
+      }
 
-    pos_x = _safe_list(getattr(getattr(model_msg, "position", None), "x", []))
-    vel_x = _safe_list(getattr(getattr(model_msg, "velocity", None), "x", []))
-    acc_x = _safe_list(getattr(getattr(model_msg, "acceleration", None), "x", []))
-    or_z = _safe_list(getattr(getattr(model_msg, "orientationRate", None), "z", []))
+    curvatures = []
+    for i in range(n):
+      v = max(abs(vx[i]), 0.1)
+      curvatures.append(abs(z[i]) / v)
 
-    if not (len(pos_x) == ModelConstants.IDX_N and len(vel_x) == ModelConstants.IDX_N and len(acc_x) == ModelConstants.IDX_N):
-        return metrics
+    near = curvatures[: min(n, 16)]
+    far = curvatures[min(16, n): min(n, 32)]
+    curve_area = sum(near)
+    max_curv_ahead = max(near) if near else 0.0
+    far_curv_peak = max(far) if far else 0.0
 
-    metrics["model_points_ok"] = 1
-    v_raw = np.interp(T_IDXS_MPC, ModelConstants.T_IDXS, vel_x)
-    v_corrected = np.maximum(v_raw, max(0.0, float(v_ego) - 1.5)) - float(model_error)
-    metrics["v_corrected_0"] = float(v_corrected[0])
+    anticipatory_slowdown = 1.0
+    if far_curv_peak > self.far_peak_threshold:
+      anticipatory_slowdown = max(0.55, 1.0 - min(0.35, far_curv_peak * 60.0))
 
-    if len(or_z) != ModelConstants.IDX_N:
-        return metrics
+    curve_detected = int(
+      (curve_area > self.area_threshold) or
+      (max_curv_ahead > self.peak_threshold) or
+      (far_curv_peak > self.far_peak_threshold)
+    )
 
-    metrics["orientation_points_ok"] = 1
-    raw_curv = np.abs(np.interp(T_IDXS_MPC, ModelConstants.T_IDXS, or_z)) / np.clip(v_corrected, 0.3, 100.0)
-    num_idx = len(raw_curv)
+    peak = max(max_curv_ahead, far_curv_peak * 0.9, 1e-6)
+    max_v_curve = math.sqrt(max(self.target_lat_accel / peak, 0.0)) * anticipatory_slowdown
 
-    far_start = min(10, max(0, num_idx - 1))
-    far_end = min(32, num_idx)
-    far_curv_peak = float(np.max(raw_curv[far_start:far_end])) if far_end > far_start else 0.0
-    anticipatory_slowdown = float(np.interp(far_curv_peak, [0.0008, 0.003], [1.0, 0.78]))
-
-    curve_area = float(np.sum(raw_curv[:25]) * 0.2)
-    max_curv_ahead = float(np.max(raw_curv[2:20])) if num_idx > 2 else 0.0
-    curve_detected = int((curve_area > AREA_THRESHOLD) or (max_curv_ahead > CURVE_PEAK_THRESHOLD))
-
-    max_v_curve = 0.0
-    v_curve_filtered = float(v_turn_filter.x)
-    if curve_detected:
-        lat_stress_factor = float((float(v_ego) ** 2) * max_curv_ahead)
-        torque_multiplier = float(np.interp(lat_stress_factor, [0.015, 0.05], [1.0, 0.65]))
-        dynamic_multiplier = float(np.interp(max_curv_ahead, [0.0015, 0.008], [1.0, 0.70]))
-        max_v_curve = dynamic_multiplier * torque_multiplier * anticipatory_slowdown * math.sqrt(max(VISION_CURVE_TARGET_LAT_A / (max_curv_ahead + 1e-4), 0.0))
-        v_curve_filtered = float(_rate_limited_update(v_turn_filter, max_v_curve, rc_up=0.3, rc_down=0.05))
+    if self.v_turn_filter <= 0.0:
+      self.v_turn_filter = max_v_curve
     else:
-        if anticipatory_slowdown < 1.0:
-            v_curve_filtered = float(_rate_limited_update(v_turn_filter, float(v_corrected[0]) * anticipatory_slowdown, rc_up=0.3, rc_down=0.05))
-        else:
-            v_curve_filtered = float(_rate_limited_update(v_turn_filter, float(v_corrected[0]), rc_up=0.3, rc_down=0.05))
+      if max_v_curve < self.v_turn_filter:
+        self.v_turn_filter += self.fall_gain * (max_v_curve - self.v_turn_filter)
+      else:
+        self.v_turn_filter += self.rise_gain * (max_v_curve - self.v_turn_filter)
 
-    metrics.update({
-        "curve_area": curve_area,
-        "max_curv_ahead": max_curv_ahead,
-        "far_curv_peak": far_curv_peak,
-        "anticipatory_slowdown": anticipatory_slowdown,
-        "curve_detected": curve_detected,
-        "max_v_curve": max_v_curve,
-        "v_curve_filtered": v_curve_filtered,
-    })
-    return metrics
+    self.v_turn_filter = max(self.v_turn_filter, 0.0)
 
-
-def build_row(sm, curve_metrics: dict) -> dict:
-    cs = sm["carState"]
-    controls = sm["controlsState"]
-    selfdrive = sm["selfdriveState"]
-    model = sm["modelV2"]
-    radar = sm["radarState"]
-    plan = sm["longitudinalPlan"]
-
-    lead = getattr(radar, "leadOne", None)
-    lead_status = int(getattr(lead, "status", False)) if lead is not None else 0
-    lead_d_rel = float(getattr(lead, "dRel", 0.0) or 0.0) if lead is not None else 0.0
-    lead_v_rel = float(getattr(lead, "vRel", 0.0) or 0.0) if lead is not None else 0.0
-    lead_y_rel = float(getattr(lead, "yRel", 0.0) or 0.0) if lead is not None else 0.0
-
-    try:
-        plan_speeds = list(plan.speeds)
-    except Exception:
-        plan_speeds = []
-
-    try:
-        plan_accels = list(plan.accels)
-    except Exception:
-        plan_accels = []
-
-    try:
-        plan_jerks = list(plan.jerks)
-    except Exception:
-        plan_jerks = []
-
-    try:
-        model_or_z = list(model.orientationRate.z)
-    except Exception:
-        model_or_z = []
-
-    row = {
-        "ts_wall": time.time(),
-        "v_ego_mps": float(getattr(cs, "vEgo", 0.0) or 0.0),
-        "a_ego_mps2": float(getattr(cs, "aEgo", 0.0) or 0.0),
-        "v_cruise_kph": float(getattr(cs, "vCruise", 0.0) or 0.0),
-        "controls_enabled": int(bool(getattr(controls, "enabled", getattr(selfdrive, "enabled", False)))),
-        "experimental_mode": int(bool(getattr(controls, "experimentalMode", getattr(selfdrive, "experimentalMode", False)))),
-        "long_control_state": int(getattr(controls, "longControlState", LongCtrlState.off)),
-        "follow_distance_s": int(getattr(cs, "followDistanceS", -1)),
-        "lead_status": lead_status,
-        "lead_d_rel_m": lead_d_rel,
-        "lead_v_rel_mps": lead_v_rel,
-        "lead_y_rel_m": lead_y_rel,
-        "model_or_z_len": len(model_or_z),
-        "model_or_z_0": float(model_or_z[0]) if model_or_z else 0.0,
-        "plan_speed_0_mps": float(plan_speeds[0]) if plan_speeds else 0.0,
-        "plan_speed_last_mps": float(plan_speeds[-1]) if plan_speeds else 0.0,
-        "plan_accel_0_mps2": float(plan_accels[0]) if plan_accels else 0.0,
-        "plan_jerk_0_mps3": float(plan_jerks[0]) if plan_jerks else 0.0,
+    return {
+      "model_ok": 1,
+      "orientation_points": len(z),
+      "velocity_points": len(vx),
+      "curve_area": curve_area,
+      "max_curv_ahead": max_curv_ahead,
+      "far_curv_peak": far_curv_peak,
+      "anticipatory_slowdown": anticipatory_slowdown,
+      "curve_detected": curve_detected,
+      "max_v_curve": max_v_curve,
+      "v_curve_filtered": self.v_turn_filter,
     }
-    row.update(curve_metrics)
-    return row
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Watch live curve metrics and export CSV.")
-    parser.add_argument("--seconds", type=float, default=120.0, help="Capture duration in seconds.")
-    parser.add_argument("--output", type=str, default="", help="CSV output path. Default: /data/media/0/realdata/curve_watch_<ts>.csv")
-    parser.add_argument("--print-events", action="store_true", help="Print when curve_detected changes or curve speed drops materially.")
-    args = parser.parse_args()
+  ap = argparse.ArgumentParser()
+  ap.add_argument("--seconds", type=int, default=180, help="How long to dump")
+  ap.add_argument("--hz", type=float, default=10.0, help="Dump rate (Hz)")
+  ap.add_argument("--out", type=str, default="", help="Optional output file path (append). If empty, writes to /data/media/0/realdata/")
+  ap.add_argument("--print-events", action="store_true", help="Print curve enter/exit events")
+  ap.add_argument("--target-lat-accel", type=float, default=1.9)
+  ap.add_argument("--area-threshold", type=float, default=0.10)
+  ap.add_argument("--peak-threshold", type=float, default=0.0015)
+  ap.add_argument("--far-peak-threshold", type=float, default=0.0010)
+  ap.add_argument("--fall-gain", type=float, default=0.35, help="How quickly filtered curve speed falls")
+  ap.add_argument("--rise-gain", type=float, default=0.08, help="How quickly filtered curve speed rises")
+  args = ap.parse_args()
 
-    out_path = Path(args.output) if args.output else Path(f"/data/media/0/realdata/curve_watch_{int(time.time())}.csv")
-    out_path.parent.mkdir(parents=True, exist_ok=True)
+  out = args.out.strip()
+  if not out:
+    ts = time.strftime("%Y%m%d_%H%M%S")
+    out = f"/data/media/0/realdata/curve_watch_{ts}.csv"
 
-    services = ["carState", "controlsState", "selfdriveState", "modelV2", "radarState", "longitudinalPlan"]
-    sm = messaging.SubMaster(services)
-    stop = {"flag": False}
+  os.makedirs(os.path.dirname(out) or ".", exist_ok=True)
 
-    def _handle_stop(signum, frame):
-        stop["flag"] = True
+  sm = messaging.SubMaster([
+    "carState",
+    "controlsState",
+    "selfdriveState",
+    "radarState",
+    "longitudinalPlan",
+    "modelV2",
+  ])
 
-    signal.signal(signal.SIGINT, _handle_stop)
-    signal.signal(signal.SIGTERM, _handle_stop)
+  cw = CurveWatch(
+    target_lat_accel=args.target_lat_accel,
+    area_threshold=args.area_threshold,
+    peak_threshold=args.peak_threshold,
+    far_peak_threshold=args.far_peak_threshold,
+    fall_gain=args.fall_gain,
+    rise_gain=args.rise_gain,
+  )
 
-    v_turn_filter = FirstOrderFilterLite(0.0, rc=0.2, dt=0.05)
+  header = (
+    "ts,"
+    "vEgo,vCruise,carVCruise,followDistanceS,cruiseEnabled,experimentalMode,"
+    "lead1_status,lead1_dRel,lead1_vRel,lead1_yRel,"
+    "lead2_status,lead2_dRel,lead2_vRel,lead2_yRel,"
+    "lp_0,lp_min12,lp_last,"
+    "model_ok,orientation_points,velocity_points,"
+    "curve_area,max_curv_ahead,far_curv_peak,anticipatory_slowdown,curve_detected,max_v_curve,v_curve_filtered,"
+    "curve_should_slow_hint,plan_not_dropping_hint"
+  )
 
-    fieldnames = [
-        "ts_wall",
-        "v_ego_mps", "a_ego_mps2", "v_cruise_kph",
-        "controls_enabled", "experimental_mode", "long_control_state", "follow_distance_s",
-        "lead_status", "lead_d_rel_m", "lead_v_rel_mps", "lead_y_rel_m",
-        "model_or_z_len", "model_or_z_0",
-        "curve_area", "max_curv_ahead", "far_curv_peak", "anticipatory_slowdown",
-        "curve_detected", "max_v_curve", "v_curve_filtered", "v_corrected_0",
-        "model_points_ok", "orientation_points_ok",
-        "plan_speed_0_mps", "plan_speed_last_mps", "plan_accel_0_mps2", "plan_jerk_0_mps3",
-    ]
+  with open(out, "a", buffering=1) as fh:
+    if fh.tell() == 0:
+      fh.write(header + "\n")
 
-    last_curve_detected = None
-    last_print_ts = 0.0
-    start = time.monotonic()
+    dt = 1.0 / max(float(args.hz), 0.1)
+    end_t = time.monotonic() + float(args.seconds)
 
-    with out_path.open("w", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=fieldnames)
-        writer.writeheader()
+    while time.monotonic() < end_t:
+      sm.update(0)
 
-        while not stop["flag"] and (time.monotonic() - start) < float(args.seconds):
-            sm.update(0)
+      cs = sm["carState"]
+      ctrl = sm["controlsState"]
+      sds = sm["selfdriveState"] if sm.valid.get("selfdriveState", False) else None
+      rs = sm["radarState"] if sm.valid.get("radarState", False) else None
+      lp = sm["longitudinalPlan"] if sm.valid.get("longitudinalPlan", False) else None
+      model = sm["modelV2"] if sm.valid.get("modelV2", False) else None
 
-            if not sm.updated["modelV2"]:
-                time.sleep(0.01)
-                continue
+      ts = time.time()
+      v_ego = _float(getattr(cs, "vEgo", 0.0))
+      v_cruise = _v_cruise(ctrl, cs)
+      car_v = _float(getattr(cs, "vCruise", 0.0))
+      fd = _int(getattr(cs, "followDistanceS", 255), 255)
 
-            v_ego = float(getattr(sm["carState"], "vEgo", 0.0) or 0.0)
-            model_error = _get_speed_error(sm["modelV2"], v_ego)
-            curve_metrics = compute_curve_metrics(sm["modelV2"], v_ego, model_error, v_turn_filter)
-            row = build_row(sm, curve_metrics)
-            writer.writerow(row)
+      cruise = getattr(cs, "cruiseState", None)
+      cruise_enabled = int(bool(getattr(cruise, "enabled", False))) if cruise is not None else 0
+      exp_mode = _exp_mode(ctrl, sds)
 
-            if args.print_events:
-                now = time.monotonic()
-                curve_detected = row["curve_detected"]
-                trigger_print = False
-                if last_curve_detected is None or curve_detected != last_curve_detected:
-                    trigger_print = True
-                if (row["v_curve_filtered"] + 0.5) < row["plan_speed_last_mps"]:
-                    trigger_print = True
-                if trigger_print and (now - last_print_ts) > 0.2:
-                    print(
-                        f"curve={curve_detected} "
-                        f"vEgo={row['v_ego_mps']*CV.MS_TO_MPH:.1f}mph "
-                        f"plan={row['plan_speed_last_mps']*CV.MS_TO_MPH:.1f}mph "
-                        f"curve_v={row['v_curve_filtered']*CV.MS_TO_MPH:.1f}mph "
-                        f"area={row['curve_area']:.4f} peak={row['max_curv_ahead']:.5f} "
-                        f"lead={row['lead_status']} dRel={row['lead_d_rel_m']:.1f} vRel={row['lead_v_rel_mps']:.2f}"
-                    )
-                    last_print_ts = now
-                last_curve_detected = curve_detected
+      lead1_status_i = lead2_status_i = 0
+      lead1_d = lead1_v = lead1_y = 0.0
+      lead2_d = lead2_v = lead2_y = 0.0
+      if rs is not None:
+        lead1_status_i, lead1_d, lead1_v, lead1_y = _lead_fields(getattr(rs, "leadOne", None))
+        lead2_status_i, lead2_d, lead2_v, lead2_y = _lead_fields(getattr(rs, "leadTwo", None))
 
-    print(f"Wrote {out_path}")
-    return 0
+      lp_0 = lp_min12 = lp_last = 0.0
+      if lp is not None:
+        speeds = list(getattr(lp, "speeds", []))
+        if speeds:
+          vals = [float(x) for x in speeds]
+          lp_0 = vals[0]
+          lp_last = vals[-1]
+          lp_min12 = float(min(vals[: min(12, len(vals))]))
+
+      curve = cw.compute(model, v_ego) if model is not None else {
+        "model_ok": 0,
+        "orientation_points": 0,
+        "velocity_points": 0,
+        "curve_area": 0.0,
+        "max_curv_ahead": 0.0,
+        "far_curv_peak": 0.0,
+        "anticipatory_slowdown": 1.0,
+        "curve_detected": 0,
+        "max_v_curve": 0.0,
+        "v_curve_filtered": cw.v_turn_filter,
+      }
+
+      lead_present = (lead1_status_i == 1) or (lead2_status_i == 1)
+      curve_should_slow_hint = 0
+      if int(curve["curve_detected"]) == 1 and v_ego > 8.0:
+        if float(curve["v_curve_filtered"]) < (v_ego - 0.5):
+          curve_should_slow_hint = 1
+
+      plan_not_dropping_hint = 0
+      if curve_should_slow_hint and not lead_present:
+        if lp_min12 >= (v_ego - 0.2):
+          plan_not_dropping_hint = 1
+
+      if args.print_events and int(curve["curve_detected"]) != cw.last_curve_detected:
+        state = "ENTER" if int(curve["curve_detected"]) else "EXIT"
+        print(
+          f"[{time.strftime('%H:%M:%S')}] CURVE_{state} "
+          f"vEgo={v_ego:.2f} vCruise={v_cruise:.2f} "
+          f"curve_area={float(curve['curve_area']):.4f} "
+          f"max_curv={float(curve['max_curv_ahead']):.5f} "
+          f"far_peak={float(curve['far_curv_peak']):.5f} "
+          f"v_curve={float(curve['v_curve_filtered']):.2f} "
+          f"lp_min12={lp_min12:.2f} lead={int(lead_present)}"
+        )
+      cw.last_curve_detected = int(curve["curve_detected"])
+
+      line = (
+        f"{ts:.3f},"
+        f"{v_ego:.3f},{v_cruise:.3f},{car_v:.3f},{fd:d},{cruise_enabled:d},{exp_mode:d},"
+        f"{lead1_status_i:d},{lead1_d:.3f},{lead1_v:.3f},{lead1_y:.3f},"
+        f"{lead2_status_i:d},{lead2_d:.3f},{lead2_v:.3f},{lead2_y:.3f},"
+        f"{lp_0:.3f},{lp_min12:.3f},{lp_last:.3f},"
+        f"{int(curve['model_ok']):d},{int(curve['orientation_points']):d},{int(curve['velocity_points']):d},"
+        f"{float(curve['curve_area']):.6f},{float(curve['max_curv_ahead']):.6f},{float(curve['far_curv_peak']):.6f},"
+        f"{float(curve['anticipatory_slowdown']):.3f},{int(curve['curve_detected']):d},{float(curve['max_v_curve']):.3f},{float(curve['v_curve_filtered']):.3f},"
+        f"{curve_should_slow_hint:d},{plan_not_dropping_hint:d}"
+      )
+      fh.write(line + "\n")
+      time.sleep(dt)
+
+  print(f"Wrote CSV to: {out}")
+  return 0
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+  raise SystemExit(main())
