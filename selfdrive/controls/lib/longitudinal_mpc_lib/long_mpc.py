@@ -256,6 +256,8 @@ class LongitudinalMpc:
     self.time_linearization = 0.0
     self.time_integrator = 0.0
     self.x0 = np.zeros(X_DIM)
+    self.cruise_min_a = CRUISE_MIN_ACCEL
+    self.max_a = CRUISE_MAX_ACCEL
     self.set_weights()
 
   def set_cost_weights(self, cost_weights, constraint_cost_weights):
@@ -274,18 +276,35 @@ class LongitudinalMpc:
     for i in range(N):
       self.solver.cost_set(i, 'Zl', Zl)
 
-  def set_weights(self, prev_accel_constraint=True, personality=log.LongitudinalPersonality.standard):
+  def set_weights(self, prev_accel_constraint=True, personality=log.LongitudinalPersonality.standard, weights=None):
     jerk_factor = get_jerk_factor(personality)
-    if self.mode == 'acc':
+    constraint_cost_weights = [LIMIT_COST, LIMIT_COST, LIMIT_COST, DANGER_ZONE_COST]
+
+    if weights is not None:
+      if len(weights) == 3:
+        x_ego_cost, v_ego_cost, a_ego_cost = [float(w) for w in weights]
+        a_change_cost = A_CHANGE_COST if prev_accel_constraint else 0.0
+        cost_weights = [
+          X_EGO_OBSTACLE_COST,
+          x_ego_cost,
+          v_ego_cost,
+          a_ego_cost,
+          jerk_factor * a_change_cost,
+          jerk_factor * J_EGO_COST,
+        ]
+      elif len(weights) == 6:
+        cost_weights = [float(w) for w in weights]
+      else:
+        raise ValueError(f"Unexpected custom weights length: {len(weights)}")
+    elif self.mode == 'acc':
       a_change_cost = A_CHANGE_COST if prev_accel_constraint else 0
       cost_weights = [X_EGO_OBSTACLE_COST, X_EGO_COST, V_EGO_COST, A_EGO_COST, jerk_factor * a_change_cost, jerk_factor * J_EGO_COST]
-      constraint_cost_weights = [LIMIT_COST, LIMIT_COST, LIMIT_COST, DANGER_ZONE_COST]
     elif self.mode == 'blended':
       a_change_cost = 40.0 if prev_accel_constraint else 0
       cost_weights = [0., 0.1, 0.2, 5.0, a_change_cost, 1.0]
-      constraint_cost_weights = [LIMIT_COST, LIMIT_COST, LIMIT_COST, DANGER_ZONE_COST]
     else:
       raise NotImplementedError(f'Planner mode {self.mode} not recognized in planner cost set')
+
     self.set_cost_weights(cost_weights, constraint_cost_weights)
 
   def set_cur_state(self, v, a):
@@ -327,10 +346,23 @@ class LongitudinalMpc:
     lead_xv = self.extrapolate_lead(x_lead, v_lead, a_lead, a_lead_tau)
     return lead_xv
 
-  def update(self, radarstate, v_cruise, x, v, a, j, personality=log.LongitudinalPersonality.standard, t_follow_override=None):
-    t_follow = get_T_FOLLOW(personality)
-    if t_follow_override is not None:
-      t_follow = float(t_follow_override)
+  def set_accel_limits(self, min_a, max_a):
+    self.cruise_min_a = float(min_a)
+    self.max_a = float(max_a)
+
+  def update(self, carstate, radarstate, v_cruise, x, v, a, j, personality=log.LongitudinalPersonality.standard):
+    # Tesla Unity parity: honor the live stalk follow-distance whenever carState provides it.
+    follow_distance_s = 255
+    if carstate is not None:
+      try:
+        follow_distance_s = int(getattr(carstate, "followDistanceS", 255))
+      except (TypeError, ValueError):
+        follow_distance_s = 255
+
+    if 0 <= follow_distance_s <= 6:
+      t_follow = 0.7 + float(follow_distance_s) * 0.2
+    else:
+      t_follow = get_T_FOLLOW(personality)
     v_ego = self.x0[1]
     self.status = radarstate.leadOne.status or radarstate.leadTwo.status
 
@@ -343,8 +375,8 @@ class LongitudinalMpc:
     lead_0_obstacle = lead_xv_0[:,0] + get_stopped_equivalence_factor(lead_xv_0[:,1])
     lead_1_obstacle = lead_xv_1[:,0] + get_stopped_equivalence_factor(lead_xv_1[:,1])
 
-    self.params[:,0] = ACCEL_MIN
-    self.params[:,1] = ACCEL_MAX
+    self.params[:,0] = self.cruise_min_a
+    self.params[:,1] = self.max_a
 
     # Update in ACC mode or ACC/e2e blend
     if self.mode == 'acc':
@@ -352,9 +384,9 @@ class LongitudinalMpc:
 
       # Fake an obstacle for cruise, this ensures smooth acceleration to set speed
       # when the leads are no factor.
-      v_lower = v_ego + (T_IDXS * CRUISE_MIN_ACCEL * 1.05)
+      v_lower = v_ego + (T_IDXS * float(self.cruise_min_a) * 1.05)
       # TODO does this make sense when max_a is negative?
-      v_upper = v_ego + (T_IDXS * CRUISE_MAX_ACCEL * 1.05)
+      v_upper = v_ego + (T_IDXS * float(self.max_a) * 1.05)
       v_cruise_clipped = np.clip(v_cruise * np.ones(N+1),
                                  v_lower,
                                  v_upper)
