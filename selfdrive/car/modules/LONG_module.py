@@ -60,6 +60,10 @@ class LongController:
     self._lead_vrel: float = 0.0
 
     self._last_info_log_ms: int = 0
+    self._enabled_since_ms: int = 0
+    self._last_active: bool = False
+    self._last_lp_seen_ns: int = 0
+    self._stable_plan_samples: int = 0
 
   def _rate_log(self, msg: str) -> None:
     now = _mono_ms()
@@ -145,12 +149,24 @@ class LongController:
     if (int(frame) % 20) != 0:
       return LongDecision(None, "gated: 5Hz(frame)")
 
-    if not bool(enabled) or not bool(getattr(CS, "enable_adaptive_cruise", False)):
+    controller_enabled = bool(enabled) and bool(getattr(CS, "enable_adaptive_cruise", False))
+    if not controller_enabled:
+      self._last_active = False
+      self._enabled_since_ms = 0
+      self._stable_plan_samples = 0
+      self._last_lp_seen_ns = 0
       return LongDecision(None, "gated: not enabled/adaptive")
 
     stock_state = str(getattr(CS, "stock_cruise_state", "") or "")
     if stock_state not in ("ENABLED", "OVERRIDE", "STANDSTILL", "STANDBY"):
+      self._last_active = False
       return LongDecision(None, f"gated: stock_state={stock_state or 'UNKNOWN'}")
+
+    if not self._last_active:
+      self._enabled_since_ms = int(now)
+      self._stable_plan_samples = 0
+      self._last_lp_seen_ns = 0
+    self._last_active = True
 
     cs_out = getattr(CS, "out", None)
     v_ego_ms = float(getattr(cs_out, "vEgo", 0.0) or 0.0)
@@ -165,9 +181,34 @@ class LongController:
       and ((now_ns - int(self._lp_last_ns)) < int(self._LP_FRESH_NS))
     )
 
+    if lp_fresh and int(self._lp_last_ns) != int(self._last_lp_seen_ns):
+      self._stable_plan_samples = min(int(self._stable_plan_samples) + 1, 1000)
+      self._last_lp_seen_ns = int(self._lp_last_ns)
+    elif not lp_fresh:
+      self._stable_plan_samples = 0
+      self._last_lp_seen_ns = 0
+
     planner_ms = float(self._lp_target_ms) if (lp_fresh and self._lp_target_ms is not None) else float(current_set_ms)
     desired_ms = float(planner_ms)
     src = "lp_last" if lp_fresh else "hold"
+
+    startup_warmup = bool(self._enabled_since_ms and ((int(now) - int(self._enabled_since_ms)) < 2500))
+    startup_invalid_clear = (
+      startup_warmup
+      and (not self._lead_present)
+      and (
+        (not lp_fresh)
+        or (int(self._stable_plan_samples) < 2)
+        or (float(planner_ms) <= 0.1)
+        or (
+          float(v_ego_ms) > float(self.MIN_CRUISE_SPEED_MS)
+          and float(planner_ms) < max(float(self.MIN_CRUISE_SPEED_MS) * 0.90, float(current_set_ms) - (4.0 * CV.KPH_TO_MS))
+        )
+      )
+    )
+    if startup_invalid_clear:
+      desired_ms = float(current_set_ms)
+      src = f"{src}+startup_hold"
 
     max_accel_target_ms, ceiling_src = self._resolve_accel_ceiling_ms(CS, speed_units=speed_units)
     if max_accel_target_ms is not None:
