@@ -349,92 +349,92 @@ class LongitudinalMpc:
   def set_accel_limits(self, min_a, max_a):
     self.cruise_min_a = float(min_a)
     self.max_a = float(max_a)
-def update(self, radarstate, v_cruise, x, v, a, j, personality=log.LongitudinalPersonality.standard, t_follow_override=None, carstate=None):
-  # Unity parity: prefer live follow-distance when available, otherwise fall back
-  # to personality-based defaults.
-  if t_follow_override is not None:
-    try:
-      t_follow = float(t_follow_override)
-    except (TypeError, ValueError):
-      t_follow = get_T_FOLLOW(personality)
-  else:
-    follow_distance_s = 255
-    if carstate is not None:
+  def update(self, radarstate, v_cruise, x, v, a, j, personality=log.LongitudinalPersonality.standard, t_follow_override=None, carstate=None):
+    # Unity parity: prefer live follow-distance when available, otherwise fall back
+    # to personality-based defaults.
+    if t_follow_override is not None:
       try:
-        follow_distance_s = int(getattr(carstate, "followDistanceS", 255))
+        t_follow = float(t_follow_override)
       except (TypeError, ValueError):
-        follow_distance_s = 255
-
-    if 0 <= follow_distance_s <= 6:
-      t_follow = 0.7 + float(follow_distance_s) * 0.2
+        t_follow = get_T_FOLLOW(personality)
     else:
-      t_follow = get_T_FOLLOW(personality)
-
-  v_ego = self.x0[1]
-  self.status = radarstate.leadOne.status or radarstate.leadTwo.status
-
-  lead_xv_0 = self.process_lead(radarstate.leadOne)
-  lead_xv_1 = self.process_lead(radarstate.leadTwo)
-
-  lead_0_obstacle = lead_xv_0[:, 0] + get_stopped_equivalence_factor(lead_xv_0[:, 1])
-  lead_1_obstacle = lead_xv_1[:, 0] + get_stopped_equivalence_factor(lead_xv_1[:, 1])
-
-  # Unity used the global MIN_ACCEL lower constraint here; keep that behavior.
-  self.params[:, 0] = MIN_ACCEL
-  self.params[:, 1] = self.max_a
-
-  if self.mode == 'acc':
-    self.params[:, 5] = LEAD_DANGER_FACTOR
-
-    v_lower = v_ego + (T_IDXS * float(self.cruise_min_a) * 1.05)
-    v_upper = v_ego + (T_IDXS * float(self.max_a) * 1.05)
-    v_cruise_clipped = np.clip(v_cruise * np.ones(N + 1), v_lower, v_upper)
-    cruise_obstacle = np.cumsum(T_DIFFS * v_cruise_clipped) + get_safe_obstacle_distance(v_cruise_clipped, t_follow)
-    x_obstacles = np.column_stack([lead_0_obstacle, lead_1_obstacle, cruise_obstacle])
-    self.source = SOURCES[np.argmin(x_obstacles[0])]
-
-    x[:], v[:], a[:], j[:] = 0.0, 0.0, 0.0, 0.0
-
-  elif self.mode == 'blended':
-    self.params[:, 5] = 1.0
-
-    x_obstacles = np.column_stack([lead_0_obstacle, lead_1_obstacle])
-    cruise_target = T_IDXS * np.clip(v_cruise, v_ego - 2.0, 1e3) + x[0]
-    xforward = ((v[1:] + v[:-1]) / 2) * (T_IDXS[1:] - T_IDXS[:-1])
-    x = np.cumsum(np.insert(xforward, 0, x[0]))
-
-    x_and_cruise = np.column_stack([x, cruise_target])
-    x = np.min(x_and_cruise, axis=1)
-
-    self.source = 'e2e' if x_and_cruise[1, 0] < x_and_cruise[1, 1] else 'cruise'
-  else:
-    raise NotImplementedError(f'Planner mode {self.mode} not recognized in planner update')
-
-  self.yref[:, 1] = x
-  self.yref[:, 2] = v
-  self.yref[:, 3] = a
-  self.yref[:, 5] = j
-  for i in range(N):
-    self.solver.set(i, "yref", self.yref[i])
-  self.solver.set(N, "yref", self.yref[N][:COST_E_DIM])
-
-  self.params[:, 2] = np.min(x_obstacles, axis=1)
-  self.params[:, 3] = np.copy(self.prev_a)
-  self.params[:, 4] = t_follow
-
-  self.run()
-  if (np.any(lead_xv_0[FCW_IDXS, 0] - self.x_sol[FCW_IDXS, 0] < CRASH_DISTANCE) and
-          radarstate.leadOne.modelProb > 0.9):
-    self.crash_cnt += 1
-  else:
-    self.crash_cnt = 0
-
-  if self.mode == 'blended':
-    if any((lead_0_obstacle - get_safe_obstacle_distance(self.x_sol[:, 1], t_follow)) - self.x_sol[:, 0] < 0.0):
-      self.source = 'lead0'
-    if any((lead_1_obstacle - get_safe_obstacle_distance(self.x_sol[:, 1], t_follow)) - self.x_sol[:, 0] < 0.0) and          (lead_1_obstacle[0] - lead_0_obstacle[0]):
-      self.source = 'lead1'
-
+      follow_distance_s = 255
+      if carstate is not None:
+        try:
+          follow_distance_s = int(getattr(carstate, "followDistanceS", 255))
+        except (TypeError, ValueError):
+          follow_distance_s = 255
+  
+      if 0 <= follow_distance_s <= 6:
+        t_follow = 0.7 + float(follow_distance_s) * 0.2
+      else:
+        t_follow = get_T_FOLLOW(personality)
+  
+    v_ego = self.x0[1]
+    self.status = radarstate.leadOne.status or radarstate.leadTwo.status
+  
+    lead_xv_0 = self.process_lead(radarstate.leadOne)
+    lead_xv_1 = self.process_lead(radarstate.leadTwo)
+  
+    lead_0_obstacle = lead_xv_0[:, 0] + get_stopped_equivalence_factor(lead_xv_0[:, 1])
+    lead_1_obstacle = lead_xv_1[:, 0] + get_stopped_equivalence_factor(lead_xv_1[:, 1])
+  
+    # Unity used the global MIN_ACCEL lower constraint here; keep that behavior.
+    self.params[:, 0] = MIN_ACCEL
+    self.params[:, 1] = self.max_a
+  
+    if self.mode == 'acc':
+      self.params[:, 5] = LEAD_DANGER_FACTOR
+  
+      v_lower = v_ego + (T_IDXS * float(self.cruise_min_a) * 1.05)
+      v_upper = v_ego + (T_IDXS * float(self.max_a) * 1.05)
+      v_cruise_clipped = np.clip(v_cruise * np.ones(N + 1), v_lower, v_upper)
+      cruise_obstacle = np.cumsum(T_DIFFS * v_cruise_clipped) + get_safe_obstacle_distance(v_cruise_clipped, t_follow)
+      x_obstacles = np.column_stack([lead_0_obstacle, lead_1_obstacle, cruise_obstacle])
+      self.source = SOURCES[np.argmin(x_obstacles[0])]
+  
+      x[:], v[:], a[:], j[:] = 0.0, 0.0, 0.0, 0.0
+  
+    elif self.mode == 'blended':
+      self.params[:, 5] = 1.0
+  
+      x_obstacles = np.column_stack([lead_0_obstacle, lead_1_obstacle])
+      cruise_target = T_IDXS * np.clip(v_cruise, v_ego - 2.0, 1e3) + x[0]
+      xforward = ((v[1:] + v[:-1]) / 2) * (T_IDXS[1:] - T_IDXS[:-1])
+      x = np.cumsum(np.insert(xforward, 0, x[0]))
+  
+      x_and_cruise = np.column_stack([x, cruise_target])
+      x = np.min(x_and_cruise, axis=1)
+  
+      self.source = 'e2e' if x_and_cruise[1, 0] < x_and_cruise[1, 1] else 'cruise'
+    else:
+      raise NotImplementedError(f'Planner mode {self.mode} not recognized in planner update')
+  
+    self.yref[:, 1] = x
+    self.yref[:, 2] = v
+    self.yref[:, 3] = a
+    self.yref[:, 5] = j
+    for i in range(N):
+      self.solver.set(i, "yref", self.yref[i])
+    self.solver.set(N, "yref", self.yref[N][:COST_E_DIM])
+  
+    self.params[:, 2] = np.min(x_obstacles, axis=1)
+    self.params[:, 3] = np.copy(self.prev_a)
+    self.params[:, 4] = t_follow
+  
+    self.run()
+    if (np.any(lead_xv_0[FCW_IDXS, 0] - self.x_sol[FCW_IDXS, 0] < CRASH_DISTANCE) and
+            radarstate.leadOne.modelProb > 0.9):
+      self.crash_cnt += 1
+    else:
+      self.crash_cnt = 0
+  
+    if self.mode == 'blended':
+      if any((lead_0_obstacle - get_safe_obstacle_distance(self.x_sol[:, 1], t_follow)) - self.x_sol[:, 0] < 0.0):
+        self.source = 'lead0'
+      if any((lead_1_obstacle - get_safe_obstacle_distance(self.x_sol[:, 1], t_follow)) - self.x_sol[:, 0] < 0.0) and          (lead_1_obstacle[0] - lead_0_obstacle[0]):
+        self.source = 'lead1'
+  
   def run(self):
     # t0 = time.monotonic()
     # reset = 0
