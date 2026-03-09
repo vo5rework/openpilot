@@ -379,8 +379,9 @@ class LongitudinalMpc:
     lead_0_obstacle = lead_xv_0[:, 0] + get_stopped_equivalence_factor(lead_xv_0[:, 1])
     lead_1_obstacle = lead_xv_1[:, 0] + get_stopped_equivalence_factor(lead_xv_1[:, 1])
   
-    # Unity used the global MIN_ACCEL lower constraint here; keep that behavior.
-    self.params[:, 0] = MIN_ACCEL
+    # Keep XNOR's resolved lower-accel constraint; this is initialized from
+    # the Unity-parity cruise min accel value above.
+    self.params[:, 0] = self.cruise_min_a
     self.params[:, 1] = self.max_a
   
     if self.mode == 'acc':
