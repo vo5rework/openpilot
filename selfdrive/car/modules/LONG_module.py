@@ -184,7 +184,11 @@ class LongController:
     if (int(frame) % 20) != 0:
       return LongDecision(None, "gated: 5Hz(frame)")
 
-    controller_enabled = bool(enabled) and bool(getattr(CS, "enable_adaptive_cruise", False))
+    adaptive_enabled = bool(
+      getattr(CS, "enable_adaptive_cruise", False)
+      or getattr(CS, "enableACC", False)
+    )
+    controller_enabled = bool(enabled) and adaptive_enabled
     if not controller_enabled:
       self._last_active = False
       self._enabled_since_ms = 0

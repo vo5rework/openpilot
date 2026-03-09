@@ -65,10 +65,10 @@ class ACCController:
   _HUMAN_COOLDOWN_MS = 3000
   _AUTO_COOLDOWN_MS = 400
   _AUTO_COOLDOWN_ACCEL_MS = 200
-  _READBACK_WAIT_MS = 700
+  _READBACK_WAIT_MS = 500
   _REVERSAL_DAMP_MS = 400
-  _LEAD_REVERSAL_DAMP_MS = 700
-  _REVERSAL_PERSIST_MS = 300
+  _LEAD_REVERSAL_DAMP_MS = 450
+  _REVERSAL_PERSIST_MS = 150
   _FAST_DECEL_RESUME_HOLDOFF_MS = 2000
   _LEAD_FRESH_MS = 700
   _AUTOENGAGE_SPEED_WINDOW_MS = 0.8
@@ -327,20 +327,23 @@ class ACCController:
     steady_lead_follow = bool(lead.status and abs(float(lead.v_rel)) < 0.35 and 15.0 < float(lead.d_rel) < 35.0)
     strong_lead_opening = bool(lead.status and (float(lead.v_rel) > 0.8 or float(lead.d_rel) > 38.0))
 
-    accel_half_kph = float(half_kph) * (0.80 if opening_or_clear else 1.0)
-    accel_full_kph = float(full_kph) * (0.85 if opening_or_clear else 1.0)
+    accel_half_kph = float(half_kph) * (0.70 if opening_or_clear else 1.0)
+    accel_full_kph = float(full_kph) * (0.80 if opening_or_clear else 1.0)
 
+    # Unity was willing to re-accelerate as soon as the lead opened and the
+    # planner target came back up. Keep XNOR's smoothing, but do not raise the
+    # accel thresholds in steady follow the way earlier patches did.
     if mild_lead_follow and not strong_lead_opening:
-      accel_half_kph = max(accel_half_kph, 1.00 * float(half_kph))
+      accel_half_kph = min(accel_half_kph, 0.85 * float(half_kph))
     if steady_lead_follow and not strong_lead_opening:
-      accel_half_kph = max(accel_half_kph, 1.15 * float(half_kph))
-      accel_full_kph = max(accel_full_kph, 1.20 * float(full_kph))
+      accel_half_kph = min(accel_half_kph, 0.75 * float(half_kph))
+      accel_full_kph = min(accel_full_kph, 0.90 * float(full_kph))
 
     decel_half_kph = 0.9 * float(half_kph)
     if mild_lead_follow and not fast_decel_required:
-      decel_half_kph = max(decel_half_kph, 1.00 * float(half_kph))
+      decel_half_kph = min(decel_half_kph, 0.90 * float(half_kph))
     if steady_lead_follow and not fast_decel_required:
-      decel_half_kph = max(decel_half_kph, 1.10 * float(half_kph))
+      decel_half_kph = min(decel_half_kph, 0.80 * float(half_kph))
 
     allow_accel_full_step = (
       (not lead.status)
@@ -412,7 +415,7 @@ class ACCController:
         and self._last_auto_direction != 0
         and direction != self._last_auto_direction
         and (int(now_ms) - int(self._direction_change_time_ms)) < reversal_damp_ms
-        and abs(float(speed_offset_kph)) < ((0.90 * float(half_kph)) if steady_lead_follow else (0.75 * float(half_kph) if lead.status else 0.65 * float(half_kph)))
+        and abs(float(speed_offset_kph)) < ((0.55 * float(half_kph)) if steady_lead_follow else (0.50 * float(half_kph) if lead.status else 0.60 * float(half_kph)))
       ):
         return AccDecision(None, "gated: reversal damp", target_kph, current_kph, current_kph)
 
