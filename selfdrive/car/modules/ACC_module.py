@@ -307,8 +307,6 @@ class ACCController:
       button = int(CruiseButtons.CANCEL)
     elif self._fast_decel_required(v_ego_ms=v_ego_ms, lead=lead) and (current_kph > 0.0):
       button = int(CruiseButtons.CANCEL)
-    elif speed_offset_kph < (-2.0 * float(full_kph)) and current_kph > 0.0:
-      button = int(CruiseButtons.CANCEL)
     elif speed_offset_kph < (-0.6 * float(full_kph)) and current_kph > 0.0:
       button = int(CruiseButtons.DECEL_2ND)
     elif speed_offset_kph < (-0.9 * float(half_kph)) and current_kph > 0.0:

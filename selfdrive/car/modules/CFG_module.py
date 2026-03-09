@@ -8,39 +8,80 @@ except ImportError:  # pragma: no cover
 
 _P = Params()
 
+
+def _safe_get(param: str):
+  try:
+    return _P.get(param)
+  except Exception:
+    return None
+
+
 def save_bool_param(param: str, val: bool) -> None:
-  _P.put_bool(param, bool(val))
+  try:
+    _P.put_bool(param, bool(val))
+  except Exception:
+    pass
+
 
 def load_bool_param(param: str, default_val: bool) -> bool:
-  if _P.get(param) is None:
-    _P.put_bool(param, bool(default_val))
+  v = _safe_get(param)
+  if v is None:
+    try:
+      _P.put_bool(param, bool(default_val))
+    except Exception:
+      pass
     return bool(default_val)
-  return _P.get_bool(param)
+  try:
+    return _P.get_bool(param)
+  except Exception:
+    return bool(default_val)
+
 
 def save_float_param(param: str, val: float) -> None:
-  _P.put(param, str(float(val)))
+  try:
+    _P.put(param, str(float(val)))
+  except Exception:
+    pass
+
 
 def load_float_param(param: str, default_val: float) -> float:
-  v = _P.get(param)
+  v = _safe_get(param)
   if v is None:
-    _P.put(param, str(float(default_val)))
+    try:
+      _P.put(param, str(float(default_val)))
+    except Exception:
+      pass
     return float(default_val)
   try:
     return float(v)
   except Exception:
-    _P.put(param, str(float(default_val)))
+    try:
+      _P.put(param, str(float(default_val)))
+    except Exception:
+      pass
     return float(default_val)
 
+
 def save_str_param(param: str, val: str) -> None:
-  _P.put(param, str(val))
+  try:
+    _P.put(param, str(val))
+  except Exception:
+    pass
+
 
 def load_str_param(param: str, default_val: str) -> str:
-  v = _P.get(param)
+  v = _safe_get(param)
   if v is None:
-    _P.put(param, str(default_val))
+    try:
+      _P.put(param, str(default_val))
+    except Exception:
+      pass
     return str(default_val)
   try:
     return v.decode() if isinstance(v, (bytes, bytearray)) else str(v)
   except Exception:
-    _P.put(param, str(default_val))
+    try:
+      _P.put(param, str(default_val))
+    except Exception:
+      pass
     return str(default_val)

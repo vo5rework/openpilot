@@ -10,7 +10,6 @@ from openpilot.common.filter_simple import FirstOrderFilter
 from openpilot.common.realtime import DT_MDL
 from openpilot.common.swaglog import cloudlog
 from openpilot.selfdrive.car.cruise import V_CRUISE_MAX, V_CRUISE_UNSET
-from openpilot.selfdrive.car.modules.CFG_module import load_bool_param, load_float_param
 from openpilot.selfdrive.controls.lib.drive_helpers import CONTROL_N, get_accel_from_plan
 from openpilot.selfdrive.controls.lib.longcontrol import LongCtrlState
 from openpilot.selfdrive.controls.lib.longitudinal_mpc_lib.long_mpc import LongitudinalMpc
@@ -26,7 +25,7 @@ ALLOW_THROTTLE_THRESHOLD = 0.4
 MIN_ALLOW_THROTTLE_SPEED = 2.5
 MAX_VEL_ERR = 5.0
 CURVE_CRUISE_WINDOW = 4
-CURVE_CRUISE_MARGIN = 0.5
+CURVE_CRUISE_MARGIN = 1.0
 
 _A_TOTAL_MAX_V = [1.7, 3.2]
 _A_TOTAL_MAX_BP = [20.0, 40.0]
@@ -90,8 +89,8 @@ class LongitudinalPlanner:
     self.solverExecutionTime = 0.0
 
     self.v_model_error = 0.0
-    self.enable_turn_slowdown = load_bool_param("TinklaTurnSlowdown", True)
-    self.turn_slowdown_factor = load_float_param("TinklaTurnSlowdownFactor", 1.0)
+    self.enable_turn_slowdown = True
+    self.turn_slowdown_factor = 1.0
     self.curve_cruise_target = 0.0
     self.curve_slowdown_active = False
 
@@ -123,10 +122,14 @@ class LongitudinalPlanner:
   def _get_curve_cruise_target(v_profile) -> float:
     if len(v_profile) == 0:
       return 0.0
-    window = v_profile[:min(CURVE_CRUISE_WINDOW, len(v_profile))]
+    window = np.asarray(v_profile[:min(CURVE_CRUISE_WINDOW, len(v_profile))], dtype=float)
+    window = window[np.isfinite(window)]
     if len(window) == 0:
       return 0.0
-    return float(np.min(window))
+    if len(window) == 1:
+      return float(window[0])
+    sorted_window = np.sort(window)
+    return float(sorted_window[1])
 
   def update(self, sm):
     controls_state = sm["controlsState"]
@@ -197,7 +200,7 @@ class LongitudinalPlanner:
       mode == "acc"
       and self.enable_turn_slowdown
       and self.curve_cruise_target > 0.0
-      and self.curve_cruise_target < float(v_cruise)
+      and self.curve_cruise_target < (float(v_cruise) - CURVE_CRUISE_MARGIN)
       and self.curve_cruise_target < (v_ego - CURVE_CRUISE_MARGIN)
     )
     if self.curve_slowdown_active:
