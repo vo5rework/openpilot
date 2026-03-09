@@ -10,6 +10,7 @@ from openpilot.common.filter_simple import FirstOrderFilter
 from openpilot.common.realtime import DT_MDL
 from openpilot.common.swaglog import cloudlog
 from openpilot.selfdrive.car.cruise import V_CRUISE_MAX, V_CRUISE_UNSET
+from openpilot.selfdrive.car.modules.CFG_module import load_bool_param, load_float_param
 from openpilot.selfdrive.controls.lib.drive_helpers import CONTROL_N, get_accel_from_plan
 from openpilot.selfdrive.controls.lib.longcontrol import LongCtrlState
 from openpilot.selfdrive.controls.lib.longitudinal_mpc_lib.long_mpc import LongitudinalMpc
@@ -17,21 +18,18 @@ from openpilot.selfdrive.controls.lib.longitudinal_mpc_lib.long_mpc import T_IDX
 from openpilot.selfdrive.modeld.constants import ModelConstants
 
 LON_MPC_STEP = 0.2
-A_CRUISE_MIN = -4.0
+A_CRUISE_MIN = -1.2
 A_CRUISE_MAX_VALS = [1.6, 1.2, 0.8, 0.6]
 A_CRUISE_MAX_BP = [0.0, 10.0, 25.0, 40.0]
 CONTROL_N_T_IDX = ModelConstants.T_IDXS[:CONTROL_N]
 ALLOW_THROTTLE_THRESHOLD = 0.4
 MIN_ALLOW_THROTTLE_SPEED = 2.5
 MAX_VEL_ERR = 5.0
+CURVE_CRUISE_WINDOW = 4
+CURVE_CRUISE_MARGIN = 0.5
 
 _A_TOTAL_MAX_V = [1.7, 3.2]
 _A_TOTAL_MAX_BP = [20.0, 40.0]
-
-CURVE_PEAK_THRESHOLD = 0.0020
-AREA_THRESHOLD = 0.012
-VISION_CURVE_TARGET_LAT_A = 2.1
-CURVE_SLOWDOWN_SPEED_MARGIN = 0.5
 
 
 def get_max_accel(v_ego: float) -> float:
@@ -61,14 +59,6 @@ def get_speed_error(model_msg, v_ego: float) -> float:
   return 0.0
 
 
-def _rate_limited_filter(filt: FirstOrderFilter, new_x: float, rc_up: float, rc_down: float) -> float:
-  if new_x < float(filt.x):
-    filt.update_alpha(rc_down)
-  else:
-    filt.update_alpha(rc_up)
-  return float(filt.update(new_x))
-
-
 def limit_accel_in_turns(v_ego: float, angle_steers: float, a_target, CP):
   a_total_max = np.interp(v_ego, _A_TOTAL_MAX_BP, _A_TOTAL_MAX_V)
   a_y = v_ego ** 2 * angle_steers * CV.DEG_TO_RAD / (CP.steerRatio * CP.wheelbase)
@@ -83,8 +73,6 @@ class LongitudinalPlanner:
     mpc_update_params = tuple(inspect.signature(self.mpc.update).parameters.keys())
     self._mpc_update_first_param = mpc_update_params[0] if len(mpc_update_params) > 0 else ""
     self._mpc_update_accepts_carstate = "carstate" in mpc_update_params
-    set_weights_params = tuple(inspect.signature(self.mpc.set_weights).parameters.keys())
-    self._mpc_set_weights_accepts_custom = "weights" in set_weights_params
     self.mpc.mode = "acc"
     self.fcw = False
     self.dt = dt
@@ -101,13 +89,14 @@ class LongitudinalPlanner:
     self.j_desired_trajectory = np.zeros(CONTROL_N)
     self.solverExecutionTime = 0.0
 
-    self.v_turn_filter = FirstOrderFilter(init_v, 0.2, self.dt)
-    self.curve_detected = False
-    self.curve_slowdown_active = False
     self.v_model_error = 0.0
+    self.enable_turn_slowdown = load_bool_param("TinklaTurnSlowdown", True)
+    self.turn_slowdown_factor = load_float_param("TinklaTurnSlowdownFactor", 1.0)
+    self.curve_cruise_target = 0.0
+    self.curve_slowdown_active = False
 
   @staticmethod
-  def parse_model(model_msg, model_error: float, v_ego: float, v_turn_filter: FirstOrderFilter):
+  def parse_model(model_msg, model_error: float, v_ego: float, enable_turn_slowdown: bool, turn_slowdown_factor: float):
     x = np.zeros(len(T_IDXS_MPC))
     v = np.zeros(len(T_IDXS_MPC))
     a = np.zeros(len(T_IDXS_MPC))
@@ -119,44 +108,25 @@ class LongitudinalPlanner:
       and len(model_msg.acceleration.x) == ModelConstants.IDX_N
     ):
       x = np.interp(T_IDXS_MPC, ModelConstants.T_IDXS, model_msg.position.x) - model_error * T_IDXS_MPC
-      v_raw = np.interp(T_IDXS_MPC, ModelConstants.T_IDXS, model_msg.velocity.x)
+      v = np.interp(T_IDXS_MPC, ModelConstants.T_IDXS, model_msg.velocity.x) - model_error
       a = np.interp(T_IDXS_MPC, ModelConstants.T_IDXS, model_msg.acceleration.x)
 
-      v_corrected = np.maximum(v_raw, max(0.0, v_ego - 1.5)) - model_error
+      if enable_turn_slowdown and len(model_msg.orientationRate.z) == ModelConstants.IDX_N:
+        max_lat_accel = float(np.interp(v_ego, [5.0, 10.0, 20.0], [1.5, 2.0, 3.0]))
+        curvatures = np.interp(T_IDXS_MPC, ModelConstants.T_IDXS, model_msg.orientationRate.z) / np.clip(v, 0.3, 100.0)
+        max_v = float(turn_slowdown_factor) * np.sqrt(max_lat_accel / (np.abs(curvatures) + 1e-3)) - 2.0
+        v = np.minimum(max_v, v)
 
-      if len(model_msg.orientationRate.z) == ModelConstants.IDX_N:
-        raw_curv = np.abs(np.interp(T_IDXS_MPC, ModelConstants.T_IDXS, model_msg.orientationRate.z)) / np.clip(v_corrected, 0.3, 100.0)
-        num_idx = len(raw_curv)
-        if num_idx > 0:
-          far_start = min(10, max(0, num_idx - 1))
-          far_end = min(32, num_idx)
-          far_curv_peak = float(np.max(raw_curv[far_start:far_end])) if far_end > far_start else 0.0
-        else:
-          far_curv_peak = 0.0
+    return x, v, a, j
 
-        anticipatory_slowdown = float(np.interp(far_curv_peak, [0.0008, 0.003], [1.0, 0.78]))
-        curve_area = float(np.sum(raw_curv[:25]) * LON_MPC_STEP)
-        max_curv_ahead = float(np.max(raw_curv[2:20])) if num_idx > 2 else 0.0
-
-        if (curve_area > AREA_THRESHOLD) or (max_curv_ahead > CURVE_PEAK_THRESHOLD):
-          lat_stress_factor = float((v_ego ** 2) * max_curv_ahead)
-          torque_multiplier = float(np.interp(lat_stress_factor, [0.015, 0.05], [1.0, 0.65]))
-          dynamic_multiplier = float(np.interp(max_curv_ahead, [0.0015, 0.008], [1.0, 0.70]))
-          max_v_curve = dynamic_multiplier * torque_multiplier * anticipatory_slowdown * math.sqrt(max(VISION_CURVE_TARGET_LAT_A / (max_curv_ahead + 1e-4), 0.0))
-          v_curve = _rate_limited_filter(v_turn_filter, max_v_curve, rc_up=0.30, rc_down=0.05)
-          # Keep Unity curve detection, but only arm slowdown when the filtered curve target is below ego speed.
-          curve_slowdown_active = bool(v_curve < (v_ego - CURVE_SLOWDOWN_SPEED_MARGIN))
-          v = np.minimum(v_curve, v_corrected)
-          return x, v, a, j, True, curve_slowdown_active
-
-        v = v_corrected
-        if anticipatory_slowdown < 1.0:
-          v = np.minimum(v * anticipatory_slowdown, v)
-        return x, v, a, j, bool(anticipatory_slowdown < 0.98), False
-
-      v = v_corrected
-
-    return x, v, a, j, False, False
+  @staticmethod
+  def _get_curve_cruise_target(v_profile) -> float:
+    if len(v_profile) == 0:
+      return 0.0
+    window = v_profile[:min(CURVE_CRUISE_WINDOW, len(v_profile))]
+    if len(window) == 0:
+      return 0.0
+    return float(np.min(window))
 
   def update(self, sm):
     controls_state = sm["controlsState"]
@@ -203,7 +173,7 @@ class LongitudinalPlanner:
 
     self.v_desired_filter.x = max(0.0, self.v_desired_filter.update(v_ego))
     self.v_model_error = get_speed_error(sm["modelV2"], v_ego)
-    x, v, a, j, self.curve_detected, self.curve_slowdown_active = self.parse_model(sm["modelV2"], self.v_model_error, v_ego, self.v_turn_filter)
+    x, v, a, j = self.parse_model(sm["modelV2"], self.v_model_error, v_ego, self.enable_turn_slowdown, self.turn_slowdown_factor)
 
     throttle_prob = 1.0
     try:
@@ -222,31 +192,35 @@ class LongitudinalPlanner:
       )
       accel_clip_turns[1] = min(accel_clip_turns[1], clipped_accel_coast_interp)
 
+    self.curve_cruise_target = self._get_curve_cruise_target(v)
+    self.curve_slowdown_active = bool(
+      mode == "acc"
+      and self.enable_turn_slowdown
+      and self.curve_cruise_target > 0.0
+      and self.curve_cruise_target < float(v_cruise)
+      and self.curve_cruise_target < (v_ego - CURVE_CRUISE_MARGIN)
+    )
+    if self.curve_slowdown_active:
+      v_cruise = max(0.0, float(self.curve_cruise_target))
+
     if force_slow_decel:
       v_cruise = 0.0
 
-    if self.curve_slowdown_active and self._mpc_set_weights_accepts_custom:
-      self.mpc.set_weights(prev_accel_constraint, personality=personality, weights=[2.0, 5.0, 40.0])
-    else:
+    if hasattr(self.mpc, "set_weights"):
       self.mpc.set_weights(prev_accel_constraint, personality=personality)
 
     if hasattr(self.mpc, "set_accel_limits"):
-      if self.curve_slowdown_active:
-        self.mpc.set_accel_limits(accel_clip_turns[0], min(self.a_desired - 0.3, -0.1))
-      else:
-        self.mpc.set_accel_limits(accel_clip_turns[0], accel_clip_turns[1])
+      self.mpc.set_accel_limits(accel_clip_turns[0], accel_clip_turns[1])
 
     self.mpc.set_cur_state(self.v_desired_filter.x, self.a_desired)
 
-    v_target = v if self.curve_slowdown_active else np.maximum(v, max(0.0, float(v_cruise) - 0.1))
-
     if self._mpc_update_first_param == "carstate":
-      self.mpc.update(sm["carState"], sm["radarState"], v_cruise, x, v_target, a, j, personality=personality)
+      self.mpc.update(sm["carState"], sm["radarState"], v_cruise, x, v, a, j, personality=personality)
     else:
       update_kwargs = {"personality": personality}
       if self._mpc_update_accepts_carstate:
         update_kwargs["carstate"] = sm["carState"]
-      self.mpc.update(sm["radarState"], v_cruise, x, v_target, a, j, **update_kwargs)
+      self.mpc.update(sm["radarState"], v_cruise, x, v, a, j, **update_kwargs)
 
     self.v_desired_trajectory = np.interp(CONTROL_N_T_IDX, T_IDXS_MPC, self.mpc.v_solution)
     self.a_desired_trajectory = np.interp(CONTROL_N_T_IDX, T_IDXS_MPC, self.mpc.a_solution)
