@@ -17,6 +17,7 @@ from openpilot.selfdrive.controls.lib.longitudinal_mpc_lib.long_mpc import T_IDX
 from openpilot.selfdrive.modeld.constants import ModelConstants
 
 LON_MPC_STEP = 0.2
+A_CRUISE_MIN = -4.0
 A_CRUISE_MAX_VALS = [1.6, 1.2, 0.8, 0.6]
 A_CRUISE_MAX_BP = [0.0, 10.0, 25.0, 40.0]
 CONTROL_N_T_IDX = ModelConstants.T_IDXS[:CONTROL_N]
@@ -60,7 +61,7 @@ def get_speed_error(model_msg, v_ego: float) -> float:
 
 
 def _rate_limited_filter(filt: FirstOrderFilter, new_x: float, rc_up: float, rc_down: float) -> float:
-  if new_x < filt.x:
+  if new_x < float(filt.x):
     filt.update_alpha(rc_down)
   else:
     filt.update_alpha(rc_up)
@@ -81,7 +82,6 @@ class LongitudinalPlanner:
     mpc_update_params = tuple(inspect.signature(self.mpc.update).parameters.keys())
     self._mpc_update_first_param = mpc_update_params[0] if len(mpc_update_params) > 0 else ""
     self._mpc_update_accepts_carstate = "carstate" in mpc_update_params
-    self._mpc_update_accepts_t_follow_override = "t_follow_override" in mpc_update_params
     set_weights_params = tuple(inspect.signature(self.mpc.set_weights).parameters.keys())
     self._mpc_set_weights_accepts_custom = "weights" in set_weights_params
     self.mpc.mode = "acc"
@@ -125,43 +125,34 @@ class LongitudinalPlanner:
       if len(model_msg.orientationRate.z) == ModelConstants.IDX_N:
         raw_curv = np.abs(np.interp(T_IDXS_MPC, ModelConstants.T_IDXS, model_msg.orientationRate.z)) / np.clip(v_corrected, 0.3, 100.0)
         num_idx = len(raw_curv)
-        far_start = min(10, max(0, num_idx - 1))
-        far_end = min(32, num_idx)
-        far_curv_peak = float(np.max(raw_curv[far_start:far_end])) if far_end > far_start else 0.0
-        anticipatory_slowdown = float(np.interp(far_curv_peak, [0.0008, 0.003], [1.0, 0.78]))
+        if num_idx > 0:
+          far_start = min(10, max(0, num_idx - 1))
+          far_end = min(32, num_idx)
+          far_curv_peak = float(np.max(raw_curv[far_start:far_end])) if far_end > far_start else 0.0
+        else:
+          far_curv_peak = 0.0
 
+        anticipatory_slowdown = float(np.interp(far_curv_peak, [0.0008, 0.003], [1.0, 0.78]))
         curve_area = float(np.sum(raw_curv[:25]) * LON_MPC_STEP)
         max_curv_ahead = float(np.max(raw_curv[2:20])) if num_idx > 2 else 0.0
-        curve_detected = (curve_area > AREA_THRESHOLD) or (max_curv_ahead > CURVE_PEAK_THRESHOLD)
 
-        if curve_detected:
+        if (curve_area > AREA_THRESHOLD) or (max_curv_ahead > CURVE_PEAK_THRESHOLD):
           lat_stress_factor = float((v_ego ** 2) * max_curv_ahead)
           torque_multiplier = float(np.interp(lat_stress_factor, [0.015, 0.05], [1.0, 0.65]))
           dynamic_multiplier = float(np.interp(max_curv_ahead, [0.0015, 0.008], [1.0, 0.70]))
           max_v_curve = dynamic_multiplier * torque_multiplier * anticipatory_slowdown * math.sqrt(max(VISION_CURVE_TARGET_LAT_A / (max_curv_ahead + 1e-4), 0.0))
-
-          if hasattr(v_turn_filter, "k"):
-            try:
-              v_turn_filter.k = 15.0 if max_v_curve < float(v_turn_filter.x) else 0.3
-              v_curve = float(v_turn_filter.update(max_v_curve))
-            except Exception:
-              v_curve = _rate_limited_filter(v_turn_filter, max_v_curve, rc_up=0.3, rc_down=0.05)
-          else:
-            v_curve = _rate_limited_filter(v_turn_filter, max_v_curve, rc_up=0.3, rc_down=0.05)
-
+          v_curve = _rate_limited_filter(v_turn_filter, max_v_curve, rc_up=0.30, rc_down=0.05)
           v = np.minimum(v_curve, v_corrected)
           return x, v, a, j, True
 
         v = v_corrected
         if anticipatory_slowdown < 1.0:
           v = np.minimum(v * anticipatory_slowdown, v)
-
         return x, v, a, j, bool(anticipatory_slowdown < 0.98)
 
       v = v_corrected
 
     return x, v, a, j, False
-
 
   def update(self, sm):
     controls_state = sm["controlsState"]
@@ -169,22 +160,20 @@ class LongitudinalPlanner:
 
     experimental_mode = bool(getattr(controls_state, "experimentalMode", getattr(selfdrive_state, "experimentalMode", False)))
     enabled_state = bool(getattr(controls_state, "enabled", getattr(selfdrive_state, "enabled", False)))
-    personality = getattr(selfdrive_state, "personality", getattr(self, "personality", 0))
+    personality = getattr(selfdrive_state, "personality", 0)
 
     mode = "blended" if experimental_mode else "acc"
+    self.mpc.mode = mode
 
     if len(sm["carControl"].orientationNED) == 3:
       accel_coast = get_coast_accel(sm["carControl"].orientationNED[1])
     else:
       accel_coast = ACCEL_MAX
 
-    v_ego = sm["carState"].vEgo
+    v_ego = float(sm["carState"].vEgo)
 
-    controls_v_cruise = float(getattr(controls_state, "vCruise", 0.0) or 0.0)
-    if 0.1 < controls_v_cruise < float(V_CRUISE_UNSET):
-      v_cruise_kph = min(controls_v_cruise, float(V_CRUISE_MAX))
-    else:
-      v_cruise_kph = min(float(sm["carState"].vCruise), float(V_CRUISE_MAX))
+    carstate_v_cruise = float(getattr(sm["carState"], "vCruise", 0.0) or 0.0)
+    v_cruise_kph = min(carstate_v_cruise, float(V_CRUISE_MAX))
     v_cruise = v_cruise_kph * CV.KPH_TO_MS
     v_cruise_initialized = (v_cruise_kph > 0.1) and (v_cruise_kph < float(V_CRUISE_UNSET))
 
@@ -197,7 +186,7 @@ class LongitudinalPlanner:
     prev_accel_constraint = not (reset_state or sm["carState"].standstill)
 
     if mode == "acc":
-      accel_clip = [ACCEL_MIN, get_max_accel(v_ego)]
+      accel_clip = [A_CRUISE_MIN, get_max_accel(v_ego)]
       steer_angle_without_offset = sm["carState"].steeringAngleDeg - sm["liveParameters"].angleOffsetDeg
       accel_clip_turns = limit_accel_in_turns(v_ego, steer_angle_without_offset, accel_clip, self.CP)
     else:
@@ -289,7 +278,6 @@ class LongitudinalPlanner:
       accel_clip_turns[idx] = np.clip(accel_clip_turns[idx], self.prev_accel_clip[idx] - 0.05, self.prev_accel_clip[idx] + 0.05)
     self.output_a_target = np.clip(output_a_target, accel_clip_turns[0], accel_clip_turns[1])
     self.prev_accel_clip = accel_clip_turns
-
 
   def publish(self, sm, pm):
     plan_send = messaging.new_message("longitudinalPlan")

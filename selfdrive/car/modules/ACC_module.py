@@ -305,7 +305,7 @@ class ACCController:
 
     opening_or_clear = (not lead.status) or (lead.v_rel > 0.1)
     mild_lead_follow = bool(lead.status and abs(float(lead.v_rel)) < 1.0 and float(lead.d_rel) > 15.0)
-    steady_lead_follow = bool(lead.status and abs(float(lead.v_rel)) < 0.60 and 22.0 < float(lead.d_rel) < 75.0)
+    steady_lead_follow = bool(lead.status and abs(float(lead.v_rel)) < 0.75 and 18.0 < float(lead.d_rel) < 85.0)
     strong_lead_opening = bool(lead.status and (float(lead.v_rel) > 1.5 or float(lead.d_rel) > 45.0))
 
     accel_half_kph = float(half_kph) * (0.75 if opening_or_clear else 1.0)
@@ -314,24 +314,24 @@ class ACCController:
     if mild_lead_follow and not strong_lead_opening:
       accel_half_kph = max(accel_half_kph, 1.10 * float(half_kph))
     if steady_lead_follow and not strong_lead_opening:
-      accel_half_kph = max(accel_half_kph, 1.45 * float(half_kph))
-      accel_full_kph = max(accel_full_kph, 1.90 * float(full_kph))
+      accel_half_kph = max(accel_half_kph, 1.70 * float(half_kph))
+      accel_full_kph = max(accel_full_kph, 2.20 * float(full_kph))
 
     decel_half_kph = 0.9 * float(half_kph)
     if mild_lead_follow and not self._fast_decel_required(v_ego_ms=v_ego_ms, lead=lead):
       decel_half_kph = 1.10 * float(half_kph)
     if steady_lead_follow and not self._fast_decel_required(v_ego_ms=v_ego_ms, lead=lead):
-      decel_half_kph = max(decel_half_kph, 1.35 * float(half_kph))
+      decel_half_kph = max(decel_half_kph, 1.55 * float(half_kph))
 
     allow_accel_full_step = (
       (not lead.status)
       or strong_lead_opening
-      or (speed_offset_kph >= (2.5 * float(full_kph)) and not steady_lead_follow)
+      or (speed_offset_kph >= (3.0 * float(full_kph)) and not steady_lead_follow)
     )
     allow_decel_full_step = (
       (not lead.status)
       or self._fast_decel_required(v_ego_ms=v_ego_ms, lead=lead)
-      or (lead.status and (float(lead.v_rel) < -3.5 or speed_offset_kph < (-1.50 * float(full_kph))))
+      or (lead.status and (not steady_lead_follow) and (float(lead.v_rel) < -3.8 or speed_offset_kph < (-1.75 * float(full_kph))))
     )
 
     button: Optional[int] = None
@@ -375,7 +375,7 @@ class ACCController:
       ):
         return AccDecision(None, "gated: waiting readback", target_kph, current_kph, current_kph)
 
-      steady_lead_follow = bool(lead.status and abs(float(lead.v_rel)) < 0.60 and 22.0 < float(lead.d_rel) < 75.0)
+      steady_lead_follow = bool(lead.status and abs(float(lead.v_rel)) < 0.75 and 18.0 < float(lead.d_rel) < 85.0)
       reversal_damp_ms = int((self._LEAD_REVERSAL_DAMP_MS + 350) if steady_lead_follow else (self._LEAD_REVERSAL_DAMP_MS if lead.status else self._REVERSAL_DAMP_MS))
       if (
         direction != 0
