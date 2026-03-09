@@ -3,21 +3,21 @@
 Unity-parity Tesla cruise stalk button selection for XNOR.
 
 What this patch fixes
-- Restores XNOR's useful readback / reversal damping so lead following stays
-  smooth instead of oscillating around a close lead.
-- Removes the non-Unity "large negative target => CANCEL" path that was causing
-  nuisance stock-cruise dropouts.
-- Keeps stock cruise engaged for curve slowdowns by clamping clear-road targets
-  to Tesla's minimum cruise speed instead of cancelling outright.
-- Still preserves CANCEL for true fast-decel / imminent-lead cases.
+- Brings engaged ACC button selection closer to Unity again while keeping the
+  useful XNOR readback smoothing.
+- Removes the non-Unity "fast decel lead => immediate CANCEL" behavior that was
+  still causing nuisance dropouts instead of stepped decel.
+- Relaxes lead-follow accel and reversal damping so the car can recover speed
+  more naturally as a lead opens instead of lingering below the target.
 
 Why this is the right adaptation
-- The attached logs show the planner is already dropping speed on real turns.
-  The failure is downstream: LONG/ACC were sometimes converting a low target
-  into a full cruise cancel, or were fighting the speed limit while following a
-  lead.
-- Unity's older flow was simple, but XNOR still benefits from readback and
-  reversal damping because stock-cruise stalk commands are discrete.
+- The latest logs show lead-following is mostly a threshold problem now, not a
+  planner-horizon problem: the set speed steps down, then hesitates to step back
+  up.
+- Unity's older engaged ACC logic was simpler and less conservative. XNOR still
+  benefits from readback and reversal damping because stock-cruise stalk
+  commands are discrete, but the damping needs to stay light enough that it does
+  not suppress normal re-accel or turn large slowdowns into a full CANCEL.
 """
 
 from __future__ import annotations
@@ -67,8 +67,8 @@ class ACCController:
   _AUTO_COOLDOWN_ACCEL_MS = 200
   _READBACK_WAIT_MS = 700
   _REVERSAL_DAMP_MS = 400
-  _LEAD_REVERSAL_DAMP_MS = 1100
-  _REVERSAL_PERSIST_MS = 450
+  _LEAD_REVERSAL_DAMP_MS = 700
+  _REVERSAL_PERSIST_MS = 300
   _FAST_DECEL_RESUME_HOLDOFF_MS = 2000
   _LEAD_FRESH_MS = 700
   _AUTOENGAGE_SPEED_WINDOW_MS = 0.8
@@ -161,6 +161,20 @@ class ACCController:
     lead_too_slow = lead_absolute_speed_ms < float(self.MIN_CRUISE_SPEED_MS)
 
     return bool(collision_imminent or lead_too_slow)
+
+  def _cancel_required(self, *, v_ego_ms: float, current_set_speed_ms: float, desired_speed_ms: float, lead: LeadInfo) -> bool:
+    if not lead.status or lead.d_rel <= 0.0:
+      return False
+
+    ttc_s = self._seconds_to_collision(lead=lead)
+    desired_below_min = float(desired_speed_ms) < float(self.MIN_CRUISE_SPEED_MS)
+    current_near_min = float(current_set_speed_ms) <= (float(self.MIN_CRUISE_SPEED_MS) + (0.55 * CV.KPH_TO_MS))
+    materially_closing = float(lead.v_rel) < -1.5
+
+    return bool(
+      (ttc_s < 2.5)
+      or (desired_below_min and current_near_min and materially_closing and ttc_s < 5.0)
+    )
 
   def _should_autoengage_cc(
     self,
@@ -308,43 +322,49 @@ class ACCController:
     speed_offset_kph = float(target_kph) - float(current_kph)
     available_speed_kph = float(max_target_kph) - float(current_kph)
 
-    opening_or_clear = (not lead.status) or (lead.v_rel > 0.1)
-    mild_lead_follow = bool(lead.status and abs(float(lead.v_rel)) < 1.0 and float(lead.d_rel) > 15.0)
-    steady_lead_follow = bool(lead.status and abs(float(lead.v_rel)) < 0.75 and 18.0 < float(lead.d_rel) < 85.0)
-    strong_lead_opening = bool(lead.status and (float(lead.v_rel) > 1.5 or float(lead.d_rel) > 45.0))
+    opening_or_clear = (not lead.status) or (lead.v_rel > 0.0) or (lead.d_rel > 40.0)
+    mild_lead_follow = bool(lead.status and abs(float(lead.v_rel)) < 0.6 and 12.0 < float(lead.d_rel) < 50.0)
+    steady_lead_follow = bool(lead.status and abs(float(lead.v_rel)) < 0.35 and 15.0 < float(lead.d_rel) < 35.0)
+    strong_lead_opening = bool(lead.status and (float(lead.v_rel) > 0.8 or float(lead.d_rel) > 38.0))
 
-    accel_half_kph = float(half_kph) * (0.75 if opening_or_clear else 1.0)
-    accel_full_kph = float(full_kph) * (0.75 if opening_or_clear else 1.0)
+    accel_half_kph = float(half_kph) * (0.80 if opening_or_clear else 1.0)
+    accel_full_kph = float(full_kph) * (0.85 if opening_or_clear else 1.0)
 
     if mild_lead_follow and not strong_lead_opening:
-      accel_half_kph = max(accel_half_kph, 1.10 * float(half_kph))
+      accel_half_kph = max(accel_half_kph, 1.00 * float(half_kph))
     if steady_lead_follow and not strong_lead_opening:
-      accel_half_kph = max(accel_half_kph, 1.70 * float(half_kph))
-      accel_full_kph = max(accel_full_kph, 2.20 * float(full_kph))
+      accel_half_kph = max(accel_half_kph, 1.15 * float(half_kph))
+      accel_full_kph = max(accel_full_kph, 1.20 * float(full_kph))
 
     decel_half_kph = 0.9 * float(half_kph)
     if mild_lead_follow and not fast_decel_required:
-      decel_half_kph = 1.10 * float(half_kph)
+      decel_half_kph = max(decel_half_kph, 1.00 * float(half_kph))
     if steady_lead_follow and not fast_decel_required:
-      decel_half_kph = max(decel_half_kph, 1.55 * float(half_kph))
+      decel_half_kph = max(decel_half_kph, 1.10 * float(half_kph))
 
     allow_accel_full_step = (
       (not lead.status)
       or strong_lead_opening
-      or (speed_offset_kph >= (3.0 * float(full_kph)) and not steady_lead_follow)
+      or (speed_offset_kph >= (2.0 * float(full_kph)) and not steady_lead_follow)
     )
     allow_decel_full_step = (
       (not lead.status)
-      or fast_decel_required
-      or (lead.status and (not steady_lead_follow) and (float(lead.v_rel) < -3.8 or speed_offset_kph < (-1.75 * float(full_kph))))
+      or (lead.status and ((float(lead.v_rel) < -3.2) or speed_offset_kph < (-1.35 * float(full_kph))))
+    )
+
+    cancel_required = self._cancel_required(
+      v_ego_ms=v_ego_ms,
+      current_set_speed_ms=current_set_speed_ms,
+      desired_speed_ms=desired_target_ms,
+      lead=lead,
     )
 
     button: Optional[int] = None
-    if fast_decel_required and (current_kph > 0.0):
+    if cancel_required and (current_kph > 0.0):
       button = int(CruiseButtons.CANCEL)
-    elif allow_decel_full_step and speed_offset_kph < (-0.95 * float(full_kph)) and current_kph > 0.0:
+    elif allow_decel_full_step and speed_offset_kph < (-0.6 * float(full_kph)) and current_kph > 0.0:
       button = int(CruiseButtons.DECEL_2ND)
-    elif speed_offset_kph < (-1.0 * float(decel_half_kph)) and current_kph > 0.0:
+    elif speed_offset_kph < (-0.9 * float(decel_half_kph)) and current_kph > 0.0:
       button = int(CruiseButtons.DECEL_SET)
     elif float(v_ego_ms) > float(self.MIN_CRUISE_SPEED_MS):
       if allow_accel_full_step and speed_offset_kph >= float(accel_full_kph) and float(full_kph) < float(available_speed_kph):
@@ -366,7 +386,7 @@ class ACCController:
       if min_after_full < min_target_kph:
         if min_after_half >= min_target_kph:
           button = int(CruiseButtons.DECEL_SET)
-        elif fast_decel_required:
+        elif cancel_required:
           button = int(CruiseButtons.CANCEL)
         else:
           self._clear_pending_reversal()
@@ -385,14 +405,14 @@ class ACCController:
       ):
         return AccDecision(None, "gated: waiting readback", target_kph, current_kph, current_kph)
 
-      steady_lead_follow = bool(lead.status and abs(float(lead.v_rel)) < 0.75 and 18.0 < float(lead.d_rel) < 85.0)
-      reversal_damp_ms = int((self._LEAD_REVERSAL_DAMP_MS + 350) if steady_lead_follow else (self._LEAD_REVERSAL_DAMP_MS if lead.status else self._REVERSAL_DAMP_MS))
+      steady_lead_follow = bool(lead.status and abs(float(lead.v_rel)) < 0.35 and 15.0 < float(lead.d_rel) < 35.0)
+      reversal_damp_ms = int(self._LEAD_REVERSAL_DAMP_MS if lead.status else self._REVERSAL_DAMP_MS)
       if (
         direction != 0
         and self._last_auto_direction != 0
         and direction != self._last_auto_direction
         and (int(now_ms) - int(self._direction_change_time_ms)) < reversal_damp_ms
-        and abs(float(speed_offset_kph)) < ((1.10 * float(half_kph)) if steady_lead_follow else (0.90 * float(half_kph) if lead.status else 0.75 * float(half_kph)))
+        and abs(float(speed_offset_kph)) < ((0.90 * float(half_kph)) if steady_lead_follow else (0.75 * float(half_kph) if lead.status else 0.65 * float(half_kph)))
       ):
         return AccDecision(None, "gated: reversal damp", target_kph, current_kph, current_kph)
 
