@@ -64,11 +64,11 @@ class ACCController:
 
   _HUMAN_COOLDOWN_MS = 3000
   _AUTO_COOLDOWN_MS = 400
-  _AUTO_COOLDOWN_ACCEL_MS = 200
-  _READBACK_WAIT_MS = 500
+  _AUTO_COOLDOWN_ACCEL_MS = 150
+  _READBACK_WAIT_MS = 350
   _REVERSAL_DAMP_MS = 400
-  _LEAD_REVERSAL_DAMP_MS = 450
-  _REVERSAL_PERSIST_MS = 150
+  _LEAD_REVERSAL_DAMP_MS = 250
+  _REVERSAL_PERSIST_MS = 100
   _FAST_DECEL_RESUME_HOLDOFF_MS = 2000
   _LEAD_FRESH_MS = 700
   _AUTOENGAGE_SPEED_WINDOW_MS = 0.8
@@ -322,22 +322,26 @@ class ACCController:
     speed_offset_kph = float(target_kph) - float(current_kph)
     available_speed_kph = float(max_target_kph) - float(current_kph)
 
-    opening_or_clear = (not lead.status) or (lead.v_rel > 0.0) or (lead.d_rel > 40.0)
-    mild_lead_follow = bool(lead.status and abs(float(lead.v_rel)) < 0.6 and 12.0 < float(lead.d_rel) < 50.0)
-    steady_lead_follow = bool(lead.status and abs(float(lead.v_rel)) < 0.35 and 15.0 < float(lead.d_rel) < 35.0)
-    strong_lead_opening = bool(lead.status and (float(lead.v_rel) > 0.8 or float(lead.d_rel) > 38.0))
+    opening_or_clear = (not lead.status) or (lead.v_rel > 0.15) or (lead.d_rel > 34.0)
+    mild_lead_follow = bool(lead.status and abs(float(lead.v_rel)) < 0.6 and 12.0 < float(lead.d_rel) < 55.0)
+    steady_lead_follow = bool(lead.status and abs(float(lead.v_rel)) < 0.35 and 15.0 < float(lead.d_rel) < 38.0)
+    lead_recovery = bool(lead.status and (float(lead.v_rel) > 0.10 or float(lead.d_rel) > 26.0))
+    strong_lead_opening = bool(lead.status and (float(lead.v_rel) > 0.55 or float(lead.d_rel) > 34.0))
 
-    accel_half_kph = float(half_kph) * (0.70 if opening_or_clear else 1.0)
-    accel_full_kph = float(full_kph) * (0.80 if opening_or_clear else 1.0)
+    accel_half_kph = float(half_kph) * (0.65 if opening_or_clear else 1.0)
+    accel_full_kph = float(full_kph) * (0.75 if opening_or_clear else 1.0)
 
     # Unity was willing to re-accelerate as soon as the lead opened and the
-    # planner target came back up. Keep XNOR's smoothing, but do not raise the
-    # accel thresholds in steady follow the way earlier patches did.
-    if mild_lead_follow and not strong_lead_opening:
-      accel_half_kph = min(accel_half_kph, 0.85 * float(half_kph))
-    if steady_lead_follow and not strong_lead_opening:
-      accel_half_kph = min(accel_half_kph, 0.75 * float(half_kph))
-      accel_full_kph = min(accel_full_kph, 0.90 * float(full_kph))
+    # planner target came back up. Keep XNOR's smoothing, but bias recovery
+    # toward quicker RES presses once the lead is clearly opening.
+    if lead_recovery:
+      accel_half_kph = min(accel_half_kph, 0.60 * float(half_kph))
+      accel_full_kph = min(accel_full_kph, 0.75 * float(full_kph))
+    elif mild_lead_follow and not strong_lead_opening:
+      accel_half_kph = min(accel_half_kph, 0.80 * float(half_kph))
+    if steady_lead_follow and not strong_lead_opening and not lead_recovery:
+      accel_half_kph = min(accel_half_kph, 0.70 * float(half_kph))
+      accel_full_kph = min(accel_full_kph, 0.85 * float(full_kph))
 
     decel_half_kph = 0.9 * float(half_kph)
     if mild_lead_follow and not fast_decel_required:
@@ -348,7 +352,8 @@ class ACCController:
     allow_accel_full_step = (
       (not lead.status)
       or strong_lead_opening
-      or (speed_offset_kph >= (2.0 * float(full_kph)) and not steady_lead_follow)
+      or (lead_recovery and speed_offset_kph >= (0.85 * float(full_kph)))
+      or (speed_offset_kph >= (1.8 * float(full_kph)) and not steady_lead_follow)
     )
     allow_decel_full_step = (
       (not lead.status)
@@ -403,7 +408,12 @@ class ACCController:
         and (int(now_ms) - int(self.automated_action_time_ms)) < int(self._READBACK_WAIT_MS)
         and (
           (direction < 0 and abs(float(speed_offset_kph)) < float(full_kph))
-          or (direction > 0 and abs(float(speed_offset_kph)) < (0.55 * float(full_kph)))
+          or (
+            direction > 0
+            and abs(float(speed_offset_kph)) < (
+              (0.35 * float(full_kph)) if lead_recovery else (0.55 * float(full_kph))
+            )
+          )
         )
       ):
         return AccDecision(None, "gated: waiting readback", target_kph, current_kph, current_kph)
@@ -415,7 +425,9 @@ class ACCController:
         and self._last_auto_direction != 0
         and direction != self._last_auto_direction
         and (int(now_ms) - int(self._direction_change_time_ms)) < reversal_damp_ms
-        and abs(float(speed_offset_kph)) < ((0.55 * float(half_kph)) if steady_lead_follow else (0.50 * float(half_kph) if lead.status else 0.60 * float(half_kph)))
+        and abs(float(speed_offset_kph)) < (
+          (0.30 * float(half_kph)) if lead_recovery else ((0.50 * float(half_kph)) if steady_lead_follow else (0.45 * float(half_kph) if lead.status else 0.60 * float(half_kph)))
+        )
       ):
         return AccDecision(None, "gated: reversal damp", target_kph, current_kph, current_kph)
 

@@ -51,17 +51,22 @@ class LongController:
   MIN_CRUISE_SPEED_MS = 17.1 * CV.MPH_TO_MS
   _LP_FRESH_NS = 1_500_000_000
   _PLAN_HEAD_WINDOW = 3
-  _CLEAR_TURN_BASE_MARGIN_MS = 1.00
-  _CLEAR_TURN_EGO_MARGIN_MS = 0.75
-  _CLEAR_TURN_SHAPE_MARGIN_MS = 0.75
-  _CLEAR_TURN_STRONG_EGO_MARGIN_MS = 1.20
-  _CLEAR_TURN_A_MARGIN_MS2 = -0.15
+  _PLAN_APPROACH_START = 2
+  _PLAN_APPROACH_END = 7
+  _CLEAR_TURN_BASE_MARGIN_MS = 1.10
+  _CLEAR_TURN_EGO_MARGIN_MS = 0.85
+  _CLEAR_TURN_HEAD_TO_APPROACH_MARGIN_MS = 0.45
+  _CLEAR_TURN_APPROACH_TO_TAIL_MARGIN_MS = 0.20
+  _CLEAR_TURN_SHAPE_MARGIN_MS = 1.00
+  _CLEAR_TURN_STRONG_EGO_MARGIN_MS = 1.25
+  _CLEAR_TURN_A_MARGIN_MS2 = -0.12
 
   def __init__(self) -> None:
     self.acc = ACCController()
     self._sm = messaging.SubMaster(["longitudinalPlan", "radarState"])
 
     self._lp_head_ms: Optional[float] = None
+    self._lp_approach_ms: Optional[float] = None
     self._lp_tail_ms: Optional[float] = None
     self._lp_has_lead: bool = False
     self._lp_a_target: float = 0.0
@@ -116,6 +121,34 @@ class LongController:
       return None
     return v_last
 
+  @classmethod
+  def _extract_plan_approach_speed(cls, lp) -> Optional[float]:
+    speeds = getattr(lp, "speeds", None)
+    if not speeds:
+      return None
+
+    start = max(0, int(cls._PLAN_APPROACH_START))
+    end = min(len(speeds), int(cls._PLAN_APPROACH_END))
+    if end <= start:
+      return None
+
+    window = []
+    try:
+      for s in speeds[start:end]:
+        v = float(s)
+        if math.isfinite(v) and v >= 0.0:
+          window.append(v)
+    except Exception:
+      return None
+
+    if len(window) == 0:
+      return None
+
+    window.sort()
+    if len(window) == 1:
+      return float(window[0])
+    return float(window[1])
+
   def _poll_plan_and_lead(self, *, now_ns: int) -> None:
     try:
       self._sm.update(0)
@@ -125,6 +158,7 @@ class LongController:
     try:
       lp = self._sm["longitudinalPlan"]
       v_head = self._extract_plan_head_speed(lp)
+      v_approach = self._extract_plan_approach_speed(lp)
       v_tail = self._extract_plan_tail_speed(lp)
       lp_mono_ns = int(self._sm.logMonoTime.get("longitudinalPlan", 0) or 0)
 
@@ -137,6 +171,7 @@ class LongController:
         and (lp_mono_ns > 0)
       ):
         self._lp_head_ms = float(v_head) if v_head is not None else None
+        self._lp_approach_ms = float(v_approach) if v_approach is not None else None
         self._lp_tail_ms = float(v_tail) if v_tail is not None else None
         self._lp_has_lead = bool(getattr(lp, "hasLead", False))
         self._lp_a_target = float(getattr(lp, "aTarget", 0.0) or 0.0)
@@ -233,20 +268,29 @@ class LongController:
     src = f"base[{ceiling_src}]" if max_accel_target_ms is not None else "base[set_speed]"
 
     planner_head_ms = float(self._lp_head_ms) if (lp_fresh and self._lp_head_ms is not None) else None
+    planner_approach_ms = float(self._lp_approach_ms) if (lp_fresh and self._lp_approach_ms is not None) else None
     planner_tail_ms = float(self._lp_tail_ms) if (lp_fresh and self._lp_tail_ms is not None) else None
     planner_has_lead = bool(lp_fresh and (self._lp_has_lead or self._lead_present))
     planner_a_target = float(self._lp_a_target) if lp_fresh else 0.0
 
     startup_warmup = bool(self._enabled_since_ms and ((int(now) - int(self._enabled_since_ms)) < 1800))
 
+    lead_recovery = bool(self._lead_present and (float(self._lead_vrel) > 0.10 or float(self._lead_drel) > 26.0))
     if planner_has_lead and planner_tail_ms is not None and planner_tail_ms > 0.1:
-      desired_ms = max(0.0, float(planner_tail_ms))
+      follow_target_ms = float(planner_tail_ms)
+      if lead_recovery and planner_head_ms is not None:
+        blended_recovery_ms = (0.65 * float(planner_head_ms)) + (0.35 * float(planner_tail_ms))
+        follow_target_ms = max(float(follow_target_ms), float(blended_recovery_ms))
+      desired_ms = max(0.0, float(follow_target_ms))
       if max_accel_target_ms is not None:
         desired_ms = min(float(desired_ms), float(max_accel_target_ms))
       src = f"{src}+lp_tail_lead"
+      if lead_recovery and planner_head_ms is not None:
+        src = f"{src}_recovery"
     else:
       allow_turn_slowdown = bool(
         planner_tail_ms is not None
+        and planner_approach_ms is not None
         and (
           not startup_warmup
           or (
@@ -256,25 +300,38 @@ class LongController:
         )
       )
 
-      if allow_turn_slowdown and planner_tail_ms is not None:
+      if allow_turn_slowdown and planner_tail_ms is not None and planner_approach_ms is not None:
         tail_drop_vs_head = 0.0
+        head_drop_vs_approach = 0.0
+        approach_drop_vs_tail = 0.0
         if planner_head_ms is not None:
-          tail_drop_vs_head = float(planner_head_ms) - float(planner_tail_ms)
+          tail_drop_vs_head = max(0.0, float(planner_head_ms) - float(planner_tail_ms))
+          head_drop_vs_approach = max(0.0, float(planner_head_ms) - float(planner_approach_ms))
+        approach_drop_vs_tail = max(0.0, float(planner_approach_ms) - float(planner_tail_ms))
 
-        shape_confirms_turn = float(tail_drop_vs_head) >= float(self._CLEAR_TURN_SHAPE_MARGIN_MS)
+        shape_confirms_turn = bool(
+          float(tail_drop_vs_head) >= float(self._CLEAR_TURN_SHAPE_MARGIN_MS)
+          and float(head_drop_vs_approach) >= float(self._CLEAR_TURN_HEAD_TO_APPROACH_MARGIN_MS)
+          and (
+            float(approach_drop_vs_tail) >= float(self._CLEAR_TURN_APPROACH_TO_TAIL_MARGIN_MS)
+            or float(planner_a_target) <= float(self._CLEAR_TURN_A_MARGIN_MS2)
+          )
+        )
         strong_turn = bool(
           float(planner_a_target) <= float(self._CLEAR_TURN_A_MARGIN_MS2)
           or float(planner_tail_ms) < (float(v_ego_ms) - float(self._CLEAR_TURN_STRONG_EGO_MARGIN_MS))
         )
         should_apply_turn_slowdown = bool(
-          float(planner_tail_ms) < (float(base_desired_ms) - float(self._CLEAR_TURN_BASE_MARGIN_MS))
+          float(planner_approach_ms) < (float(base_desired_ms) - (0.55 * float(self._CLEAR_TURN_BASE_MARGIN_MS)))
+          and float(planner_tail_ms) < (float(base_desired_ms) - float(self._CLEAR_TURN_BASE_MARGIN_MS))
           and float(planner_tail_ms) < (float(v_ego_ms) - float(self._CLEAR_TURN_EGO_MARGIN_MS))
           and (shape_confirms_turn or strong_turn)
         )
 
         if should_apply_turn_slowdown:
-          desired_ms = max(float(self.MIN_CRUISE_SPEED_MS), float(planner_tail_ms))
-          src = f"{src}+lp_tail_turn"
+          turn_target_ms = min(float(planner_approach_ms), float(planner_tail_ms) + 0.25)
+          desired_ms = max(float(self.MIN_CRUISE_SPEED_MS), float(turn_target_ms))
+          src = f"{src}+lp_turn_approach_tail"
 
     if (not lp_fresh) and self._lead_present and (self._lead_drel < 80.0) and (self._lead_vrel < -0.5):
       lead_speed_ms = max(0.0, float(v_ego_ms) + float(self._lead_vrel))
