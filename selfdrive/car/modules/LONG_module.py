@@ -123,16 +123,24 @@ class LongController:
       return
 
     try:
-      if bool(self._sm.valid.get("longitudinalPlan", False)):
-        lp = self._sm["longitudinalPlan"]
-        v_head = self._extract_plan_head_speed(lp)
-        v_tail = self._extract_plan_tail_speed(lp)
-        if (v_head is not None) or (v_tail is not None):
-          self._lp_head_ms = float(v_head) if v_head is not None else None
-          self._lp_tail_ms = float(v_tail) if v_tail is not None else None
-          self._lp_has_lead = bool(getattr(lp, "hasLead", False))
-          self._lp_a_target = float(getattr(lp, "aTarget", 0.0) or 0.0)
-          self._lp_last_ns = int(self._sm.logMonoTime.get("longitudinalPlan", now_ns))
+      lp = self._sm["longitudinalPlan"]
+      v_head = self._extract_plan_head_speed(lp)
+      v_tail = self._extract_plan_tail_speed(lp)
+      lp_mono_ns = int(self._sm.logMonoTime.get("longitudinalPlan", 0) or 0)
+
+      # Unity consumed the planner tail as soon as the message existed rather than
+      # waiting for the message-valid bit to go true. Keep XNOR's freshness guard,
+      # but do not discard a fresh, finite plan during startup just because one
+      # upstream validity bit is still settling.
+      if (
+        ((v_head is not None) or (v_tail is not None))
+        and (lp_mono_ns > 0)
+      ):
+        self._lp_head_ms = float(v_head) if v_head is not None else None
+        self._lp_tail_ms = float(v_tail) if v_tail is not None else None
+        self._lp_has_lead = bool(getattr(lp, "hasLead", False))
+        self._lp_a_target = float(getattr(lp, "aTarget", 0.0) or 0.0)
+        self._lp_last_ns = int(lp_mono_ns)
     except Exception:
       pass
 
