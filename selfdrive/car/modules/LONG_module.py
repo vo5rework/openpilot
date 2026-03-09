@@ -3,25 +3,24 @@
 Unity-style stock cruise set-speed syncing for XNOR.
 
 Behavior
-- Planner output remains the desired speed target on both clear road and with a
-  lead present.
-- The live speed-limit target (+ offset) acts only as an upper bound on increases,
-  so clear-road re-acceleration still works while planner-driven slowdowns (such as
-  vision turns) are preserved.
-- Live follow-distance and controller smoothing from patch51 remain unchanged.
+- Treats the stock set speed (or active speed-limit target) as the base desired cruise speed.
+- Uses the planner only as a near-term slowdown cap, instead of mirroring the far-horizon
+  planner tail directly into stock cruise.
+- Keeps live follow-distance and lead-handling behavior from the recent XNOR refactor.
 
 Why this patch exists
-- Patch51 fixed smoothness and live follow-distance, but later LONG changes removed
-  Unity's "speed-limit as base desired speed" behavior.
-- In recent logs, clear-road `lp_last` sat slightly below the current stock set
-  speed, so ACC never saw a real up-command.
-- This restores the proven upward-accel path from the earlier working patch while
-  keeping the newer stability improvements.
+- In the latest curve logs, LONG's `lp_last` was often below ego even with no lead and even
+  on samples where `curve_detected = 0`.
+- Feeding that far-horizon tail directly into ACC made stock cruise hesitate to re-accelerate
+  and occasionally step down on very slight bends.
+- Unity's pure-vision slowdown intent is preserved here, but adapted for XNOR's stock-cruise
+  sync path by using a stable near-term planner slowdown signal instead of the plan tail.
 """
 
 from __future__ import annotations
 
 import math
+import statistics
 import time
 from dataclasses import dataclass
 from typing import Optional
@@ -47,12 +46,15 @@ class LongDecision:
 class LongController:
   MIN_CRUISE_SPEED_MS = 17.1 * CV.MPH_TO_MS
   _LP_FRESH_NS = 1_500_000_000
+  _PLAN_SLOWDOWN_WINDOW = 6
+  _PLAN_SLOWDOWN_MARGIN_MS = 0.6
+  _PLAN_SLOWDOWN_EGO_MARGIN_MS = 0.35
 
   def __init__(self) -> None:
     self.acc = ACCController()
     self._sm = messaging.SubMaster(["longitudinalPlan", "radarState"])
 
-    self._lp_target_ms: Optional[float] = None
+    self._lp_slowdown_ms: Optional[float] = None
     self._lp_last_ns: int = 0
 
     self._lead_present: bool = False
@@ -72,18 +74,24 @@ class LongController:
     self._last_info_log_ms = int(now)
     cloudlog.info(msg)
 
-  @staticmethod
-  def _extract_plan_speed_last(lp) -> Optional[float]:
+  @classmethod
+  def _extract_plan_slowdown_speed(cls, lp) -> Optional[float]:
     speeds = getattr(lp, "speeds", None)
     if not speeds:
       return None
+
+    window = []
     try:
-      v_last = float(speeds[-1])
+      for s in speeds[:min(int(cls._PLAN_SLOWDOWN_WINDOW), len(speeds))]:
+        v = float(s)
+        if math.isfinite(v) and v >= 0.0:
+          window.append(v)
     except Exception:
       return None
-    if not (math.isfinite(v_last) and v_last >= 0.0):
+
+    if len(window) == 0:
       return None
-    return v_last
+    return float(statistics.median(window))
 
   def _poll_plan_and_lead(self, *, now_ns: int) -> None:
     try:
@@ -94,9 +102,9 @@ class LongController:
     try:
       if bool(self._sm.valid.get("longitudinalPlan", False)):
         lp = self._sm["longitudinalPlan"]
-        v_last = self._extract_plan_speed_last(lp)
-        if v_last is not None:
-          self._lp_target_ms = float(v_last)
+        v_slow = self._extract_plan_slowdown_speed(lp)
+        if v_slow is not None:
+          self._lp_slowdown_ms = float(v_slow)
           self._lp_last_ns = int(self._sm.logMonoTime.get("longitudinalPlan", now_ns))
     except Exception:
       pass
@@ -119,15 +127,7 @@ class LongController:
       pass
 
   def _resolve_accel_ceiling_ms(self, CS, *, speed_units: str) -> tuple[Optional[float], str]:
-    """Return only the live speed-limit accel ceiling, if one exists.
-
-    Unity's ACC keeps its own persistent max cruise owner internally. XNOR patch52
-    was clamping the planner target against a separate owner field in LONG before ACC
-    could act, which prevented clear-road and lead-pull-away acceleration.
-
-    LONG should pass the planner target through unchanged and only provide a speed
-    limit ceiling so ACC can cap *increases* without forcing a target decrease.
-    """
+    """Return the live speed-limit target, if one exists."""
     tinkla = getattr(CS, "_tinkla", None)
     use_speed_limit = bool(tinkla and getattr(tinkla, "adjust_acc_with_speed_limit", False))
     if not use_speed_limit:
@@ -176,7 +176,7 @@ class LongController:
 
     self._poll_plan_and_lead(now_ns=now_ns)
     lp_fresh = (
-      (self._lp_target_ms is not None)
+      (self._lp_slowdown_ms is not None)
       and (int(self._lp_last_ns) > 0)
       and ((now_ns - int(self._lp_last_ns)) < int(self._LP_FRESH_NS))
     )
@@ -188,32 +188,34 @@ class LongController:
       self._stable_plan_samples = 0
       self._last_lp_seen_ns = 0
 
-    planner_ms = float(self._lp_target_ms) if (lp_fresh and self._lp_target_ms is not None) else float(current_set_ms)
-    desired_ms = float(planner_ms)
-    src = "lp_last" if lp_fresh else "hold"
+    max_accel_target_ms, ceiling_src = self._resolve_accel_ceiling_ms(CS, speed_units=speed_units)
+    base_desired_ms = float(max_accel_target_ms) if max_accel_target_ms is not None else float(current_set_ms)
+    desired_ms = float(base_desired_ms)
+    src = f"base[{ceiling_src}]" if max_accel_target_ms is not None else "base[set_speed]"
+
+    planner_slow_ms = float(self._lp_slowdown_ms) if (lp_fresh and self._lp_slowdown_ms is not None) else None
 
     startup_warmup = bool(self._enabled_since_ms and ((int(now) - int(self._enabled_since_ms)) < 2500))
-    startup_invalid_clear = (
-      startup_warmup
-      and (not self._lead_present)
+    allow_plan_slowdown = bool(
+      planner_slow_ms is not None
       and (
-        (not lp_fresh)
-        or (int(self._stable_plan_samples) < 2)
-        or (float(planner_ms) <= 0.1)
+        not startup_warmup
+        or self._lead_present
         or (
-          float(v_ego_ms) > float(self.MIN_CRUISE_SPEED_MS)
-          and float(planner_ms) < max(float(self.MIN_CRUISE_SPEED_MS) * 0.90, float(current_set_ms) - (4.0 * CV.KPH_TO_MS))
+          int(self._stable_plan_samples) >= 2
+          and float(planner_slow_ms) > 0.1
         )
       )
     )
-    if startup_invalid_clear:
-      desired_ms = float(current_set_ms)
-      src = f"{src}+startup_hold"
 
-    max_accel_target_ms, ceiling_src = self._resolve_accel_ceiling_ms(CS, speed_units=speed_units)
-    if max_accel_target_ms is not None:
-      desired_ms = min(float(desired_ms), float(max_accel_target_ms))
-      src = f"{src}+cap[{ceiling_src}]"
+    if allow_plan_slowdown and planner_slow_ms is not None:
+      should_apply_plan_slowdown = bool(
+        float(planner_slow_ms) < (float(base_desired_ms) - float(self._PLAN_SLOWDOWN_MARGIN_MS))
+        and float(planner_slow_ms) < (float(v_ego_ms) - float(self._PLAN_SLOWDOWN_EGO_MARGIN_MS))
+      )
+      if should_apply_plan_slowdown:
+        desired_ms = float(planner_slow_ms)
+        src = f"{src}+plan_slow"
 
     if (not lp_fresh) and self._lead_present and (self._lead_drel < 80.0) and (self._lead_vrel < -0.5):
       lead_speed_ms = max(0.0, float(v_ego_ms) + float(self._lead_vrel))
