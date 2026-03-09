@@ -31,6 +31,7 @@ _A_TOTAL_MAX_BP = [20.0, 40.0]
 CURVE_PEAK_THRESHOLD = 0.0020
 AREA_THRESHOLD = 0.012
 VISION_CURVE_TARGET_LAT_A = 2.1
+CURVE_SLOWDOWN_SPEED_MARGIN = 0.5
 
 
 def get_max_accel(v_ego: float) -> float:
@@ -102,6 +103,7 @@ class LongitudinalPlanner:
 
     self.v_turn_filter = FirstOrderFilter(init_v, 0.2, self.dt)
     self.curve_detected = False
+    self.curve_slowdown_active = False
     self.v_model_error = 0.0
 
   @staticmethod
@@ -142,17 +144,19 @@ class LongitudinalPlanner:
           dynamic_multiplier = float(np.interp(max_curv_ahead, [0.0015, 0.008], [1.0, 0.70]))
           max_v_curve = dynamic_multiplier * torque_multiplier * anticipatory_slowdown * math.sqrt(max(VISION_CURVE_TARGET_LAT_A / (max_curv_ahead + 1e-4), 0.0))
           v_curve = _rate_limited_filter(v_turn_filter, max_v_curve, rc_up=0.30, rc_down=0.05)
+          # Keep Unity curve detection, but only arm slowdown when the filtered curve target is below ego speed.
+          curve_slowdown_active = bool(v_curve < (v_ego - CURVE_SLOWDOWN_SPEED_MARGIN))
           v = np.minimum(v_curve, v_corrected)
-          return x, v, a, j, True
+          return x, v, a, j, True, curve_slowdown_active
 
         v = v_corrected
         if anticipatory_slowdown < 1.0:
           v = np.minimum(v * anticipatory_slowdown, v)
-        return x, v, a, j, bool(anticipatory_slowdown < 0.98)
+        return x, v, a, j, bool(anticipatory_slowdown < 0.98), False
 
       v = v_corrected
 
-    return x, v, a, j, False
+    return x, v, a, j, False, False
 
   def update(self, sm):
     controls_state = sm["controlsState"]
@@ -199,7 +203,7 @@ class LongitudinalPlanner:
 
     self.v_desired_filter.x = max(0.0, self.v_desired_filter.update(v_ego))
     self.v_model_error = get_speed_error(sm["modelV2"], v_ego)
-    x, v, a, j, self.curve_detected = self.parse_model(sm["modelV2"], self.v_model_error, v_ego, self.v_turn_filter)
+    x, v, a, j, self.curve_detected, self.curve_slowdown_active = self.parse_model(sm["modelV2"], self.v_model_error, v_ego, self.v_turn_filter)
 
     throttle_prob = 1.0
     try:
@@ -221,20 +225,20 @@ class LongitudinalPlanner:
     if force_slow_decel:
       v_cruise = 0.0
 
-    if self.curve_detected and self._mpc_set_weights_accepts_custom:
+    if self.curve_slowdown_active and self._mpc_set_weights_accepts_custom:
       self.mpc.set_weights(prev_accel_constraint, personality=personality, weights=[2.0, 5.0, 40.0])
     else:
       self.mpc.set_weights(prev_accel_constraint, personality=personality)
 
     if hasattr(self.mpc, "set_accel_limits"):
-      if self.curve_detected:
+      if self.curve_slowdown_active:
         self.mpc.set_accel_limits(accel_clip_turns[0], min(self.a_desired - 0.3, -0.1))
       else:
         self.mpc.set_accel_limits(accel_clip_turns[0], accel_clip_turns[1])
 
     self.mpc.set_cur_state(self.v_desired_filter.x, self.a_desired)
 
-    v_target = v if self.curve_detected else np.maximum(v, max(0.0, float(v_cruise) - 0.1))
+    v_target = v if self.curve_slowdown_active else np.maximum(v, max(0.0, float(v_cruise) - 0.1))
 
     if self._mpc_update_first_param == "carstate":
       self.mpc.update(sm["carState"], sm["radarState"], v_cruise, x, v_target, a, j, personality=personality)
