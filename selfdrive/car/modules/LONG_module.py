@@ -2,29 +2,24 @@
 """
 Unity-parity stock-cruise syncing for XNOR.
 
-What this patch fixes
-- Restores Unity's use of the planner tail (`longitudinalPlan.speeds[-1]`) for
-  lead following, instead of using a more reactive near-term median.
-- Keeps the speed limit as an accel ceiling only; it no longer fights the
-  planner while following a lead.
-- Restores clear-road turn slowdowns by using the planner tail again, but only
-  when the plan shape and target drop indicate a real turn instead of slight-bend
-  noise on a mostly straight road.
+What this patch restores
+- LONG follows the planner tail directly again, like Unity.
+- The adaptive max-cruise ceiling comes from carstate's separate owner
+  (`acc_speed_max_ms` / `carState.vCruise`), not the current stock set speed.
+- Turn and lead behavior stay in planner/MPC; LONG does not reinterpret them.
 
-Why this is the right adaptation
-- Unity's older Tesla ACC path followed the planner tail directly.
-- Patch90's near-term split fixed one failure mode but changed the horizon
-  semantics: lead following became more reactive, while real turns that showed up
-  mainly in the plan tail could be missed.
-- XNOR still needs a guard on clear road, so turn slowdown activation is based on
-  the tail being materially lower than both the current target and the near-term
-  plan head.
+Why this is the right XNOR adaptation
+- XNOR already publishes a Unity-style adaptive max cruise ceiling in carstate.
+  Recent patches were not using it, so once stock cruise stepped down behind a
+  lead there was often no remembered ceiling to climb back to.
+- Restoring planner-tail semantics and using the adaptive ceiling lets lead
+  pull-away recovery and vision turns behave closer to Unity without adding
+  more downstream heuristics.
 """
 
 from __future__ import annotations
 
 import math
-import statistics
 import time
 from dataclasses import dataclass
 from typing import Optional
@@ -50,26 +45,12 @@ class LongDecision:
 class LongController:
   MIN_CRUISE_SPEED_MS = 17.1 * CV.MPH_TO_MS
   _LP_FRESH_NS = 1_500_000_000
-  _PLAN_HEAD_WINDOW = 3
-  _PLAN_APPROACH_START = 2
-  _PLAN_APPROACH_END = 7
-  _CLEAR_TURN_BASE_MARGIN_MS = 1.10
-  _CLEAR_TURN_EGO_MARGIN_MS = 0.85
-  _CLEAR_TURN_HEAD_TO_APPROACH_MARGIN_MS = 0.45
-  _CLEAR_TURN_APPROACH_TO_TAIL_MARGIN_MS = 0.20
-  _CLEAR_TURN_SHAPE_MARGIN_MS = 1.00
-  _CLEAR_TURN_STRONG_EGO_MARGIN_MS = 1.25
-  _CLEAR_TURN_A_MARGIN_MS2 = -0.12
 
   def __init__(self) -> None:
     self.acc = ACCController()
     self._sm = messaging.SubMaster(["longitudinalPlan", "radarState"])
 
-    self._lp_head_ms: Optional[float] = None
-    self._lp_approach_ms: Optional[float] = None
-    self._lp_tail_ms: Optional[float] = None
-    self._lp_has_lead: bool = False
-    self._lp_a_target: float = 0.0
+    self._lp_target_ms: Optional[float] = None
     self._lp_last_ns: int = 0
 
     self._lead_present: bool = False
@@ -89,27 +70,8 @@ class LongController:
     self._last_info_log_ms = int(now)
     cloudlog.info(msg)
 
-  @classmethod
-  def _extract_plan_head_speed(cls, lp) -> Optional[float]:
-    speeds = getattr(lp, "speeds", None)
-    if not speeds:
-      return None
-
-    window = []
-    try:
-      for s in speeds[:min(int(cls._PLAN_HEAD_WINDOW), len(speeds))]:
-        v = float(s)
-        if math.isfinite(v) and v >= 0.0:
-          window.append(v)
-    except Exception:
-      return None
-
-    if len(window) == 0:
-      return None
-    return float(statistics.median(window))
-
   @staticmethod
-  def _extract_plan_tail_speed(lp) -> Optional[float]:
+  def _extract_plan_speed_last(lp) -> Optional[float]:
     speeds = getattr(lp, "speeds", None)
     if not speeds:
       return None
@@ -121,34 +83,6 @@ class LongController:
       return None
     return v_last
 
-  @classmethod
-  def _extract_plan_approach_speed(cls, lp) -> Optional[float]:
-    speeds = getattr(lp, "speeds", None)
-    if not speeds:
-      return None
-
-    start = max(0, int(cls._PLAN_APPROACH_START))
-    end = min(len(speeds), int(cls._PLAN_APPROACH_END))
-    if end <= start:
-      return None
-
-    window = []
-    try:
-      for s in speeds[start:end]:
-        v = float(s)
-        if math.isfinite(v) and v >= 0.0:
-          window.append(v)
-    except Exception:
-      return None
-
-    if len(window) == 0:
-      return None
-
-    window.sort()
-    if len(window) == 1:
-      return float(window[0])
-    return float(window[1])
-
   def _poll_plan_and_lead(self, *, now_ns: int) -> None:
     try:
       self._sm.update(0)
@@ -157,24 +91,14 @@ class LongController:
 
     try:
       lp = self._sm["longitudinalPlan"]
-      v_head = self._extract_plan_head_speed(lp)
-      v_approach = self._extract_plan_approach_speed(lp)
-      v_tail = self._extract_plan_tail_speed(lp)
+      v_last = self._extract_plan_speed_last(lp)
       lp_mono_ns = int(self._sm.logMonoTime.get("longitudinalPlan", 0) or 0)
 
       # Unity consumed the planner tail as soon as the message existed rather than
-      # waiting for the message-valid bit to go true. Keep XNOR's freshness guard,
-      # but do not discard a fresh, finite plan during startup just because one
-      # upstream validity bit is still settling.
-      if (
-        ((v_head is not None) or (v_tail is not None))
-        and (lp_mono_ns > 0)
-      ):
-        self._lp_head_ms = float(v_head) if v_head is not None else None
-        self._lp_approach_ms = float(v_approach) if v_approach is not None else None
-        self._lp_tail_ms = float(v_tail) if v_tail is not None else None
-        self._lp_has_lead = bool(getattr(lp, "hasLead", False))
-        self._lp_a_target = float(getattr(lp, "aTarget", 0.0) or 0.0)
+      # waiting for the valid bit. Keep the freshness guard, but do not discard
+      # a fresh finite plan during startup.
+      if (v_last is not None) and (lp_mono_ns > 0):
+        self._lp_target_ms = float(v_last)
         self._lp_last_ns = int(lp_mono_ns)
     except Exception:
       pass
@@ -197,19 +121,36 @@ class LongController:
       pass
 
   def _resolve_accel_ceiling_ms(self, CS, *, speed_units: str) -> tuple[Optional[float], str]:
-    """Return the live speed-limit target, if one exists."""
+    # Unity keeps a separate adaptive max cruise owner internally. XNOR carstate
+    # already mirrors that as acc_speed_max_ms / carState.vCruise; use it here.
+    adaptive_ceiling_ms = 0.0
+    try:
+      adaptive_ceiling_ms = float(getattr(CS, "acc_speed_max_ms", 0.0) or 0.0)
+    except Exception:
+      adaptive_ceiling_ms = 0.0
+
+    cs_out = getattr(CS, "out", None)
+    try:
+      out_v_cruise_kph = float(getattr(cs_out, "vCruise", 0.0) or 0.0)
+      adaptive_ceiling_ms = max(adaptive_ceiling_ms, out_v_cruise_kph * CV.KPH_TO_MS)
+    except Exception:
+      pass
+
     tinkla = getattr(CS, "_tinkla", None)
     use_speed_limit = bool(tinkla and getattr(tinkla, "adjust_acc_with_speed_limit", False))
-    if not use_speed_limit:
-      return None, "none"
+    sl_target_ms = 0.0
+    if use_speed_limit:
+      try:
+        sl_target_ms = float(CS._calc_speed_limit_target_ms(speed_units))
+      except Exception:
+        sl_target_ms = 0.0
 
-    try:
-      speed_limit_target_ms = float(CS._calc_speed_limit_target_ms(speed_units))
-    except Exception:
-      speed_limit_target_ms = 0.0
-
-    if speed_limit_target_ms > 0.0:
-      return float(speed_limit_target_ms), "speed_limit_target"
+    if adaptive_ceiling_ms > 0.1 and sl_target_ms > 0.1:
+      return min(float(adaptive_ceiling_ms), float(sl_target_ms)), "adaptive_max+speed_limit"
+    if adaptive_ceiling_ms > 0.1:
+      return float(adaptive_ceiling_ms), "adaptive_max"
+    if sl_target_ms > 0.1:
+      return float(sl_target_ms), "speed_limit_target"
     return None, "none"
 
   def update(self, CS, *, enabled: bool, frame: int, now_ms: Optional[int] = None) -> LongDecision:
@@ -250,7 +191,7 @@ class LongController:
 
     self._poll_plan_and_lead(now_ns=now_ns)
     lp_fresh = (
-      (self._lp_tail_ms is not None)
+      (self._lp_target_ms is not None)
       and (int(self._lp_last_ns) > 0)
       and ((now_ns - int(self._lp_last_ns)) < int(self._LP_FRESH_NS))
     )
@@ -262,90 +203,32 @@ class LongController:
       self._stable_plan_samples = 0
       self._last_lp_seen_ns = 0
 
-    max_accel_target_ms, ceiling_src = self._resolve_accel_ceiling_ms(CS, speed_units=speed_units)
-    base_desired_ms = float(max_accel_target_ms) if max_accel_target_ms is not None else float(current_set_ms)
-    desired_ms = float(base_desired_ms)
-    src = f"base[{ceiling_src}]" if max_accel_target_ms is not None else "base[set_speed]"
-
-    planner_head_ms = float(self._lp_head_ms) if (lp_fresh and self._lp_head_ms is not None) else None
-    planner_approach_ms = float(self._lp_approach_ms) if (lp_fresh and self._lp_approach_ms is not None) else None
-    planner_tail_ms = float(self._lp_tail_ms) if (lp_fresh and self._lp_tail_ms is not None) else None
-    planner_has_lead = bool(lp_fresh and self._lp_has_lead)
-    planner_a_target = float(self._lp_a_target) if lp_fresh else 0.0
+    planner_ms = float(self._lp_target_ms) if (lp_fresh and self._lp_target_ms is not None) else float(current_set_ms)
+    desired_ms = float(planner_ms)
+    src = "lp_last" if lp_fresh else "hold"
 
     startup_warmup = bool(self._enabled_since_ms and ((int(now) - int(self._enabled_since_ms)) < 1800))
-
-    lead_recovery = bool(self._lead_present and (float(self._lead_vrel) > 0.15 or float(self._lead_drel) > 30.0))
-    lead_far_or_opening = bool(self._lead_present and (float(self._lead_drel) > 45.0 or float(self._lead_vrel) > 0.15))
-    lead_constraining = bool(
-      planner_has_lead
-      and planner_tail_ms is not None
-      and float(planner_tail_ms) > 0.1
+    startup_invalid_clear = (
+      startup_warmup
+      and (not self._lead_present)
       and (
-        float(planner_tail_ms) < (float(base_desired_ms) - 0.40)
-        or (self._lead_present and float(self._lead_drel) < 45.0)
-        or (self._lead_present and float(self._lead_vrel) < 0.15)
+        (not lp_fresh)
+        or (int(self._stable_plan_samples) < 2)
+        or (float(planner_ms) <= 0.1)
+        or (
+          float(v_ego_ms) > float(self.MIN_CRUISE_SPEED_MS)
+          and float(planner_ms) < max(float(self.MIN_CRUISE_SPEED_MS) * 0.90, float(current_set_ms) - (4.0 * CV.KPH_TO_MS))
+        )
       )
     )
+    if startup_invalid_clear:
+      desired_ms = float(current_set_ms)
+      src = f"{src}+startup_hold"
 
-    if lead_constraining:
-      follow_target_ms = float(planner_tail_ms)
-      if lead_recovery and planner_head_ms is not None:
-        blended_recovery_ms = (0.85 * float(planner_head_ms)) + (0.15 * float(planner_tail_ms))
-        follow_target_ms = max(float(follow_target_ms), float(blended_recovery_ms))
-      if lead_far_or_opening and planner_head_ms is not None:
-        follow_target_ms = max(float(follow_target_ms), float(planner_head_ms) - 0.15)
-      desired_ms = max(0.0, float(follow_target_ms))
-      if max_accel_target_ms is not None:
-        desired_ms = min(float(desired_ms), float(max_accel_target_ms))
-      src = f"{src}+lp_lead_follow"
-      if lead_recovery and planner_head_ms is not None:
-        src = f"{src}_recovery"
-    else:
-      allow_turn_slowdown = bool(
-        planner_tail_ms is not None
-        and planner_approach_ms is not None
-        and (
-          not startup_warmup
-          or (
-            int(self._stable_plan_samples) >= 2
-            and float(planner_tail_ms) > 0.1
-          )
-        )
-      )
-
-      if allow_turn_slowdown and planner_tail_ms is not None and planner_approach_ms is not None:
-        tail_drop_vs_head = 0.0
-        head_drop_vs_approach = 0.0
-        approach_drop_vs_tail = 0.0
-        if planner_head_ms is not None:
-          tail_drop_vs_head = max(0.0, float(planner_head_ms) - float(planner_tail_ms))
-          head_drop_vs_approach = max(0.0, float(planner_head_ms) - float(planner_approach_ms))
-        approach_drop_vs_tail = max(0.0, float(planner_approach_ms) - float(planner_tail_ms))
-
-        shape_confirms_turn = bool(
-          float(tail_drop_vs_head) >= float(self._CLEAR_TURN_SHAPE_MARGIN_MS)
-          and float(head_drop_vs_approach) >= float(self._CLEAR_TURN_HEAD_TO_APPROACH_MARGIN_MS)
-          and (
-            float(approach_drop_vs_tail) >= float(self._CLEAR_TURN_APPROACH_TO_TAIL_MARGIN_MS)
-            or float(planner_a_target) <= float(self._CLEAR_TURN_A_MARGIN_MS2)
-          )
-        )
-        strong_turn = bool(
-          float(planner_a_target) <= float(self._CLEAR_TURN_A_MARGIN_MS2)
-          or float(planner_tail_ms) < (float(v_ego_ms) - float(self._CLEAR_TURN_STRONG_EGO_MARGIN_MS))
-        )
-        should_apply_turn_slowdown = bool(
-          float(planner_approach_ms) < (float(base_desired_ms) - (0.55 * float(self._CLEAR_TURN_BASE_MARGIN_MS)))
-          and float(planner_tail_ms) < (float(base_desired_ms) - float(self._CLEAR_TURN_BASE_MARGIN_MS))
-          and float(planner_tail_ms) < (float(v_ego_ms) - float(self._CLEAR_TURN_EGO_MARGIN_MS))
-          and (shape_confirms_turn or strong_turn)
-        )
-
-        if should_apply_turn_slowdown:
-          turn_target_ms = min(float(planner_approach_ms), float(planner_tail_ms) + 0.25)
-          desired_ms = max(float(self.MIN_CRUISE_SPEED_MS), float(turn_target_ms))
-          src = f"{src}+lp_turn_approach_tail"
+    max_accel_target_ms, ceiling_src = self._resolve_accel_ceiling_ms(CS, speed_units=speed_units)
+    if max_accel_target_ms is not None:
+      desired_ms = min(float(desired_ms), float(max_accel_target_ms))
+      src = f"{src}+cap[{ceiling_src}]"
 
     if (not lp_fresh) and self._lead_present and (self._lead_drel < 80.0) and (self._lead_vrel < -0.5):
       lead_speed_ms = max(0.0, float(v_ego_ms) + float(self._lead_vrel))

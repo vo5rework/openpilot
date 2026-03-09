@@ -9,13 +9,6 @@ except ImportError:  # pragma: no cover
 _P = Params()
 
 
-def _safe_get(param: str):
-  try:
-    return _P.get(param)
-  except Exception:
-    return None
-
-
 def save_bool_param(param: str, val: bool) -> None:
   try:
     _P.put_bool(param, bool(val))
@@ -24,7 +17,10 @@ def save_bool_param(param: str, val: bool) -> None:
 
 
 def load_bool_param(param: str, default_val: bool) -> bool:
-  v = _safe_get(param)
+  try:
+    v = _P.get(param)
+  except Exception:
+    return bool(default_val)
   if v is None:
     try:
       _P.put_bool(param, bool(default_val))
@@ -45,7 +41,10 @@ def save_float_param(param: str, val: float) -> None:
 
 
 def load_float_param(param: str, default_val: float) -> float:
-  v = _safe_get(param)
+  try:
+    v = _P.get(param)
+  except Exception:
+    return float(default_val)
   if v is None:
     try:
       _P.put(param, str(float(default_val)))
@@ -70,7 +69,10 @@ def save_str_param(param: str, val: str) -> None:
 
 
 def load_str_param(param: str, default_val: str) -> str:
-  v = _safe_get(param)
+  try:
+    v = _P.get(param)
+  except Exception:
+    return str(default_val)
   if v is None:
     try:
       _P.put(param, str(default_val))

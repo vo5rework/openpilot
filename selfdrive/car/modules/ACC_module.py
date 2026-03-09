@@ -2,27 +2,24 @@
 """
 Unity-parity Tesla cruise stalk button selection for XNOR.
 
-What this patch fixes
-- Brings engaged ACC button selection closer to Unity again while keeping the
-  useful XNOR readback smoothing.
-- Removes the non-Unity "fast decel lead => immediate CANCEL" behavior that was
-  still causing nuisance dropouts instead of stepped decel.
-- Relaxes lead-follow accel and reversal damping so the car can recover speed
-  more naturally as a lead opens instead of lingering below the target.
+What this patch restores
+- ACC decisions come from the planner/LONG desired speed, like Unity.
+- Lead handling stays primarily in MPC/planner; ACC is not a second lead controller.
+- Stock-cruise CANCEL is reserved for true emergency / below-min cases.
+- Automated set-speed changes keep lightweight XNOR readback guards only.
 
-Why this is the right adaptation
-- The latest logs show lead-following is mostly a threshold problem now, not a
-  planner-horizon problem: the set speed steps down, then hesitates to step back
-  up.
-- Unity's older engaged ACC logic was simpler and less conservative. XNOR still
-  benefits from readback and reversal damping because stock-cruise stalk
-  commands are discrete, but the damping needs to stay light enough that it does
-  not suppress normal re-accel or turn large slowdowns into a full CANCEL.
+Why this is the right XNOR adaptation
+- Unity's older ACC logic was simple: compare desired target vs current stock set
+  and step the Tesla stalk toward it.
+- Later XNOR patches added extra lead-specific accel/decel heuristics in ACC,
+  which created 1-2 mph nibbling and made re-accel depend on ACC thresholds
+  instead of the planner target.
+- Keeping the Unity decision thresholds while retaining modest readback damping
+  gives smoother follow behavior in XNOR's stock-cruise-sync architecture.
 """
 
 from __future__ import annotations
 
-import sys
 import time
 from dataclasses import dataclass
 from typing import Optional
@@ -37,7 +34,6 @@ def _now_ms() -> int:
 
 
 def _cc_units_kph(speed_units: str) -> tuple[float, float]:
-  """Return Tesla half/full stalk step sizes in kph."""
   if speed_units == "MPH":
     return 1.0 * CV.MPH_TO_KPH, 5.0 * CV.MPH_TO_KPH
   return 1.0, 5.0
@@ -64,11 +60,11 @@ class ACCController:
 
   _HUMAN_COOLDOWN_MS = 3000
   _AUTO_COOLDOWN_MS = 400
-  _AUTO_COOLDOWN_ACCEL_MS = 150
+  _AUTO_COOLDOWN_ACCEL_MS = 200
   _READBACK_WAIT_MS = 350
-  _REVERSAL_DAMP_MS = 400
+  _REVERSAL_DAMP_MS = 250
   _LEAD_REVERSAL_DAMP_MS = 250
-  _REVERSAL_PERSIST_MS = 100
+  _REVERSAL_PERSIST_MS = 150
   _FAST_DECEL_RESUME_HOLDOFF_MS = 2000
   _LEAD_FRESH_MS = 700
   _AUTOENGAGE_SPEED_WINDOW_MS = 0.8
@@ -100,37 +96,41 @@ class ACCController:
 
   def note_human_buttons(self, cruise_buttons: int, *, now_ms: Optional[int] = None) -> None:
     now = _now_ms() if now_ms is None else int(now_ms)
-    btn = int(cruise_buttons or 0)
-    if btn not in (int(CruiseButtons.IDLE), int(CruiseButtons.MAIN)):
-      self.human_action_time_ms = now
-    self.prev_cruise_buttons = btn
+    current_button = int(cruise_buttons)
+
+    if current_button != int(self.prev_cruise_buttons):
+      self.human_action_time_ms = int(now)
+      if current_button != int(CruiseButtons.IDLE):
+        self._awaiting_readback = False
+        self._pending_reversal_direction = 0
+        self._pending_reversal_since_ms = 0
+        self._last_auto_direction = 0
+
+    self.prev_cruise_buttons = current_button
 
   def _no_human_action_for(self, *, now_ms: int, milliseconds: int) -> bool:
-    return now_ms > int(self.human_action_time_ms) + int(milliseconds)
+    return (int(now_ms) - int(self.human_action_time_ms)) >= int(milliseconds)
 
   def _no_automated_action_for(self, *, now_ms: int, milliseconds: int) -> bool:
-    return now_ms > int(self.automated_action_time_ms) + int(milliseconds)
+    return (int(now_ms) - int(self.automated_action_time_ms)) >= int(milliseconds)
 
   def _refresh_readback_state(self, *, now_ms: int, readback_kph: float, half_kph: float) -> None:
     if not self._awaiting_readback:
       return
 
-    age_ms = int(now_ms) - int(self.automated_action_time_ms)
-    moved_kph = float(readback_kph) - float(self._last_auto_readback_kph)
-    confirmed = False
-
-    if self._last_auto_direction > 0:
-      confirmed = moved_kph >= (0.45 * float(half_kph))
-    elif self._last_auto_direction < 0:
-      confirmed = moved_kph <= (-0.45 * float(half_kph))
-
-    if confirmed or (age_ms >= int(self._READBACK_WAIT_MS)):
+    moved_enough = abs(float(readback_kph) - float(self._last_auto_readback_kph)) >= (0.45 * float(half_kph))
+    timed_out = (int(now_ms) - int(self.automated_action_time_ms)) > 1200
+    if moved_enough or timed_out:
       self._awaiting_readback = False
 
   def _poll_lead(self, *, now_ms: int) -> LeadInfo:
-    lead = LeadInfo()
     try:
       self._radar_sm.update(0)
+    except Exception:
+      pass
+
+    lead = LeadInfo()
+    try:
       if bool(self._radar_sm.valid.get("radarState", False)):
         rs = self._radar_sm["radarState"]
         lead_one = getattr(rs, "leadOne", None)
@@ -146,11 +146,9 @@ class ACCController:
 
   @staticmethod
   def _seconds_to_collision(*, lead: LeadInfo) -> float:
-    if (not lead.status) or (lead.d_rel <= 0.0):
-      return float(sys.maxsize)
-    if lead.v_rel >= 0.0:
-      return float(sys.maxsize)
-    return abs(float(lead.d_rel) / float(lead.v_rel))
+    if (not lead.status) or (lead.d_rel <= 0.0) or (lead.v_rel >= -0.01):
+      return 1e6
+    return float(lead.d_rel) / max(0.01, -float(lead.v_rel))
 
   def _fast_decel_required(self, *, v_ego_ms: float, lead: LeadInfo) -> bool:
     if not lead.status or lead.d_rel <= 0.0:
@@ -176,75 +174,50 @@ class ACCController:
       or (desired_below_min and current_near_min and materially_closing and ttc_s < 5.0)
     )
 
-  def _should_autoengage_cc(
-    self,
-    *,
-    now_ms: int,
-    v_ego_ms: float,
-    brake_pressed: bool,
-    lead: LeadInfo,
-  ) -> bool:
-    if float(v_ego_ms) < float(self.MIN_CRUISE_SPEED_MS):
+  def _should_autoengage_cc(self, *, now_ms: int, v_ego_ms: float, brake_pressed: bool, lead: LeadInfo) -> bool:
+    if float(v_ego_ms) <= float(self.MIN_CRUISE_SPEED_MS):
       return False
     if bool(brake_pressed):
       return False
-    if int(now_ms) <= int(self.fast_decel_time_ms) + int(self._FAST_DECEL_RESUME_HOLDOFF_MS):
+    if (int(now_ms) - int(self.fast_decel_time_ms)) < int(self._FAST_DECEL_RESUME_HOLDOFF_MS):
       return False
-
-    recent_lead = lead.status or ((int(now_ms) - int(self.lead_last_seen_time_ms)) < int(self._LEAD_FRESH_MS))
-    if recent_lead and lead.status:
-      materially_closing = (lead.d_rel > 0.0) and (lead.v_rel < -1.2)
-      if materially_closing:
-        return False
-      if self._fast_decel_required(v_ego_ms=v_ego_ms, lead=lead):
-        return False
-
+    if lead.status and self._fast_decel_required(v_ego_ms=v_ego_ms, lead=lead):
+      return False
     return True
 
   def _clear_pending_reversal(self) -> None:
     self._pending_reversal_direction = 0
     self._pending_reversal_since_ms = 0
 
-  def _allow_lead_reversal(
-    self,
-    *,
-    now_ms: int,
-    direction: int,
-    speed_offset_kph: float,
-    half_kph: float,
-    lead: LeadInfo,
-  ) -> bool:
-    if (not lead.status) or direction == 0 or self._last_auto_direction == 0 or direction == self._last_auto_direction:
+  def _allow_lead_reversal(self, *, now_ms: int, direction: int, speed_offset_kph: float, half_kph: float, lead: LeadInfo) -> bool:
+    if direction == 0 or (not lead.status):
       self._clear_pending_reversal()
       return True
 
-    if abs(float(speed_offset_kph)) >= (1.35 * float(half_kph)):
+    threshold = 0.55 * float(half_kph)
+    if abs(float(speed_offset_kph)) >= threshold:
       self._clear_pending_reversal()
       return True
 
-    if int(direction) != int(self._pending_reversal_direction):
-      self._pending_reversal_direction = int(direction)
-      self._pending_reversal_since_ms = int(now_ms)
-      return False
+    if self._pending_reversal_direction == direction:
+      return (int(now_ms) - int(self._pending_reversal_since_ms)) >= int(self._REVERSAL_PERSIST_MS)
 
-    return (int(now_ms) - int(self._pending_reversal_since_ms)) >= int(self._REVERSAL_PERSIST_MS)
-
+    self._pending_reversal_direction = int(direction)
+    self._pending_reversal_since_ms = int(now_ms)
+    return False
 
   def _record_button(self, *, now_ms: int, button: int, readback_kph: float, half_kph: float) -> None:
-    direction = self._button_direction(int(button))
-    if direction != self._last_auto_direction:
-      self._direction_change_time_ms = int(now_ms)
-
-    self._last_auto_button = int(button)
-    self._last_auto_direction = int(direction)
-    self._clear_pending_reversal()
-    self._last_auto_readback_kph = float(readback_kph)
-    self._awaiting_readback = int(button) not in (int(CruiseButtons.CANCEL), int(CruiseButtons.RES_ACCEL))
     self.automated_action_time_ms = int(now_ms)
+    self._last_auto_button = int(button)
+    self._last_auto_direction = self._button_direction(int(button))
+    self._last_auto_readback_kph = float(readback_kph)
+    self._awaiting_readback = int(button) != int(CruiseButtons.CANCEL)
+
+    if self._last_auto_direction != 0:
+      self._direction_change_time_ms = int(now_ms)
 
     if int(button) == int(CruiseButtons.CANCEL):
       self.fast_decel_time_ms = int(now_ms)
-      self._awaiting_readback = False
 
   def update(
     self,
@@ -261,7 +234,6 @@ class ACCController:
     brake_pressed: bool = False,
     max_accel_target_ms: Optional[float] = None,
   ) -> AccDecision:
-    """Return one CruiseButtons press to move stock cruise toward the desired target."""
     self.note_human_buttons(cruise_buttons, now_ms=now_ms)
     lead = self._poll_lead(now_ms=now_ms)
 
@@ -297,14 +269,9 @@ class ACCController:
       return AccDecision(None, "gated: missing target/current")
 
     half_kph, full_kph = _cc_units_kph(speed_units)
-
     fast_decel_required = self._fast_decel_required(v_ego_ms=v_ego_ms, lead=lead)
-    min_target_kph = float(self.MIN_CRUISE_SPEED_MS) * CV.MS_TO_KPH
     desired_target_ms = float(desired_speed_ms)
 
-    # Keep stock cruise alive for clear-road curve slowdowns. Below-min targets
-    # are clamped to Tesla's minimum cruise speed unless a true fast-decel lead
-    # event requires a CANCEL.
     if (not fast_decel_required) and desired_target_ms < float(self.MIN_CRUISE_SPEED_MS):
       desired_target_ms = float(self.MIN_CRUISE_SPEED_MS)
 
@@ -322,56 +289,9 @@ class ACCController:
     speed_offset_kph = float(target_kph) - float(current_kph)
     available_speed_kph = float(max_target_kph) - float(current_kph)
 
-    opening_or_clear = (not lead.status) or (lead.v_rel > 0.15) or (lead.d_rel > 42.0)
-    mild_lead_follow = bool(lead.status and abs(float(lead.v_rel)) < 0.6 and 12.0 < float(lead.d_rel) < 42.0)
-    steady_lead_follow = bool(lead.status and abs(float(lead.v_rel)) < 0.35 and 15.0 < float(lead.d_rel) < 32.0)
-    lead_recovery = bool(lead.status and (float(lead.v_rel) > 0.15 or float(lead.d_rel) > 30.0))
-    strong_lead_opening = bool(lead.status and (float(lead.v_rel) > 0.55 or float(lead.d_rel) > 42.0))
-
-    accel_half_kph = float(half_kph) * (0.65 if opening_or_clear else 1.0)
-    accel_full_kph = float(full_kph) * (0.75 if opening_or_clear else 1.0)
-
-    # Unity was willing to re-accelerate as soon as the lead opened and the
-    # planner target came back up. Keep XNOR's smoothing, but bias recovery
-    # toward quicker RES presses once the lead is clearly opening.
-    if lead_recovery:
-      accel_half_kph = min(accel_half_kph, 0.50 * float(half_kph))
-      accel_full_kph = min(accel_full_kph, 0.65 * float(full_kph))
-    elif mild_lead_follow and not strong_lead_opening:
-      accel_half_kph = min(accel_half_kph, 0.80 * float(half_kph))
-    if steady_lead_follow and not strong_lead_opening and not lead_recovery:
-      accel_half_kph = min(accel_half_kph, 0.70 * float(half_kph))
-      accel_full_kph = min(accel_full_kph, 0.85 * float(full_kph))
-
-    decel_half_kph = 0.9 * float(half_kph)
-    if mild_lead_follow and not fast_decel_required:
-      decel_half_kph = min(decel_half_kph, 0.90 * float(half_kph))
-    if steady_lead_follow and not fast_decel_required:
-      decel_half_kph = min(decel_half_kph, 0.80 * float(half_kph))
-
-    lead_deadband_kph = 0.0
-    if lead.status and not fast_decel_required:
-      if lead_recovery:
-        lead_deadband_kph = 0.40 * float(half_kph)
-      elif steady_lead_follow:
-        lead_deadband_kph = 0.95 * float(half_kph)
-      elif mild_lead_follow:
-        lead_deadband_kph = 0.75 * float(half_kph)
-
-    if lead_deadband_kph > 0.0 and abs(float(speed_offset_kph)) < float(lead_deadband_kph):
+    if abs(float(speed_offset_kph)) < (0.55 * float(half_kph)):
       self._clear_pending_reversal()
-      return AccDecision(None, "no-op: lead deadband", target_kph, current_kph, current_kph)
-
-    allow_accel_full_step = (
-      (not lead.status)
-      or strong_lead_opening
-      or (lead_recovery and speed_offset_kph >= (0.70 * float(full_kph)))
-      or (speed_offset_kph >= (1.8 * float(full_kph)) and not steady_lead_follow)
-    )
-    allow_decel_full_step = (
-      (not lead.status)
-      or (lead.status and ((float(lead.v_rel) < -3.2) or speed_offset_kph < (-1.35 * float(full_kph))))
-    )
+      return AccDecision(None, "no-op: deadband", target_kph, current_kph, current_kph)
 
     cancel_required = self._cancel_required(
       v_ego_ms=v_ego_ms,
@@ -383,14 +303,14 @@ class ACCController:
     button: Optional[int] = None
     if cancel_required and (current_kph > 0.0):
       button = int(CruiseButtons.CANCEL)
-    elif allow_decel_full_step and speed_offset_kph < (-0.6 * float(full_kph)) and current_kph > 0.0:
+    elif speed_offset_kph < (-0.6 * float(full_kph)) and current_kph > 0.0:
       button = int(CruiseButtons.DECEL_2ND)
-    elif speed_offset_kph < (-(1.15 if (strong_lead_opening or (lead.status and float(lead.d_rel) > 45.0 and float(lead.v_rel) > -0.2)) else 0.90) * float(decel_half_kph)) and current_kph > 0.0:
+    elif speed_offset_kph < (-0.9 * float(half_kph)) and current_kph > 0.0:
       button = int(CruiseButtons.DECEL_SET)
     elif float(v_ego_ms) > float(self.MIN_CRUISE_SPEED_MS):
-      if allow_accel_full_step and speed_offset_kph >= float(accel_full_kph) and float(full_kph) < float(available_speed_kph):
+      if speed_offset_kph >= float(full_kph) and float(full_kph) < float(available_speed_kph):
         button = int(CruiseButtons.RES_ACCEL_2ND)
-      elif speed_offset_kph >= float(accel_half_kph) and float(half_kph) < float(available_speed_kph):
+      elif speed_offset_kph >= float(half_kph) and float(half_kph) < float(available_speed_kph):
         button = int(CruiseButtons.RES_ACCEL)
 
     if button is None:
@@ -404,6 +324,7 @@ class ACCController:
     if CruiseButtons.is_decel(button):
       min_after_full = float(current_kph) - float(full_kph)
       min_after_half = float(current_kph) - float(half_kph)
+      min_target_kph = float(self.MIN_CRUISE_SPEED_MS) * CV.MS_TO_KPH
       if min_after_full < min_target_kph:
         if min_after_half >= min_target_kph:
           button = int(CruiseButtons.DECEL_SET)
@@ -419,28 +340,17 @@ class ACCController:
         self._awaiting_readback
         and direction == self._last_auto_direction
         and (int(now_ms) - int(self.automated_action_time_ms)) < int(self._READBACK_WAIT_MS)
-        and (
-          (direction < 0 and abs(float(speed_offset_kph)) < float(full_kph))
-          or (
-            direction > 0
-            and abs(float(speed_offset_kph)) < (
-              (0.35 * float(full_kph)) if lead_recovery else (0.55 * float(full_kph))
-            )
-          )
-        )
+        and abs(float(speed_offset_kph)) < float(full_kph)
       ):
         return AccDecision(None, "gated: waiting readback", target_kph, current_kph, current_kph)
 
-      steady_lead_follow = bool(lead.status and abs(float(lead.v_rel)) < 0.35 and 15.0 < float(lead.d_rel) < 35.0)
       reversal_damp_ms = int(self._LEAD_REVERSAL_DAMP_MS if lead.status else self._REVERSAL_DAMP_MS)
       if (
         direction != 0
         and self._last_auto_direction != 0
         and direction != self._last_auto_direction
         and (int(now_ms) - int(self._direction_change_time_ms)) < reversal_damp_ms
-        and abs(float(speed_offset_kph)) < (
-          (0.30 * float(half_kph)) if lead_recovery else ((0.50 * float(half_kph)) if steady_lead_follow else (0.45 * float(half_kph) if lead.status else 0.60 * float(half_kph)))
-        )
+        and abs(float(speed_offset_kph)) < (0.75 * float(half_kph))
       ):
         return AccDecision(None, "gated: reversal damp", target_kph, current_kph, current_kph)
 
@@ -467,9 +377,5 @@ class ACCController:
     else:
       est_kph = 0.0
 
-    if int(button) == int(CruiseButtons.CANCEL):
-      reason = "cancel: fast_decel"
-    else:
-      reason = "press"
-
+    reason = "cancel: imminent" if int(button) == int(CruiseButtons.CANCEL) else "press"
     return AccDecision(int(button), reason, target_kph, current_kph, est_kph)
