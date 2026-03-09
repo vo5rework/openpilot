@@ -322,11 +322,11 @@ class ACCController:
     speed_offset_kph = float(target_kph) - float(current_kph)
     available_speed_kph = float(max_target_kph) - float(current_kph)
 
-    opening_or_clear = (not lead.status) or (lead.v_rel > 0.15) or (lead.d_rel > 34.0)
-    mild_lead_follow = bool(lead.status and abs(float(lead.v_rel)) < 0.6 and 12.0 < float(lead.d_rel) < 55.0)
-    steady_lead_follow = bool(lead.status and abs(float(lead.v_rel)) < 0.35 and 15.0 < float(lead.d_rel) < 38.0)
-    lead_recovery = bool(lead.status and (float(lead.v_rel) > 0.10 or float(lead.d_rel) > 26.0))
-    strong_lead_opening = bool(lead.status and (float(lead.v_rel) > 0.55 or float(lead.d_rel) > 34.0))
+    opening_or_clear = (not lead.status) or (lead.v_rel > 0.15) or (lead.d_rel > 42.0)
+    mild_lead_follow = bool(lead.status and abs(float(lead.v_rel)) < 0.6 and 12.0 < float(lead.d_rel) < 42.0)
+    steady_lead_follow = bool(lead.status and abs(float(lead.v_rel)) < 0.35 and 15.0 < float(lead.d_rel) < 32.0)
+    lead_recovery = bool(lead.status and (float(lead.v_rel) > 0.15 or float(lead.d_rel) > 30.0))
+    strong_lead_opening = bool(lead.status and (float(lead.v_rel) > 0.55 or float(lead.d_rel) > 42.0))
 
     accel_half_kph = float(half_kph) * (0.65 if opening_or_clear else 1.0)
     accel_full_kph = float(full_kph) * (0.75 if opening_or_clear else 1.0)
@@ -335,8 +335,8 @@ class ACCController:
     # planner target came back up. Keep XNOR's smoothing, but bias recovery
     # toward quicker RES presses once the lead is clearly opening.
     if lead_recovery:
-      accel_half_kph = min(accel_half_kph, 0.60 * float(half_kph))
-      accel_full_kph = min(accel_full_kph, 0.75 * float(full_kph))
+      accel_half_kph = min(accel_half_kph, 0.50 * float(half_kph))
+      accel_full_kph = min(accel_full_kph, 0.65 * float(full_kph))
     elif mild_lead_follow and not strong_lead_opening:
       accel_half_kph = min(accel_half_kph, 0.80 * float(half_kph))
     if steady_lead_follow and not strong_lead_opening and not lead_recovery:
@@ -349,10 +349,23 @@ class ACCController:
     if steady_lead_follow and not fast_decel_required:
       decel_half_kph = min(decel_half_kph, 0.80 * float(half_kph))
 
+    lead_deadband_kph = 0.0
+    if lead.status and not fast_decel_required:
+      if lead_recovery:
+        lead_deadband_kph = 0.40 * float(half_kph)
+      elif steady_lead_follow:
+        lead_deadband_kph = 0.95 * float(half_kph)
+      elif mild_lead_follow:
+        lead_deadband_kph = 0.75 * float(half_kph)
+
+    if lead_deadband_kph > 0.0 and abs(float(speed_offset_kph)) < float(lead_deadband_kph):
+      self._clear_pending_reversal()
+      return AccDecision(None, "no-op: lead deadband", target_kph, current_kph, current_kph)
+
     allow_accel_full_step = (
       (not lead.status)
       or strong_lead_opening
-      or (lead_recovery and speed_offset_kph >= (0.85 * float(full_kph)))
+      or (lead_recovery and speed_offset_kph >= (0.70 * float(full_kph)))
       or (speed_offset_kph >= (1.8 * float(full_kph)) and not steady_lead_follow)
     )
     allow_decel_full_step = (
@@ -372,7 +385,7 @@ class ACCController:
       button = int(CruiseButtons.CANCEL)
     elif allow_decel_full_step and speed_offset_kph < (-0.6 * float(full_kph)) and current_kph > 0.0:
       button = int(CruiseButtons.DECEL_2ND)
-    elif speed_offset_kph < (-0.9 * float(decel_half_kph)) and current_kph > 0.0:
+    elif speed_offset_kph < (-(1.15 if (strong_lead_opening or (lead.status and float(lead.d_rel) > 45.0 and float(lead.v_rel) > -0.2)) else 0.90) * float(decel_half_kph)) and current_kph > 0.0:
       button = int(CruiseButtons.DECEL_SET)
     elif float(v_ego_ms) > float(self.MIN_CRUISE_SPEED_MS):
       if allow_accel_full_step and speed_offset_kph >= float(accel_full_kph) and float(full_kph) < float(available_speed_kph):

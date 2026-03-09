@@ -270,21 +270,35 @@ class LongController:
     planner_head_ms = float(self._lp_head_ms) if (lp_fresh and self._lp_head_ms is not None) else None
     planner_approach_ms = float(self._lp_approach_ms) if (lp_fresh and self._lp_approach_ms is not None) else None
     planner_tail_ms = float(self._lp_tail_ms) if (lp_fresh and self._lp_tail_ms is not None) else None
-    planner_has_lead = bool(lp_fresh and (self._lp_has_lead or self._lead_present))
+    planner_has_lead = bool(lp_fresh and self._lp_has_lead)
     planner_a_target = float(self._lp_a_target) if lp_fresh else 0.0
 
     startup_warmup = bool(self._enabled_since_ms and ((int(now) - int(self._enabled_since_ms)) < 1800))
 
-    lead_recovery = bool(self._lead_present and (float(self._lead_vrel) > 0.10 or float(self._lead_drel) > 26.0))
-    if planner_has_lead and planner_tail_ms is not None and planner_tail_ms > 0.1:
+    lead_recovery = bool(self._lead_present and (float(self._lead_vrel) > 0.15 or float(self._lead_drel) > 30.0))
+    lead_far_or_opening = bool(self._lead_present and (float(self._lead_drel) > 45.0 or float(self._lead_vrel) > 0.15))
+    lead_constraining = bool(
+      planner_has_lead
+      and planner_tail_ms is not None
+      and float(planner_tail_ms) > 0.1
+      and (
+        float(planner_tail_ms) < (float(base_desired_ms) - 0.40)
+        or (self._lead_present and float(self._lead_drel) < 45.0)
+        or (self._lead_present and float(self._lead_vrel) < 0.15)
+      )
+    )
+
+    if lead_constraining:
       follow_target_ms = float(planner_tail_ms)
       if lead_recovery and planner_head_ms is not None:
-        blended_recovery_ms = (0.65 * float(planner_head_ms)) + (0.35 * float(planner_tail_ms))
+        blended_recovery_ms = (0.85 * float(planner_head_ms)) + (0.15 * float(planner_tail_ms))
         follow_target_ms = max(float(follow_target_ms), float(blended_recovery_ms))
+      if lead_far_or_opening and planner_head_ms is not None:
+        follow_target_ms = max(float(follow_target_ms), float(planner_head_ms) - 0.15)
       desired_ms = max(0.0, float(follow_target_ms))
       if max_accel_target_ms is not None:
         desired_ms = min(float(desired_ms), float(max_accel_target_ms))
-      src = f"{src}+lp_tail_lead"
+      src = f"{src}+lp_lead_follow"
       if lead_recovery and planner_head_ms is not None:
         src = f"{src}_recovery"
     else:
