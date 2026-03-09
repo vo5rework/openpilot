@@ -1,20 +1,24 @@
 # /data/openpilot/selfdrive/car/modules/LONG_module.py
 """
-Unity-style stock cruise set-speed syncing for XNOR.
+Unity-parity stock-cruise syncing for XNOR.
 
-Behavior
-- Treats the stock set speed (or active speed-limit target) as the base desired cruise speed.
-- Uses the planner only as a near-term slowdown cap, instead of mirroring the far-horizon
-  planner tail directly into stock cruise.
-- Keeps live follow-distance and lead-handling behavior from the recent XNOR refactor.
+What this patch fixes
+- Uses the planner directly for lead following, instead of fighting back toward
+  the speed limit while a lead is present.
+- Uses the planner only as a clear-road slowdown cap for vision turns.
+- Removes the non-Unity lead-open speed-limit push that was causing "hunting"
+  behind a lead.
+- Uses a more responsive but still spike-resistant near-term curve sample so
+  real turns slow down, while slight-bend noise is still filtered.
 
-Why this patch exists
-- In the latest curve logs, LONG's `lp_last` was often below ego even with no lead and even
-  on samples where `curve_detected = 0`.
-- Feeding that far-horizon tail directly into ACC made stock cruise hesitate to re-accelerate
-  and occasionally step down on very slight bends.
-- Unity's pure-vision slowdown intent is preserved here, but adapted for XNOR's stock-cruise
-  sync path by using a stable near-term planner slowdown signal instead of the plan tail.
+Why this is the right adaptation
+- The attached logs show real turns already produce a lower planner target, but
+  patch89 could still drop cruise or ignore the slowdown because LONG/ACC were
+  mixing that target with speed-limit ownership too aggressively.
+- Unity's older path effectively followed the planner target. On XNOR, the clean
+  split is:
+    * lead present  -> follow the planner directly
+    * no lead       -> use planner only to cap cruise for turn slowdown
 """
 
 from __future__ import annotations
@@ -46,15 +50,21 @@ class LongDecision:
 class LongController:
   MIN_CRUISE_SPEED_MS = 17.1 * CV.MPH_TO_MS
   _LP_FRESH_NS = 1_500_000_000
+  _PLAN_FOLLOW_WINDOW = 3
   _PLAN_SLOWDOWN_WINDOW = 6
-  _PLAN_SLOWDOWN_MARGIN_MS = 1.0
-  _PLAN_SLOWDOWN_EGO_MARGIN_MS = 0.75
+  _PLAN_SLOWDOWN_MARGIN_MS = 0.75
+  _PLAN_SLOWDOWN_EGO_MARGIN_MS = 0.50
+  _PLAN_SLOWDOWN_STRONG_EGO_MARGIN_MS = 1.00
+  _PLAN_SLOWDOWN_A_MARGIN_MS2 = -0.15
 
   def __init__(self) -> None:
     self.acc = ACCController()
     self._sm = messaging.SubMaster(["longitudinalPlan", "radarState"])
 
+    self._lp_follow_ms: Optional[float] = None
     self._lp_slowdown_ms: Optional[float] = None
+    self._lp_has_lead: bool = False
+    self._lp_a_target: float = 0.0
     self._lp_last_ns: int = 0
 
     self._lead_present: bool = False
@@ -75,6 +85,25 @@ class LongController:
     cloudlog.info(msg)
 
   @classmethod
+  def _extract_plan_follow_speed(cls, lp) -> Optional[float]:
+    speeds = getattr(lp, "speeds", None)
+    if not speeds:
+      return None
+
+    window = []
+    try:
+      for s in speeds[:min(int(cls._PLAN_FOLLOW_WINDOW), len(speeds))]:
+        v = float(s)
+        if math.isfinite(v) and v >= 0.0:
+          window.append(v)
+    except Exception:
+      return None
+
+    if len(window) == 0:
+      return None
+    return float(statistics.median(window))
+
+  @classmethod
   def _extract_plan_slowdown_speed(cls, lp) -> Optional[float]:
     speeds = getattr(lp, "speeds", None)
     if not speeds:
@@ -91,8 +120,11 @@ class LongController:
 
     if len(window) == 0:
       return None
+    if len(window) == 1:
+      return float(window[0])
+
     sorted_window = sorted(window)
-    return float(sorted_window[len(sorted_window) // 2])
+    return float(sorted_window[1])
 
   def _poll_plan_and_lead(self, *, now_ns: int) -> None:
     try:
@@ -103,9 +135,13 @@ class LongController:
     try:
       if bool(self._sm.valid.get("longitudinalPlan", False)):
         lp = self._sm["longitudinalPlan"]
+        v_follow = self._extract_plan_follow_speed(lp)
         v_slow = self._extract_plan_slowdown_speed(lp)
-        if v_slow is not None:
-          self._lp_slowdown_ms = float(v_slow)
+        if (v_follow is not None) or (v_slow is not None):
+          self._lp_follow_ms = float(v_follow) if v_follow is not None else None
+          self._lp_slowdown_ms = float(v_slow) if v_slow is not None else None
+          self._lp_has_lead = bool(getattr(lp, "hasLead", False))
+          self._lp_a_target = float(getattr(lp, "aTarget", 0.0) or 0.0)
           self._lp_last_ns = int(self._sm.logMonoTime.get("longitudinalPlan", now_ns))
     except Exception:
       pass
@@ -194,52 +230,49 @@ class LongController:
     desired_ms = float(base_desired_ms)
     src = f"base[{ceiling_src}]" if max_accel_target_ms is not None else "base[set_speed]"
 
+    planner_follow_ms = float(self._lp_follow_ms) if (lp_fresh and self._lp_follow_ms is not None) else None
     planner_slow_ms = float(self._lp_slowdown_ms) if (lp_fresh and self._lp_slowdown_ms is not None) else None
+    planner_has_lead = bool(lp_fresh and (self._lp_has_lead or self._lead_present))
+    planner_a_target = float(self._lp_a_target) if lp_fresh else 0.0
 
-    startup_warmup = bool(self._enabled_since_ms and ((int(now) - int(self._enabled_since_ms)) < 2500))
-    allow_plan_slowdown = bool(
-      planner_slow_ms is not None
-      and (
-        not startup_warmup
-        or self._lead_present
-        or (
-          int(self._stable_plan_samples) >= 3
-          and float(planner_slow_ms) > 0.1
+    startup_warmup = bool(self._enabled_since_ms and ((int(now) - int(self._enabled_since_ms)) < 1800))
+
+    if planner_has_lead and planner_follow_ms is not None and planner_follow_ms > 0.1:
+      desired_ms = min(float(base_desired_ms), float(planner_follow_ms))
+      desired_ms = max(0.0, float(desired_ms))
+      src = f"{src}+lp_lead"
+    else:
+      allow_plan_slowdown = bool(
+        planner_slow_ms is not None
+        and (
+          not startup_warmup
+          or (
+            int(self._stable_plan_samples) >= 2
+            and float(planner_slow_ms) > 0.1
+          )
         )
       )
-    )
 
-    if allow_plan_slowdown and planner_slow_ms is not None:
-      should_apply_plan_slowdown = bool(
-        float(planner_slow_ms) < (float(base_desired_ms) - float(self._PLAN_SLOWDOWN_MARGIN_MS))
-        and float(planner_slow_ms) < (float(v_ego_ms) - float(self._PLAN_SLOWDOWN_EGO_MARGIN_MS))
-      )
-      if should_apply_plan_slowdown:
-        desired_ms = float(planner_slow_ms)
-        src = f"{src}+plan_slow"
+      if allow_plan_slowdown and planner_slow_ms is not None:
+        strong_plan_slowdown = bool(
+          float(planner_a_target) <= float(self._PLAN_SLOWDOWN_A_MARGIN_MS2)
+          or float(planner_slow_ms) < (float(v_ego_ms) - float(self._PLAN_SLOWDOWN_STRONG_EGO_MARGIN_MS))
+        )
+        should_apply_plan_slowdown = bool(
+          float(planner_slow_ms) < (float(base_desired_ms) - float(self._PLAN_SLOWDOWN_MARGIN_MS))
+          and (
+            strong_plan_slowdown
+            or float(planner_slow_ms) < (float(v_ego_ms) - float(self._PLAN_SLOWDOWN_EGO_MARGIN_MS))
+          )
+        )
+        if should_apply_plan_slowdown:
+          desired_ms = max(float(self.MIN_CRUISE_SPEED_MS), float(planner_slow_ms))
+          src = f"{src}+plan_slow"
 
     if (not lp_fresh) and self._lead_present and (self._lead_drel < 80.0) and (self._lead_vrel < -0.5):
       lead_speed_ms = max(0.0, float(v_ego_ms) + float(self._lead_vrel))
       desired_ms = min(float(desired_ms), max(float(self.MIN_CRUISE_SPEED_MS), float(lead_speed_ms)))
       src = f"{src}+stale_lead"
-
-    if self._lead_present and (max_accel_target_ms is not None) and (self._lead_vrel > 0.1):
-      t_follow = 1.45
-      try:
-        follow_distance = int(getattr(cs_out, "followDistanceS", 255))
-        if follow_distance != 255:
-          t_follow = 0.7 + float(follow_distance) * 0.2
-      except Exception:
-        pass
-
-      headway_m = max(4.5, float(v_ego_ms) * float(t_follow) + 2.5)
-      extra_gap_m = float(self._lead_drel) - float(headway_m)
-      if extra_gap_m > 1.5:
-        catch_up_bias_ms = min(1.2, max(0.0, 0.12 * float(extra_gap_m)))
-        lead_open_target_ms = min(float(max_accel_target_ms), float(v_ego_ms) + max(float(self._lead_vrel), 0.0) + float(catch_up_bias_ms))
-        if lead_open_target_ms > float(desired_ms):
-          desired_ms = float(lead_open_target_ms)
-          src = f"{src}+lead_open"
 
     stock_cruise_enabled = stock_state in ("ENABLED", "OVERRIDE", "STANDSTILL")
     brake_pressed = bool(getattr(cs_out, "brakePressed", False))
