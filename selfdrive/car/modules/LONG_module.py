@@ -235,6 +235,24 @@ class LongController:
       desired_ms = min(float(desired_ms), max(float(self.MIN_CRUISE_SPEED_MS), float(lead_speed_ms)))
       src = f"{src}+stale_lead"
 
+    if self._lead_present and (max_accel_target_ms is not None) and (self._lead_vrel > 0.1):
+      t_follow = 1.45
+      try:
+        follow_distance = int(getattr(cs_out, "followDistanceS", 255))
+        if follow_distance != 255:
+          t_follow = 0.7 + float(follow_distance) * 0.2
+      except Exception:
+        pass
+
+      headway_m = max(4.5, float(v_ego_ms) * float(t_follow) + 2.5)
+      extra_gap_m = float(self._lead_drel) - float(headway_m)
+      if extra_gap_m > 1.5:
+        catch_up_bias_ms = min(1.2, max(0.0, 0.12 * float(extra_gap_m)))
+        lead_open_target_ms = min(float(max_accel_target_ms), float(v_ego_ms) + max(float(self._lead_vrel), 0.0) + float(catch_up_bias_ms))
+        if lead_open_target_ms > float(desired_ms):
+          desired_ms = float(lead_open_target_ms)
+          src = f"{src}+lead_open"
+
     stock_cruise_enabled = stock_state in ("ENABLED", "OVERRIDE", "STANDSTILL")
     brake_pressed = bool(getattr(cs_out, "brakePressed", False))
 

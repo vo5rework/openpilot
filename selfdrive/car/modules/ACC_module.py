@@ -61,11 +61,11 @@ class ACCController:
   _HUMAN_COOLDOWN_MS = 3000
   _AUTO_COOLDOWN_MS = 400
   _AUTO_COOLDOWN_ACCEL_MS = 200
-  _READBACK_WAIT_MS = 350
-  _REVERSAL_DAMP_MS = 250
-  _LEAD_REVERSAL_DAMP_MS = 250
-  _REVERSAL_PERSIST_MS = 150
-  _FAST_DECEL_RESUME_HOLDOFF_MS = 2000
+  _READBACK_WAIT_MS = 700
+  _REVERSAL_DAMP_MS = 400
+  _LEAD_REVERSAL_DAMP_MS = 1100
+  _REVERSAL_PERSIST_MS = 450
+  _FAST_DECEL_RESUME_HOLDOFF_MS = 900
   _LEAD_FRESH_MS = 700
   _AUTOENGAGE_SPEED_WINDOW_MS = 0.8
 
@@ -289,6 +289,26 @@ class ACCController:
     speed_offset_kph = float(target_kph) - float(current_kph)
     available_speed_kph = float(max_target_kph) - float(current_kph)
 
+    opening_or_clear = (not lead.status) or (lead.v_rel > 0.1)
+    mild_lead_follow = bool(lead.status and abs(float(lead.v_rel)) < 1.0 and float(lead.d_rel) > 15.0)
+    steady_lead_follow = bool(lead.status and abs(float(lead.v_rel)) < 0.75 and 18.0 < float(lead.d_rel) < 85.0)
+    strong_lead_opening = bool(lead.status and (float(lead.v_rel) > 1.5 or float(lead.d_rel) > 45.0))
+
+    accel_half_kph = float(half_kph) * (0.75 if opening_or_clear else 1.0)
+    accel_full_kph = float(full_kph) * (0.75 if opening_or_clear else 1.0)
+
+    if mild_lead_follow and not strong_lead_opening:
+      accel_half_kph = max(accel_half_kph, 1.10 * float(half_kph))
+    if steady_lead_follow and not strong_lead_opening:
+      accel_half_kph = max(accel_half_kph, 1.70 * float(half_kph))
+      accel_full_kph = max(accel_full_kph, 2.20 * float(full_kph))
+
+    decel_half_kph = 0.9 * float(half_kph)
+    if mild_lead_follow and not fast_decel_required:
+      decel_half_kph = 1.10 * float(half_kph)
+    if steady_lead_follow and not fast_decel_required:
+      decel_half_kph = max(decel_half_kph, 1.55 * float(half_kph))
+
     if abs(float(speed_offset_kph)) < (0.55 * float(half_kph)):
       self._clear_pending_reversal()
       return AccDecision(None, "no-op: deadband", target_kph, current_kph, current_kph)
@@ -300,17 +320,28 @@ class ACCController:
       lead=lead,
     )
 
+    allow_accel_full_step = (
+      (not lead.status)
+      or strong_lead_opening
+      or (speed_offset_kph >= (3.0 * float(full_kph)) and not steady_lead_follow)
+    )
+    allow_decel_full_step = (
+      (not lead.status)
+      or fast_decel_required
+      or (lead.status and (not steady_lead_follow) and (float(lead.v_rel) < -3.8 or speed_offset_kph < (-1.75 * float(full_kph))))
+    )
+
     button: Optional[int] = None
     if cancel_required and (current_kph > 0.0):
       button = int(CruiseButtons.CANCEL)
-    elif speed_offset_kph < (-0.6 * float(full_kph)) and current_kph > 0.0:
+    elif allow_decel_full_step and speed_offset_kph < (-0.95 * float(full_kph)) and current_kph > 0.0:
       button = int(CruiseButtons.DECEL_2ND)
-    elif speed_offset_kph < (-0.9 * float(half_kph)) and current_kph > 0.0:
+    elif speed_offset_kph < (-1.0 * float(decel_half_kph)) and current_kph > 0.0:
       button = int(CruiseButtons.DECEL_SET)
     elif float(v_ego_ms) > float(self.MIN_CRUISE_SPEED_MS):
-      if speed_offset_kph >= float(full_kph) and float(full_kph) < float(available_speed_kph):
+      if allow_accel_full_step and speed_offset_kph >= float(accel_full_kph) and float(full_kph) < float(available_speed_kph):
         button = int(CruiseButtons.RES_ACCEL_2ND)
-      elif speed_offset_kph >= float(half_kph) and float(half_kph) < float(available_speed_kph):
+      elif speed_offset_kph >= float(accel_half_kph) and float(half_kph) < float(available_speed_kph):
         button = int(CruiseButtons.RES_ACCEL)
 
     if button is None:
