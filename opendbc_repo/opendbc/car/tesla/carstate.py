@@ -81,8 +81,6 @@ class CarState(CarStateBase):
     self.enable_adaptive_cruise = False
     self._prev_enable_adaptive_cruise = False
     self.acc_speed_max_ms = 0.0
-    self._prev_acc_max_button = int(CruiseButtons.IDLE)
-    self._prev_speed_limit_target_ms = 0.0
     self._last_cruise_stalk_pull_ms = 0
     self._prev_pull_button = 0
     self._xnor_last_virtual_btn = 0
@@ -219,75 +217,6 @@ class CarState(CarStateBase):
       self.enable_adaptive_cruise = False
 
     self._prev_pull_button = int(btn)
-
-
-  @staticmethod
-  def _cc_units_kph(speed_units: str) -> tuple[float, float]:
-    if speed_units == "MPH":
-      return 1.0 * CV.MPH_TO_KPH, 5.0 * CV.MPH_TO_KPH
-    return 1.0, 5.0
-
-  def _is_virtual_cruise_button(self, btn: int, *, now_ms: int, window_ms: int = 250) -> bool:
-    vbtn = int(getattr(self, "_xnor_last_virtual_btn", 0) or 0)
-    vms = int(getattr(self, "_xnor_last_virtual_ms", 0) or 0)
-    return bool(int(btn) == vbtn and 0 <= (int(now_ms) - vms) <= int(window_ms))
-
-  def _update_adaptive_max_cruise(self, *, now_ms: int, v_ego_ms: float, actual_set_ms: float, speed_units: str, speed_limit_target_ms: float) -> None:
-    """Unity-style adaptive max cruise owner for XNOR.
-
-    Unity keeps an internal `acc_speed_kph` ceiling that is:
-    - seeded on adaptive enable,
-    - adjusted by manual stalk up/down presses,
-    - updated to the new speed-limit target when the limit changes.
-
-    XNOR uses `acc_speed_max_ms`/`carState.vCruise` as the equivalent ceiling.
-    Automated virtual stalk pulses must not move this ceiling.
-    """
-    now_adapt = bool(getattr(self, "enable_adaptive_cruise", False) or getattr(self, "enableACC", False))
-    prev_adapt = bool(getattr(self, "_prev_enable_adaptive_cruise", False))
-
-    cur_btn = int(getattr(self, "cruise_buttons", int(CruiseButtons.IDLE)) or 0)
-    prev_btn = int(getattr(self, "_prev_acc_max_button", int(CruiseButtons.IDLE)) or 0)
-
-    if not now_adapt:
-      self.acc_speed_max_ms = 0.0
-      self._prev_speed_limit_target_ms = 0.0
-      self._prev_acc_max_button = int(cur_btn)
-      return
-
-    half_kph, full_kph = self._cc_units_kph(str(speed_units or "MPH"))
-    kph_delta = {
-      int(CruiseButtons.RES_ACCEL): float(half_kph),
-      int(CruiseButtons.RES_ACCEL_2ND): float(full_kph),
-      int(CruiseButtons.DECEL_SET): -float(half_kph),
-      int(CruiseButtons.DECEL_2ND): -float(full_kph),
-    }
-
-    if not prev_adapt:
-      seed_ms = float(speed_limit_target_ms) if float(speed_limit_target_ms) > 0.0 else float(actual_set_ms)
-      self.acc_speed_max_ms = float(max(float(v_ego_ms), float(seed_ms), float(actual_set_ms)))
-    else:
-      prev_sl_ms = float(getattr(self, "_prev_speed_limit_target_ms", 0.0) or 0.0)
-      if float(speed_limit_target_ms) > 0.0:
-        prev_sl_kph = float(prev_sl_ms) * CV.MS_TO_KPH
-        cur_sl_kph = float(speed_limit_target_ms) * CV.MS_TO_KPH
-        if int(round(prev_sl_kph)) != int(round(cur_sl_kph)):
-          self.acc_speed_max_ms = float(max(float(v_ego_ms), float(speed_limit_target_ms), float(actual_set_ms)))
-
-      manual_edge = bool(
-        int(cur_btn) != int(prev_btn)
-        and int(cur_btn) in kph_delta
-        and (not self._is_virtual_cruise_button(int(cur_btn), now_ms=int(now_ms)))
-      )
-      if manual_edge:
-        self.acc_speed_max_ms = float(self.acc_speed_max_ms) + (float(kph_delta[int(cur_btn)]) * CV.KPH_TO_MS)
-
-    max_acc_ms = 170.0 * CV.KPH_TO_MS
-    self.acc_speed_max_ms = float(min(max_acc_ms, max(0.0, float(self.acc_speed_max_ms))))
-    self.acc_speed_max_ms = float(max(float(self.acc_speed_max_ms), float(v_ego_ms), float(actual_set_ms)))
-
-    self._prev_speed_limit_target_ms = float(speed_limit_target_ms) if float(speed_limit_target_ms) > 0.0 else 0.0
-    self._prev_acc_max_button = int(cur_btn)
 
   def _pick_stock_cruise_set_u(self, di_state: dict, v_ego_ms: float, cruise_enabled: bool, speed_units: str) -> tuple[float, str]:
     """Pick Tesla cruise setpoint in MPH/KPH without changing the DBC.
@@ -791,31 +720,51 @@ class CarState(CarStateBase):
       pass
 
 
-    # Unity parity: separate max cruise (planner/UI) from the actual Tesla set speed.
+    # Unity parity: separate max cruise (planner/UI) from actual stock set speed when adaptive is enabled.
     try:
+      prev_adapt = bool(getattr(self, "_prev_enable_adaptive_cruise", False))
       now_adapt = bool(getattr(self, "enable_adaptive_cruise", False) or getattr(self, "enableACC", False))
       uom = str(getattr(self, "speed_units", "MPH") or "MPH")
       use_sl = bool(getattr(self._tinkla, "adjust_acc_with_speed_limit", False))
       sl_target_ms = float(self._calc_speed_limit_target_ms(uom)) if use_sl else 0.0
 
-      actual_set_ms = float(getattr(self, "stock_cruise_set_speed_ms", 0.0) or 0.0)
-      if actual_set_ms <= 0.0:
-        actual_set_ms = float(ret.cruiseState.speed or 0.0)
+      # Unity parity: maintain a separate max cruise (planner/UI ceiling) so following a lead doesn't
+      # permanently lower vCruise.
+      if now_adapt:
+        actual_set_ms = float(getattr(self, "stock_cruise_set_speed_ms", 0.0) or 0.0)
+        if actual_set_ms <= 0.0:
+          actual_set_ms = float(ret.cruiseState.speed or 0.0)
 
-      self._update_adaptive_max_cruise(
-        now_ms=int(time.monotonic_ns() // 1_000_000),
-        v_ego_ms=float(ret.vEgoRaw),
-        actual_set_ms=float(actual_set_ms),
-        speed_units=uom,
-        speed_limit_target_ms=float(sl_target_ms),
-      )
+        if not prev_adapt:
+          # On engage, seed max from speed-limit (if available) else current set speed.
+          seed_ms = float(sl_target_ms) if sl_target_ms > 0.0 else float(actual_set_ms)
+          self.acc_speed_max_ms = float(max(float(ret.vEgoRaw), seed_ms, float(getattr(self, "acc_speed_max_ms", 0.0) or 0.0)))
+        else:
+          if sl_target_ms > 0.0:
+            # When speed-limit matching is active, keep max aligned to the current limit.
+            self.acc_speed_max_ms = float(max(float(ret.vEgoRaw), float(sl_target_ms)))
+          else:
+            # No valid limit: hold prior max (but never below current speed).
+            self.acc_speed_max_ms = float(max(float(ret.vEgoRaw), float(getattr(self, "acc_speed_max_ms", 0.0) or 0.0)))
+      else:
+        actual_set_ms = float(getattr(self, "stock_cruise_set_speed_ms", 0.0) or 0.0)
+        if actual_set_ms <= 0.0:
+          actual_set_ms = float(ret.cruiseState.speed or 0.0)
+        self.acc_speed_max_ms = 0.0
 
+      # Publish: cruiseState.speed = max cruise; cruiseState.speedCluster = actual Tesla set speed.
       if now_adapt and (float(self.acc_speed_max_ms) > 0.1):
         ret.cruiseState.speedCluster = max(float(actual_set_ms), 1e-3)
         ret.cruiseState.speed = max(float(self.acc_speed_max_ms), 1e-3)
+
+        # XNOR longitudinal planner uses carState.vCruise (kph). Keep it at the ceiling while adaptive is enabled.
+
         try:
+
           ret.vCruise = float(self.acc_speed_max_ms) * CV.MS_TO_KPH
+
         except Exception:
+
           pass
       else:
         ret.cruiseState.speedCluster = max(float(ret.cruiseState.speed or 0.0), 1e-3)

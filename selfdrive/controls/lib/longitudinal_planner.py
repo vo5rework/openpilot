@@ -140,12 +140,15 @@ class LongitudinalPlanner:
 
     v_ego = float(sm["carState"].vEgo)
 
-    # Unity parity: planner should follow controlsState.vCruise first.
-    # Fall back to carState.vCruise only for XNOR compatibility if controlsState
-    # is still unset.
-    controls_v_cruise = float(getattr(controls_state, "vCruise", 0.0) or 0.0)
+    # XNOR adaptation for Unity parity:
+    # CarState owns the adaptive max cruise ceiling while automation is stepping
+    # Tesla's stock set speed up and down. Prefer carState.vCruise here so the
+    # planner does not collapse back to the lowered stock set speed after a
+    # virtual decel press. Fall back to controlsState.vCruise if the carState
+    # ceiling is still unset.
     carstate_v_cruise = float(getattr(sm["carState"], "vCruise", 0.0) or 0.0)
-    v_cruise_kph = float(controls_v_cruise if controls_v_cruise > 0.0 else carstate_v_cruise)
+    controls_v_cruise = float(getattr(controls_state, "vCruise", 0.0) or 0.0)
+    v_cruise_kph = float(carstate_v_cruise if carstate_v_cruise > 0.0 else controls_v_cruise)
     v_cruise_kph = min(float(v_cruise_kph), float(V_CRUISE_MAX))
     v_cruise = v_cruise_kph * CV.KPH_TO_MS
 
