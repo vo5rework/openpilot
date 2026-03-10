@@ -7,50 +7,19 @@ import time
 from pathlib import Path
 from typing import Any
 
+# Make repo-root imports work when run as:
+#   cd /data/openpilot
+#   python3 tools/xnor_planner_root_watch.py
+REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(REPO_ROOT) not in sys.path:
+  sys.path.insert(0, str(REPO_ROOT))
+
 import numpy as np
-
-
-def _add_repo_root_to_path() -> None:
-  here = Path(__file__).resolve()
-  for parent in [here.parent] + list(here.parents):
-    if (parent / "selfdrive").exists() and (parent / "common").exists():
-      repo_root = str(parent)
-      if repo_root not in sys.path:
-        sys.path.insert(0, repo_root)
-      return
-
-
-_add_repo_root_to_path()
-
-import cereal.messaging as messaging  # noqa: E402
-
-try:
-  from common.conversions import Conversions as CV  # type: ignore  # noqa: E402
-except Exception:
-  from openpilot.common.conversions import Conversions as CV  # type: ignore  # noqa: E402
-
-try:
-  from common.numpy_fast import interp  # type: ignore  # noqa: E402
-except Exception:
-  from openpilot.common.numpy_fast import interp  # type: ignore  # noqa: E402
-
-try:
-  from common.realtime import Ratekeeper  # type: ignore  # noqa: E402
-except Exception:
-  from openpilot.common.realtime import Ratekeeper  # type: ignore  # noqa: E402
-
-try:
-  from selfdrive.modeld.constants import ModelConstants  # type: ignore  # noqa: E402
-except Exception:
-  from openpilot.selfdrive.modeld.constants import ModelConstants  # type: ignore  # noqa: E402
-
-try:
-  from selfdrive.controls.lib.longitudinal_mpc_lib.long_mpc import T_IDXS as T_IDXS_MPC  # type: ignore  # noqa: E402
-except Exception:
-  try:
-    from openpilot.selfdrive.controls.lib.longitudinal_mpc_lib.long_mpc import T_IDXS as T_IDXS_MPC  # type: ignore  # noqa: E402
-  except Exception:
-    T_IDXS_MPC = np.asarray(ModelConstants.T_IDXS, dtype=float)
+import cereal.messaging as messaging
+from opendbc.car.common.conversions import Conversions as CV
+from common.realtime import Ratekeeper
+from selfdrive.modeld.constants import ModelConstants
+from selfdrive.controls.lib.longitudinal_mpc_lib.long_mpc import T_IDXS as T_IDXS_MPC
 
 
 def nested_get(obj: Any, path: str, default: Any = None) -> Any:
@@ -80,6 +49,13 @@ def as_bool(v: Any, default: bool = False) -> bool:
     return bool(default)
 
 
+def interp_scalar(x: float, xp: list[float], fp: list[float]) -> float:
+  try:
+    return float(np.interp(float(x), xp, fp))
+  except Exception:
+    return float(fp[-1])
+
+
 def compute_unity_curve_targets(model: Any, v_ego: float, factor: float = 1.0) -> tuple[float, float]:
   try:
     vel_x = list(nested_get(model, "velocity.x", []) or [])
@@ -88,7 +64,7 @@ def compute_unity_curve_targets(model: Any, v_ego: float, factor: float = 1.0) -
       return 0.0, 0.0
 
     v = np.interp(T_IDXS_MPC, ModelConstants.T_IDXS, vel_x)
-    max_lat_accel = interp(v_ego, [5.0, 10.0, 20.0], [1.5, 2.0, 3.0])
+    max_lat_accel = interp_scalar(v_ego, [5.0, 10.0, 20.0], [1.5, 2.0, 3.0])
     curvatures = np.interp(T_IDXS_MPC, ModelConstants.T_IDXS, ori_z) / np.clip(v, 0.3, 100.0)
     max_v = factor * np.sqrt(max_lat_accel / (np.abs(curvatures) + 1e-3)) - 2.0
     max_v = np.clip(max_v, 0.0, 100.0)
@@ -107,7 +83,7 @@ def first_valid_speed_ms(car_state: Any) -> float:
   return max(speed, speed_cluster)
 
 
-def plan_speeds(lp: Any) -> tuple[float, float, float, float]:
+def first_lp_speeds(lp: Any) -> tuple[float, float, float, float]:
   speeds = list(getattr(lp, "speeds", []) or [])
   if not speeds:
     return 0.0, 0.0, 0.0, 0.0
@@ -145,6 +121,14 @@ def infer_blocker(
     return "force_decel", "controlsState.forceDecel active"
 
   effective_ceiling_ms = max(controls_vcruise_ms, car_vcruise_ms, stock_set_ms)
+  lead_constraining = bool(
+    lead_status and (
+      lead_drel < 45.0
+      or lead_vrel < -0.25
+      or lp_has_lead
+    )
+  )
+
   planner_low = bool(
     lplast > 0.1
     and effective_ceiling_ms > max(v_ego, stock_set_ms) + 0.6
@@ -156,14 +140,6 @@ def infer_blocker(
       return "acc_sync_block", "planner asks higher, stock set speed not following"
     return "ok_or_no_block", "no clear speed-up block"
 
-  lead_constraining = bool(
-    lead_status
-    and (
-      lead_drel < 45.0
-      or lead_vrel < -0.25
-      or lp_has_lead
-    )
-  )
   if lead_constraining:
     return "lead_hold", "lead/plan still constraining planner target"
 
@@ -238,7 +214,7 @@ def main() -> int:
       lead_drel = as_float(nested_get(lead, "dRel", 0.0), 0.0)
       lead_vrel = as_float(nested_get(lead, "vRel", 0.0), 0.0)
 
-      lp0, lp4, lp8, lplast = plan_speeds(lp)
+      lp0, lp4, lp8, lplast = first_lp_speeds(lp)
       lp_has_lead = as_bool(getattr(lp, "hasLead", False), False)
       lp_a_target = as_float(getattr(lp, "aTarget", 0.0), 0.0)
 
@@ -296,8 +272,6 @@ def main() -> int:
       })
       f.flush()
       rk.keep_time()
-
-  return 0
 
 
 if __name__ == "__main__":
