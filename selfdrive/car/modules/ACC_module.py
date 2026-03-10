@@ -39,6 +39,10 @@ def _cc_units_kph(speed_units: str) -> tuple[float, float]:
   return 1.0, 5.0
 
 
+def _button_should_be_throttled(button: int) -> bool:
+  return int(button) not in (int(CruiseButtons.MAIN), int(CruiseButtons.IDLE))
+
+
 @dataclass
 class LeadInfo:
   status: bool = False
@@ -97,14 +101,26 @@ class ACCController:
   def note_human_buttons(self, cruise_buttons: int, *, now_ms: Optional[int] = None) -> None:
     now = _now_ms() if now_ms is None else int(now_ms)
     current_button = int(cruise_buttons)
+    button_changed = current_button != int(self.prev_cruise_buttons)
 
-    if current_button != int(self.prev_cruise_buttons):
+    automated_echo = bool(
+      button_changed
+      and _button_should_be_throttled(current_button)
+      and current_button == int(self._last_auto_button)
+      and (int(now) - int(self.automated_action_time_ms)) < 1200
+    )
+
+    if button_changed and _button_should_be_throttled(current_button) and not automated_echo:
       self.human_action_time_ms = int(now)
-      if current_button != int(CruiseButtons.IDLE):
-        self._awaiting_readback = False
-        self._pending_reversal_direction = 0
-        self._pending_reversal_since_ms = 0
-        self._last_auto_direction = 0
+      self._awaiting_readback = False
+      self._pending_reversal_direction = 0
+      self._pending_reversal_since_ms = 0
+      self._last_auto_direction = 0
+
+    if button_changed and current_button == int(CruiseButtons.IDLE):
+      # Readback release for an automated pulse should not count as a human action,
+      # but it should let the controller issue the next step immediately.
+      self._awaiting_readback = False
 
     self.prev_cruise_buttons = current_button
 
