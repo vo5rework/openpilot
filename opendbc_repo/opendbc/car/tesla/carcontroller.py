@@ -88,6 +88,7 @@ class CarController(CarControllerBase):
     self._stw_release_bus = int(CANBUS.party)
     self._stw_sequence = []  # list[(frame:int, btn:int)]
     self._op_enabled_prev = False
+    self._xnor_diag_last_log_ms = 0
 
     if CP.carFingerprint in LEGACY_CARS:
       if CP.carFingerprint in (CAR.TESLA_MODEL_S_HW1, CAR.TESLA_MODEL_X_HW1):
@@ -228,17 +229,32 @@ class CarController(CarControllerBase):
       self._send_stw(CS, can_sends, BTN_IDLE, bus=int(self._stw_release_bus))
       self._stw_release_frame = -1
 
+  def _diag_log(self, msg: str) -> None:
+    now_ms = int(self._now_ms())
+    if (now_ms - int(self._xnor_diag_last_log_ms)) < 1000:
+      return
+    self._xnor_diag_last_log_ms = int(now_ms)
+    cloudlog.info(msg)
+
   def _speed_limit_sync(self, CC, CS, can_sends) -> None:
     enabled = bool(getattr(CC, "enabled", False) or getattr(CC, "latActive", False))
     if (not enabled) or (not self._cached_autopilot_disabled):
+      self._diag_log(
+        f"[XNOR_CC_DIAG] gate=pre enabled={int(enabled)} "
+        f"latActive={int(bool(getattr(CC, 'latActive', False)))} "
+        f"cc_enabled={int(bool(getattr(CC, 'enabled', False)))} "
+        f"ap_disabled={int(bool(self._cached_autopilot_disabled))}"
+      )
       return
 
     # Don't overlap with explicit sequences or a pending pulse release.
     if (int(self._stw_release_frame) >= 0):
+      self._diag_log(f"[XNOR_CC_DIAG] gate=pending_release release_frame={int(self._stw_release_frame)} frame={int(self.frame)}")
       return
 
     decision = self._long_module.update(CS, enabled=enabled, frame=int(self.frame), now_ms=int(self._now_ms()))
     if decision.button is None:
+      self._diag_log(f"[XNOR_CC_DIAG] gate=no_decision detail={decision.log or 'none'}")
       return
 
     # One Unity-style pulse; release is handled next frame by _queue_stalk_pulse().

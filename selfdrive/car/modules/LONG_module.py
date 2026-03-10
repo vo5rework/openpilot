@@ -88,10 +88,16 @@ class LongController:
 
     adaptive_enabled = bool(getattr(CS, "enable_adaptive_cruise", False) or getattr(CS, "enableACC", False))
     if (not bool(enabled)) or (not adaptive_enabled):
+      self._rate_log(
+        f"[XNOR_LONG_DIAG] gate=not_enabled enabled={int(bool(enabled))} "
+        f"adaptive={int(adaptive_enabled)} enableACC={int(bool(getattr(CS, 'enableACC', False)))} "
+        f"enable_adaptive={int(bool(getattr(CS, 'enable_adaptive_cruise', False)))}"
+      )
       return LongDecision(None, "gated: not enabled/adaptive")
 
     stock_state = str(getattr(CS, "stock_cruise_state", "") or "").upper()
     if stock_state not in ("ENABLED", "OVERRIDE", "STANDSTILL", "STANDBY"):
+      self._rate_log(f"[XNOR_LONG_DIAG] gate=stock_state stock_state={stock_state or 'UNKNOWN'}")
       return LongDecision(None, f"gated: stock_state={stock_state or 'UNKNOWN'}")
 
     cs_out = getattr(CS, "out", None)
@@ -109,6 +115,13 @@ class LongController:
     desired_ms = float(self._lp_target_ms) if lp_fresh and self._lp_target_ms is not None else float(current_set_ms)
     speed_limit_target_ms = self._resolve_speed_limit_target_ms(CS, speed_units=speed_units)
 
+    if not lp_fresh:
+      self._rate_log(
+        f"[XNOR_LONG_DIAG] gate=lp_not_fresh vEgo={float(v_ego_ms):.2f} "
+        f"set_ms={float(current_set_ms):.2f} desired_ms={float(desired_ms):.2f} "
+        f"lp_target_ms={float(self._lp_target_ms) if self._lp_target_ms is not None else -1.0:.2f}"
+      )
+
     decision: AccDecision = self.acc.update(
       now_ms=int(now),
       enabled=True,
@@ -125,6 +138,12 @@ class LongController:
 
     if decision.button is None or int(decision.button) == int(CruiseButtons.IDLE):
       src = "lp_last" if lp_fresh else "hold"
+      self._rate_log(
+        f"[XNOR_LONG_DIAG] gate=no_button reason={decision.reason} src={src} "
+        f"vEgo={float(v_ego_ms):.2f} set_ms={float(current_set_ms):.2f} desired_ms={float(desired_ms):.2f} "
+        f"speed_limit_ms={float(speed_limit_target_ms) if speed_limit_target_ms is not None else -1.0:.2f} "
+        f"stock_state={stock_state}"
+      )
       return LongDecision(None, f"{decision.reason} src={src}")
 
     msg = (
