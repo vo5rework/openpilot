@@ -58,6 +58,7 @@ STOP_DISTANCE = 6.0
 DIST_FACTOR = 2.0
 CRUISE_MIN_ACCEL = -1.2
 CRUISE_MAX_ACCEL = 1.6
+MIN_ACCEL = ACCEL_MIN
 
 def get_jerk_factor(personality=log.LongitudinalPersonality.standard):
   if personality==log.LongitudinalPersonality.relaxed:
@@ -340,7 +341,7 @@ class LongitudinalMpc:
 
     # MPC will not converge if immediate crash is expected
     # Clip lead distance to what is still possible to brake for
-    min_x_lead = ((v_ego + v_lead) / 2) * (v_ego - v_lead) / (-ACCEL_MIN * DIST_FACTOR)
+    min_x_lead = ((v_ego + v_lead) / 2) * (v_ego - v_lead) / (-MIN_ACCEL * DIST_FACTOR)
     x_lead = np.clip(x_lead, min_x_lead, 1e8)
     v_lead = np.clip(v_lead, 0.0, 1e8)
     a_lead = np.clip(a_lead, -10., 5.)
@@ -383,7 +384,9 @@ class LongitudinalMpc:
   
     # Keep XNOR's resolved lower-accel constraint; this is initialized from
     # the Unity-parity cruise min accel value above.
-    self.params[:, 0] = self.cruise_min_a
+    # Unity parity: the MPC obstacle constraint uses the harder MIN_ACCEL floor.
+    # cruise_min_a only shapes the synthetic cruise obstacle via v_lower.
+    self.params[:, 0] = MIN_ACCEL
     self.params[:, 1] = self.max_a
   
     if self.mode == 'acc':
@@ -468,7 +471,7 @@ class LongitudinalMpc:
     self.a_solution = self.x_sol[:,2]
     self.j_solution = self.u_sol[:,0]
 
-    self.prev_a = np.interp(T_IDXS + self.dt, T_IDXS, self.a_solution)
+    self.prev_a = np.interp(T_IDXS + 0.05, T_IDXS, self.a_solution)
 
     t = time.monotonic()
     if self.solution_status != 0:
