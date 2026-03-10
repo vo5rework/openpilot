@@ -2,24 +2,29 @@
 """
 Unity-parity Tesla cruise stalk button selection for XNOR.
 
-What this patch restores
-- ACC decisions come from the planner/LONG desired speed, like Unity.
-- Lead handling stays primarily in MPC/planner; ACC is not a second lead controller.
-- Stock-cruise CANCEL is reserved for true emergency / below-min cases.
-- Automated set-speed changes keep lightweight XNOR readback guards only.
+What this patch restores from Unity
+- ACC owns a separate adaptive max-speed ceiling (`acc_speed_kph`).
+- Automated slowdowns do not permanently lower that ceiling.
+- Human stalk changes and speed-limit changes re-seed the ceiling.
+- Button selection compares the planner target against the actual Tesla stock
+  set speed, while accel headroom comes from the separate ceiling.
 
-Why this is the right XNOR adaptation
-- Unity's older ACC logic was simple: compare desired target vs current stock set
-  and step the Tesla stalk toward it.
-- Later XNOR patches added extra lead-specific accel/decel heuristics in ACC,
-  which created 1-2 mph nibbling and made re-accel depend on ACC thresholds
-  instead of the planner target.
-- Keeping the Unity decision thresholds while retaining modest readback damping
-  gives smoother follow behavior in XNOR's stock-cruise-sync architecture.
+Why this is the right next step
+- Recent patches kept moving the ceiling between carstate, planner, and LONG.
+  Unity kept that ownership inside ACC itself.
+- If the stock set speed is stepped down behind a lead, Unity can still climb
+  back up later because `acc_speed_kph` stays high. Without that, XNOR can
+  "slow only" forever.
+
+XNOR adaptations retained
+- Uses real stock-cruise readback (`current_set_speed_ms`) for the current set.
+- Ignores recent echoes of its own virtual stalk pulses when tracking human input.
+- Keeps the narrowed cancel path for genuinely imminent / below-min situations.
 """
 
 from __future__ import annotations
 
+import sys
 import time
 from dataclasses import dataclass
 from typing import Optional
@@ -37,10 +42,6 @@ def _cc_units_kph(speed_units: str) -> tuple[float, float]:
   if speed_units == "MPH":
     return 1.0 * CV.MPH_TO_KPH, 5.0 * CV.MPH_TO_KPH
   return 1.0, 5.0
-
-
-def _button_should_be_throttled(button: int) -> bool:
-  return int(button) not in (int(CruiseButtons.MAIN), int(CruiseButtons.IDLE))
 
 
 @dataclass
@@ -65,13 +66,9 @@ class ACCController:
   _HUMAN_COOLDOWN_MS = 3000
   _AUTO_COOLDOWN_MS = 400
   _AUTO_COOLDOWN_ACCEL_MS = 200
-  _READBACK_WAIT_MS = 350
-  _REVERSAL_DAMP_MS = 250
-  _LEAD_REVERSAL_DAMP_MS = 250
-  _REVERSAL_PERSIST_MS = 150
-  _FAST_DECEL_RESUME_HOLDOFF_MS = 2000
-  _LEAD_FRESH_MS = 700
   _AUTOENGAGE_SPEED_WINDOW_MS = 0.8
+  _FAST_DECEL_RESUME_HOLDOFF_MS = 2000
+  _AUTO_ECHO_IGNORE_MS = 1200
 
   def __init__(self) -> None:
     self.human_action_time_ms = 0
@@ -79,97 +76,125 @@ class ACCController:
     self.prev_cruise_buttons = int(CruiseButtons.IDLE)
 
     self._last_auto_button = int(CruiseButtons.IDLE)
-    self._last_auto_direction = 0
-    self._last_auto_readback_kph = 0.0
-    self._awaiting_readback = False
-    self._direction_change_time_ms = 0
-    self._pending_reversal_direction = 0
-    self._pending_reversal_since_ms = 0
+    self._last_auto_button_time_ms = 0
+
+    self.acc_speed_kph = 0.0
+    self.speed_limit_kph = 0.0
+    self.prev_speed_limit_kph = 0.0
 
     self.fast_decel_time_ms = 0
     self.lead_last_seen_time_ms = 0
     self._radar_sm = messaging.SubMaster(["radarState"])
 
-    self.acc_speed_kph = 0.0
-    self.speed_limit_kph = 0.0
-    self.prev_speed_limit_kph = 0.0
-    self._last_human_throttled = False
+  def _seed_ceiling_from_current(self, *, current_set_speed_ms: float) -> None:
+    current_kph = float(current_set_speed_ms) * CV.MS_TO_KPH
+    if current_kph > 0.0:
+      self.acc_speed_kph = max(float(self.acc_speed_kph), float(current_kph))
 
-  @staticmethod
-  def _button_direction(button: int) -> int:
-    if CruiseButtons.is_accel(button):
-      return 1
-    if CruiseButtons.is_decel(button) or int(button) == int(CruiseButtons.CANCEL):
-      return -1
-    return 0
+  def _sync_acc_ceiling(
+    self,
+    *,
+    current_set_speed_ms: float,
+    max_accel_target_ms: Optional[float],
+  ) -> None:
+    current_kph = float(current_set_speed_ms) * CV.MS_TO_KPH
+    self.prev_speed_limit_kph = float(self.speed_limit_kph)
+    self.speed_limit_kph = float(max_accel_target_ms) * CV.MS_TO_KPH if (max_accel_target_ms is not None and float(max_accel_target_ms) > 0.1) else 0.0
 
-  def note_human_buttons(self, cruise_buttons: int, *, now_ms: Optional[int] = None) -> None:
+    if self.acc_speed_kph <= 0.0:
+      self.acc_speed_kph = max(current_kph, self.speed_limit_kph)
+
+    if self.speed_limit_kph > 0.0:
+      if int(self.prev_speed_limit_kph) != int(self.speed_limit_kph):
+        self.acc_speed_kph = float(self.speed_limit_kph)
+      else:
+        self.acc_speed_kph = max(float(self.acc_speed_kph), float(self.speed_limit_kph), float(current_kph))
+    else:
+      self.acc_speed_kph = max(float(self.acc_speed_kph), float(current_kph))
+
+  def _update_max_acc_speed_from_human(
+    self,
+    *,
+    button: int,
+    current_set_speed_ms: float,
+    speed_units: str,
+  ) -> None:
+    self._seed_ceiling_from_current(current_set_speed_ms=current_set_speed_ms)
+    half_kph, full_kph = _cc_units_kph(speed_units)
+    speed_change_map = {
+      int(CruiseButtons.RES_ACCEL): float(half_kph),
+      int(CruiseButtons.RES_ACCEL_2ND): float(full_kph),
+      int(CruiseButtons.DECEL_SET): -float(half_kph),
+      int(CruiseButtons.DECEL_2ND): -float(full_kph),
+    }
+    self.acc_speed_kph = max(0.0, float(self.acc_speed_kph) + float(speed_change_map.get(int(button), 0.0)))
+
+  def note_human_buttons(
+    self,
+    cruise_buttons: int,
+    *,
+    now_ms: Optional[int] = None,
+    current_set_speed_ms: float = 0.0,
+    speed_units: str = "MPH",
+  ) -> None:
     now = _now_ms() if now_ms is None else int(now_ms)
     btn = int(cruise_buttons or 0)
-    changed = btn != int(self.prev_cruise_buttons)
+    prev_btn = int(self.prev_cruise_buttons)
 
-    automated_echo = bool(
-      changed
-      and _button_should_be_throttled(btn)
+    edge = (btn != prev_btn)
+    throttled = btn not in (int(CruiseButtons.IDLE), int(CruiseButtons.MAIN))
+    auto_echo = (
+      edge
       and btn == int(self._last_auto_button)
-      and (int(now) - int(self.automated_action_time_ms)) < 1500
+      and (int(now) - int(self._last_auto_button_time_ms)) <= int(self._AUTO_ECHO_IGNORE_MS)
     )
 
-    self._last_human_throttled = False
-    if changed and _button_should_be_throttled(btn) and not automated_echo:
+    if edge and throttled and not auto_echo:
       self.human_action_time_ms = int(now)
-      self._awaiting_readback = False
-      self._pending_reversal_direction = 0
-      self._pending_reversal_since_ms = 0
-      self._last_auto_direction = 0
-      self._last_human_throttled = True
+      self._update_max_acc_speed_from_human(
+        button=btn,
+        current_set_speed_ms=current_set_speed_ms,
+        speed_units=speed_units,
+      )
 
-    if changed and btn == int(CruiseButtons.IDLE):
-      self._awaiting_readback = False
-
-    self.prev_cruise_buttons = btn
+    self.prev_cruise_buttons = int(btn)
 
   def _no_human_action_for(self, *, now_ms: int, milliseconds: int) -> bool:
-    return (int(now_ms) - int(self.human_action_time_ms)) >= int(milliseconds)
+    return int(now_ms) > int(self.human_action_time_ms) + int(milliseconds)
 
   def _no_automated_action_for(self, *, now_ms: int, milliseconds: int) -> bool:
-    return (int(now_ms) - int(self.automated_action_time_ms)) >= int(milliseconds)
-
-  def _refresh_readback_state(self, *, now_ms: int, readback_kph: float, half_kph: float) -> None:
-    if not self._awaiting_readback:
-      return
-
-    moved_enough = abs(float(readback_kph) - float(self._last_auto_readback_kph)) >= (0.45 * float(half_kph))
-    timed_out = (int(now_ms) - int(self.automated_action_time_ms)) > 1200
-    if moved_enough or timed_out:
-      self._awaiting_readback = False
+    return int(now_ms) > int(self.automated_action_time_ms) + int(milliseconds)
 
   def _poll_lead(self, *, now_ms: int) -> LeadInfo:
     try:
       self._radar_sm.update(0)
     except Exception:
-      pass
+      return LeadInfo()
 
-    lead = LeadInfo()
+    if not bool(self._radar_sm.valid.get("radarState", False)):
+      return LeadInfo()
+
     try:
-      if bool(self._radar_sm.valid.get("radarState", False)):
-        rs = self._radar_sm["radarState"]
-        lead_one = getattr(rs, "leadOne", None)
-        if lead_one is not None and bool(getattr(lead_one, "status", False)):
-          d_rel = float(getattr(lead_one, "dRel", 0.0) or 0.0)
-          v_rel = float(getattr(lead_one, "vRel", 0.0) or 0.0)
-          if d_rel > 0.0:
-            lead = LeadInfo(True, d_rel, v_rel)
-            self.lead_last_seen_time_ms = int(now_ms)
+      rs = self._radar_sm["radarState"]
+      lead = getattr(rs, "leadOne", None)
+      if lead is not None and bool(getattr(lead, "status", False)):
+        d_rel = float(getattr(lead, "dRel", 0.0) or 0.0)
+        v_rel = float(getattr(lead, "vRel", 0.0) or 0.0)
+        if d_rel > 0.0:
+          self.lead_last_seen_time_ms = int(now_ms)
+          return LeadInfo(True, d_rel, v_rel)
     except Exception:
       pass
-    return lead
+
+    return LeadInfo()
 
   @staticmethod
   def _seconds_to_collision(*, lead: LeadInfo) -> float:
-    if (not lead.status) or (lead.d_rel <= 0.0) or (lead.v_rel >= -0.01):
-      return 1e6
-    return float(lead.d_rel) / max(0.01, -float(lead.v_rel))
+    if (not lead.status) or lead.d_rel <= 0.0:
+      return sys.maxsize
+    if lead.v_rel >= 0.0:
+      return sys.maxsize
+    return abs(float(lead.d_rel) / float(lead.v_rel))
 
   def _fast_decel_required(self, *, v_ego_ms: float, lead: LeadInfo) -> bool:
     if not lead.status or lead.d_rel <= 0.0:
@@ -196,47 +221,27 @@ class ACCController:
     )
 
   def _should_autoengage_cc(self, *, now_ms: int, v_ego_ms: float, brake_pressed: bool, lead: LeadInfo) -> bool:
-    if float(v_ego_ms) <= float(self.MIN_CRUISE_SPEED_MS):
+    cruise_ready = (
+      float(v_ego_ms) >= float(self.MIN_CRUISE_SPEED_MS)
+      and int(now_ms) > int(self.fast_decel_time_ms) + int(self._FAST_DECEL_RESUME_HOLDOFF_MS)
+    )
+    if not cruise_ready or brake_pressed:
       return False
-    if bool(brake_pressed):
-      return False
-    if (int(now_ms) - int(self.fast_decel_time_ms)) < int(self._FAST_DECEL_RESUME_HOLDOFF_MS):
-      return False
-    if lead.status and self._fast_decel_required(v_ego_ms=v_ego_ms, lead=lead):
-      return False
-    return True
 
-  def _clear_pending_reversal(self) -> None:
-    self._pending_reversal_direction = 0
-    self._pending_reversal_since_ms = 0
+    slow_lead = bool(
+      lead.status
+      and lead.d_rel > 0.0
+      and (
+        lead.v_rel < 0.0
+        or self._fast_decel_required(v_ego_ms=v_ego_ms, lead=lead)
+      )
+    )
+    return not slow_lead
 
-  def _allow_lead_reversal(self, *, now_ms: int, direction: int, speed_offset_kph: float, half_kph: float, lead: LeadInfo) -> bool:
-    if direction == 0 or (not lead.status):
-      self._clear_pending_reversal()
-      return True
-
-    threshold = 0.55 * float(half_kph)
-    if abs(float(speed_offset_kph)) >= threshold:
-      self._clear_pending_reversal()
-      return True
-
-    if self._pending_reversal_direction == direction:
-      return (int(now_ms) - int(self._pending_reversal_since_ms)) >= int(self._REVERSAL_PERSIST_MS)
-
-    self._pending_reversal_direction = int(direction)
-    self._pending_reversal_since_ms = int(now_ms)
-    return False
-
-  def _record_button(self, *, now_ms: int, button: int, readback_kph: float, half_kph: float) -> None:
+  def _record_button(self, *, now_ms: int, button: int) -> None:
     self.automated_action_time_ms = int(now_ms)
     self._last_auto_button = int(button)
-    self._last_auto_direction = self._button_direction(int(button))
-    self._last_auto_readback_kph = float(readback_kph)
-    self._awaiting_readback = int(button) != int(CruiseButtons.CANCEL)
-
-    if self._last_auto_direction != 0:
-      self._direction_change_time_ms = int(now_ms)
-
+    self._last_auto_button_time_ms = int(now_ms)
     if int(button) == int(CruiseButtons.CANCEL):
       self.fast_decel_time_ms = int(now_ms)
 
@@ -255,7 +260,16 @@ class ACCController:
     brake_pressed: bool = False,
     max_accel_target_ms: Optional[float] = None,
   ) -> AccDecision:
-    self.note_human_buttons(cruise_buttons, now_ms=now_ms)
+    self.note_human_buttons(
+      cruise_buttons,
+      now_ms=now_ms,
+      current_set_speed_ms=current_set_speed_ms,
+      speed_units=speed_units,
+    )
+    self._sync_acc_ceiling(
+      current_set_speed_ms=current_set_speed_ms,
+      max_accel_target_ms=max_accel_target_ms,
+    )
     lead = self._poll_lead(now_ms=now_ms)
 
     if not enabled:
@@ -266,14 +280,12 @@ class ACCController:
 
     if stock_state == "STANDBY":
       if (
-        float(desired_speed_ms) >= float(v_ego_ms)
+        float(desired_speed_ms) >= float(v_ego_ms) - float(self._AUTOENGAGE_SPEED_WINDOW_MS)
         and self._no_human_action_for(now_ms=now_ms, milliseconds=self._HUMAN_COOLDOWN_MS)
         and self._no_automated_action_for(now_ms=now_ms, milliseconds=self._AUTO_COOLDOWN_MS)
         and self._should_autoengage_cc(now_ms=now_ms, v_ego_ms=v_ego_ms, brake_pressed=brake_pressed, lead=lead)
       ):
-        readback_kph = float(current_set_speed_ms) * CV.MS_TO_KPH
-        self._record_button(now_ms=now_ms, button=int(CruiseButtons.RES_ACCEL), readback_kph=readback_kph, half_kph=half_kph)
-        self._awaiting_readback = False
+        self._record_button(now_ms=now_ms, button=int(CruiseButtons.RES_ACCEL))
         return AccDecision(int(CruiseButtons.RES_ACCEL), "autoengage: RES")
       return AccDecision(None, "standby: no autoengage")
 
@@ -285,9 +297,6 @@ class ACCController:
 
     if not self._no_human_action_for(now_ms=now_ms, milliseconds=self._HUMAN_COOLDOWN_MS):
       return AccDecision(None, "gated: recent human action")
-
-    if not self._no_automated_action_for(now_ms=now_ms, milliseconds=self._AUTO_COOLDOWN_MS):
-      return AccDecision(None, "gated: cooldown")
 
     if float(desired_speed_ms) <= 0.1 or float(current_set_speed_ms) <= 0.1:
       return AccDecision(None, "gated: missing target/current")
@@ -306,27 +315,7 @@ class ACCController:
 
     target_kph = float(desired_target_ms) * CV.MS_TO_KPH
     current_kph = float(current_set_speed_ms) * CV.MS_TO_KPH
-
-    self.prev_speed_limit_kph = float(self.speed_limit_kph)
-    self.speed_limit_kph = float(max_accel_target_ms) * CV.MS_TO_KPH if (max_accel_target_ms is not None and float(max_accel_target_ms) > 0.1) else 0.0
-
-    # Unity parity: ACC keeps its own max allowed cruise speed and does not lower
-    # it when automation steps stock cruise down behind a lead.
-    if float(self.speed_limit_kph) > 0.0 and int(self.prev_speed_limit_kph) != int(self.speed_limit_kph):
-      self.acc_speed_kph = float(self.speed_limit_kph)
-
-    if float(self.acc_speed_kph) <= 0.0:
-      self.acc_speed_kph = max(float(current_kph), float(self.speed_limit_kph), float(v_ego_ms) * CV.MS_TO_KPH)
-
-    if self._last_human_throttled:
-      self.acc_speed_kph = max(float(current_kph), float(self.speed_limit_kph), float(v_ego_ms) * CV.MS_TO_KPH)
-
-    if float(self.speed_limit_kph) > 0.0:
-      self.acc_speed_kph = max(float(self.acc_speed_kph), float(self.speed_limit_kph))
-
-    self.acc_speed_kph = max(float(self.acc_speed_kph), float(v_ego_ms) * CV.MS_TO_KPH)
-
-    available_speed_kph = float(self.acc_speed_kph) - float(current_kph)
+    available_speed_kph = max(0.0, float(self.acc_speed_kph) - float(current_kph))
     speed_offset_kph = float(target_kph) - float(current_kph)
 
     button: Optional[int] = None
@@ -343,8 +332,11 @@ class ACCController:
         button = int(CruiseButtons.RES_ACCEL)
 
     if button is None:
-      self._clear_pending_reversal()
       return AccDecision(None, "no-op", target_kph, current_kph, current_kph)
+
+    cooldown_ms = int(self._AUTO_COOLDOWN_ACCEL_MS) if CruiseButtons.is_accel(button) else int(self._AUTO_COOLDOWN_MS)
+    if not self._no_automated_action_for(now_ms=now_ms, milliseconds=cooldown_ms):
+      return AccDecision(None, "gated: cooldown", target_kph, current_kph, current_kph)
 
     if CruiseButtons.is_decel(button):
       min_target_kph = float(self.MIN_CRUISE_SPEED_MS) * CV.MS_TO_KPH
@@ -356,13 +348,11 @@ class ACCController:
         elif cancel_required:
           button = int(CruiseButtons.CANCEL)
         else:
-          self._clear_pending_reversal()
           return AccDecision(None, "no-op:min cruise clamp", target_kph, current_kph, current_kph)
 
-    readback_kph = float(current_set_speed_ms) * CV.MS_TO_KPH
-    self._record_button(now_ms=now_ms, button=int(button), readback_kph=readback_kph, half_kph=half_kph)
+    self._record_button(now_ms=now_ms, button=int(button))
 
-    est_kph = float(readback_kph)
+    est_kph = float(current_kph)
     if int(button) == int(CruiseButtons.RES_ACCEL_2ND):
       est_kph += float(full_kph)
     elif int(button) == int(CruiseButtons.RES_ACCEL):
@@ -374,5 +364,5 @@ class ACCController:
     else:
       est_kph = 0.0
 
-    reason = "cancel: imminent" if int(button) == int(CruiseButtons.CANCEL) else "press"
+    reason = "cancel: fast_decel" if int(button) == int(CruiseButtons.CANCEL) else "press"
     return AccDecision(int(button), reason, target_kph, current_kph, est_kph)

@@ -2,19 +2,16 @@
 """
 Unity-parity stock-cruise syncing for XNOR.
 
-What this patch restores
-- LONG follows the planner tail directly again, like Unity.
-- The adaptive max-cruise ceiling comes from carstate's separate owner
-  (`acc_speed_max_ms` / `carState.vCruise`), not the current stock set speed.
-- Turn and lead behavior stay in planner/MPC; LONG does not reinterpret them.
+What this patch restores from Unity
+- The planner tail remains the desired speed target.
+- The speed-limit target acts as a separate accel ceiling only; it does not
+  rewrite the desired target inside LONG.
+- No downstream `lead_open` recovery hint is used.
 
-Why this is the right XNOR adaptation
-- XNOR already publishes a Unity-style adaptive max cruise ceiling in carstate.
-  Recent patches were not using it, so once stock cruise stepped down behind a
-  lead there was often no remembered ceiling to climb back to.
-- Restoring planner-tail semantics and using the adaptive ceiling lets lead
-  pull-away recovery and vision turns behave closer to Unity without adding
-  more downstream heuristics.
+Why this is the right next step
+- Unity let ACC own the max speed ceiling (`acc_speed_kph`) and fed it the
+  planner target directly. Later XNOR patches reinterpreted that inside LONG,
+  which added behavior not present in Unity and still did not restore re-accel.
 """
 
 from __future__ import annotations
@@ -93,10 +90,6 @@ class LongController:
       lp = self._sm["longitudinalPlan"]
       v_last = self._extract_plan_speed_last(lp)
       lp_mono_ns = int(self._sm.logMonoTime.get("longitudinalPlan", 0) or 0)
-
-      # Unity consumed the planner tail as soon as the message existed rather than
-      # waiting for the valid bit. Keep the freshness guard, but do not discard
-      # a fresh finite plan during startup.
       if (v_last is not None) and (lp_mono_ns > 0):
         self._lp_target_ms = float(v_last)
         self._lp_last_ns = int(lp_mono_ns)
@@ -121,7 +114,6 @@ class LongController:
       pass
 
   def _resolve_accel_ceiling_ms(self, CS, *, speed_units: str) -> tuple[Optional[float], str]:
-    """Return the live speed-limit target, if one exists."""
     tinkla = getattr(CS, "_tinkla", None)
     use_speed_limit = bool(tinkla and getattr(tinkla, "adjust_acc_with_speed_limit", False))
     if not use_speed_limit:
@@ -190,7 +182,7 @@ class LongController:
     desired_ms = float(planner_ms)
     src = "lp_last" if lp_fresh else "hold"
 
-    startup_warmup = bool(self._enabled_since_ms and ((int(now) - int(self._enabled_since_ms)) < 1800))
+    startup_warmup = bool(self._enabled_since_ms and ((int(now) - int(self._enabled_since_ms)) < 2500))
     startup_invalid_clear = (
       startup_warmup
       and (not self._lead_present)
@@ -210,8 +202,7 @@ class LongController:
 
     max_accel_target_ms, ceiling_src = self._resolve_accel_ceiling_ms(CS, speed_units=speed_units)
     if max_accel_target_ms is not None:
-      desired_ms = min(float(desired_ms), float(max_accel_target_ms))
-      src = f"{src}+cap[{ceiling_src}]"
+      src = f"{src}+ceiling[{ceiling_src}]"
 
     if (not lp_fresh) and self._lead_present and (self._lead_drel < 80.0) and (self._lead_vrel < -0.5):
       lead_speed_ms = max(0.0, float(v_ego_ms) + float(self._lead_vrel))
@@ -242,7 +233,8 @@ class LongController:
     msg = (
       f"[XNOR_CRUISE_SYNC] src={src} uom={speed_units} "
       f"tgt={decision.target_kph * kph_to_u:.1f} cur={decision.current_kph * kph_to_u:.1f} "
-      f"est={decision.est_kph * kph_to_u:.1f} btn={int(decision.button)} reason={decision.reason}"
+      f"est={decision.est_kph * kph_to_u:.1f} ceiling={self.acc.acc_speed_kph * kph_to_u:.1f} "
+      f"btn={int(decision.button)} reason={decision.reason}"
     )
     self._rate_log(msg)
     return LongDecision(int(decision.button), msg)
