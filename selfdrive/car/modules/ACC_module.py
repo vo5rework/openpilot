@@ -100,29 +100,27 @@ class ACCController:
 
   def note_human_buttons(self, cruise_buttons: int, *, now_ms: Optional[int] = None) -> None:
     now = _now_ms() if now_ms is None else int(now_ms)
-    current_button = int(cruise_buttons)
-    button_changed = current_button != int(self.prev_cruise_buttons)
+    btn = int(cruise_buttons or 0)
+    changed = btn != int(self.prev_cruise_buttons)
 
     automated_echo = bool(
-      button_changed
-      and _button_should_be_throttled(current_button)
-      and current_button == int(self._last_auto_button)
-      and (int(now) - int(self.automated_action_time_ms)) < 1200
+      changed
+      and _button_should_be_throttled(btn)
+      and btn == int(self._last_auto_button)
+      and (int(now) - int(self.automated_action_time_ms)) < 1500
     )
 
-    if button_changed and _button_should_be_throttled(current_button) and not automated_echo:
+    if changed and _button_should_be_throttled(btn) and not automated_echo:
       self.human_action_time_ms = int(now)
       self._awaiting_readback = False
       self._pending_reversal_direction = 0
       self._pending_reversal_since_ms = 0
       self._last_auto_direction = 0
 
-    if button_changed and current_button == int(CruiseButtons.IDLE):
-      # Readback release for an automated pulse should not count as a human action,
-      # but it should let the controller issue the next step immediately.
+    if changed and btn == int(CruiseButtons.IDLE):
       self._awaiting_readback = False
 
-    self.prev_cruise_buttons = current_button
+    self.prev_cruise_buttons = btn
 
   def _no_human_action_for(self, *, now_ms: int, milliseconds: int) -> bool:
     return (int(now_ms) - int(self.human_action_time_ms)) >= int(milliseconds)
@@ -257,15 +255,15 @@ class ACCController:
       return AccDecision(None, "gated: not enabled")
 
     stock_state = str(stock_cruise_state or "").upper()
+    half_kph, full_kph = _cc_units_kph(speed_units)
 
     if stock_state == "STANDBY":
       if (
-        float(desired_speed_ms) >= float(v_ego_ms) - float(self._AUTOENGAGE_SPEED_WINDOW_MS)
+        float(desired_speed_ms) >= float(v_ego_ms)
         and self._no_human_action_for(now_ms=now_ms, milliseconds=self._HUMAN_COOLDOWN_MS)
         and self._no_automated_action_for(now_ms=now_ms, milliseconds=self._AUTO_COOLDOWN_MS)
         and self._should_autoengage_cc(now_ms=now_ms, v_ego_ms=v_ego_ms, brake_pressed=brake_pressed, lead=lead)
       ):
-        half_kph, _ = _cc_units_kph(speed_units)
         readback_kph = float(current_set_speed_ms) * CV.MS_TO_KPH
         self._record_button(now_ms=now_ms, button=int(CruiseButtons.RES_ACCEL), readback_kph=readback_kph, half_kph=half_kph)
         self._awaiting_readback = False
@@ -281,30 +279,14 @@ class ACCController:
     if not self._no_human_action_for(now_ms=now_ms, milliseconds=self._HUMAN_COOLDOWN_MS):
       return AccDecision(None, "gated: recent human action")
 
+    if not self._no_automated_action_for(now_ms=now_ms, milliseconds=self._AUTO_COOLDOWN_MS):
+      return AccDecision(None, "gated: cooldown")
+
     if float(desired_speed_ms) <= 0.1 or float(current_set_speed_ms) <= 0.1:
       return AccDecision(None, "gated: missing target/current")
 
-    half_kph, full_kph = _cc_units_kph(speed_units)
-    fast_decel_required = self._fast_decel_required(v_ego_ms=v_ego_ms, lead=lead)
     desired_target_ms = float(desired_speed_ms)
-
-    if (not fast_decel_required) and desired_target_ms < float(self.MIN_CRUISE_SPEED_MS):
-      desired_target_ms = float(self.MIN_CRUISE_SPEED_MS)
-
-    target_kph = float(desired_target_ms) * CV.MS_TO_KPH
-    readback_kph = float(current_set_speed_ms) * CV.MS_TO_KPH
-    current_kph = float(readback_kph)
-
-    max_target_kph = float(target_kph)
-    if max_accel_target_ms is not None and float(max_accel_target_ms) > 0.1:
-      max_target_kph = float(max_accel_target_ms) * CV.MS_TO_KPH
-    max_target_kph = max(max_target_kph, float(current_kph))
-
-    self._refresh_readback_state(now_ms=now_ms, readback_kph=readback_kph, half_kph=half_kph)
-
-    speed_offset_kph = float(target_kph) - float(current_kph)
-    available_speed_kph = float(max_target_kph) - float(current_kph)
-
+    fast_decel_required = self._fast_decel_required(v_ego_ms=v_ego_ms, lead=lead)
     cancel_required = self._cancel_required(
       v_ego_ms=v_ego_ms,
       current_set_speed_ms=current_set_speed_ms,
@@ -312,8 +294,21 @@ class ACCController:
       lead=lead,
     )
 
+    if (not fast_decel_required) and desired_target_ms < float(self.MIN_CRUISE_SPEED_MS):
+      desired_target_ms = float(self.MIN_CRUISE_SPEED_MS)
+
+    target_kph = float(desired_target_ms) * CV.MS_TO_KPH
+    current_kph = float(current_set_speed_ms) * CV.MS_TO_KPH
+
+    max_target_kph = float(target_kph)
+    if max_accel_target_ms is not None and float(max_accel_target_ms) > 0.1:
+      max_target_kph = float(max_accel_target_ms) * CV.MS_TO_KPH
+
+    available_speed_kph = float(max_target_kph) - float(current_kph)
+    speed_offset_kph = float(target_kph) - float(current_kph)
+
     button: Optional[int] = None
-    if cancel_required and (current_kph > 0.0):
+    if cancel_required and current_kph > 0.0:
       button = int(CruiseButtons.CANCEL)
     elif speed_offset_kph < (-0.6 * float(full_kph)) and current_kph > 0.0:
       button = int(CruiseButtons.DECEL_2ND)
@@ -329,14 +324,10 @@ class ACCController:
       self._clear_pending_reversal()
       return AccDecision(None, "no-op", target_kph, current_kph, current_kph)
 
-    cooldown_ms = int(self._AUTO_COOLDOWN_ACCEL_MS) if CruiseButtons.is_accel(button) else int(self._AUTO_COOLDOWN_MS)
-    if not self._no_automated_action_for(now_ms=now_ms, milliseconds=cooldown_ms):
-      return AccDecision(None, "gated: cooldown", target_kph, current_kph, current_kph)
-
     if CruiseButtons.is_decel(button):
+      min_target_kph = float(self.MIN_CRUISE_SPEED_MS) * CV.MS_TO_KPH
       min_after_full = float(current_kph) - float(full_kph)
       min_after_half = float(current_kph) - float(half_kph)
-      min_target_kph = float(self.MIN_CRUISE_SPEED_MS) * CV.MS_TO_KPH
       if min_after_full < min_target_kph:
         if min_after_half >= min_target_kph:
           button = int(CruiseButtons.DECEL_SET)
@@ -346,38 +337,7 @@ class ACCController:
           self._clear_pending_reversal()
           return AccDecision(None, "no-op:min cruise clamp", target_kph, current_kph, current_kph)
 
-    direction = self._button_direction(int(button))
-    if int(button) != int(CruiseButtons.CANCEL):
-      # Unity parity for speed recovery: do not add extra accel-side readback or
-      # reversal damping beyond the normal automated-action cooldown.
-      if CruiseButtons.is_decel(button):
-        if (
-          self._awaiting_readback
-          and direction == self._last_auto_direction
-          and (int(now_ms) - int(self.automated_action_time_ms)) < int(self._READBACK_WAIT_MS)
-          and abs(float(speed_offset_kph)) < float(full_kph)
-        ):
-          return AccDecision(None, "gated: waiting readback", target_kph, current_kph, current_kph)
-
-        reversal_damp_ms = int(self._LEAD_REVERSAL_DAMP_MS if lead.status else self._REVERSAL_DAMP_MS)
-        if (
-          direction != 0
-          and self._last_auto_direction != 0
-          and direction != self._last_auto_direction
-          and (int(now_ms) - int(self._direction_change_time_ms)) < reversal_damp_ms
-          and abs(float(speed_offset_kph)) < (0.75 * float(half_kph))
-        ):
-          return AccDecision(None, "gated: reversal damp", target_kph, current_kph, current_kph)
-
-        if not self._allow_lead_reversal(
-          now_ms=now_ms,
-          direction=direction,
-          speed_offset_kph=speed_offset_kph,
-          half_kph=half_kph,
-          lead=lead,
-        ):
-          return AccDecision(None, "gated: reversal persist", target_kph, current_kph, current_kph)
-
+    readback_kph = float(current_set_speed_ms) * CV.MS_TO_KPH
     self._record_button(now_ms=now_ms, button=int(button), readback_kph=readback_kph, half_kph=half_kph)
 
     est_kph = float(readback_kph)
