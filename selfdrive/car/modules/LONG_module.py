@@ -121,25 +121,19 @@ class LongController:
       pass
 
   def _resolve_accel_ceiling_ms(self, CS, *, speed_units: str) -> tuple[Optional[float], str]:
-    # Unity keeps a separate adaptive max cruise owner internally. In XNOR that
-    # owner is carState.acc_speed_max_ms / carState.vCruise. Do not recompute a
-    # second speed-limit ceiling here; LONG should consume the ceiling that
-    # carstate already owns.
-    adaptive_ceiling_ms = 0.0
-    try:
-      adaptive_ceiling_ms = float(getattr(CS, "acc_speed_max_ms", 0.0) or 0.0)
-    except Exception:
-      adaptive_ceiling_ms = 0.0
+    """Return the live speed-limit target, if one exists."""
+    tinkla = getattr(CS, "_tinkla", None)
+    use_speed_limit = bool(tinkla and getattr(tinkla, "adjust_acc_with_speed_limit", False))
+    if not use_speed_limit:
+      return None, "none"
 
-    cs_out = getattr(CS, "out", None)
     try:
-      out_v_cruise_kph = float(getattr(cs_out, "vCruise", 0.0) or 0.0)
-      adaptive_ceiling_ms = max(adaptive_ceiling_ms, out_v_cruise_kph * CV.KPH_TO_MS)
+      speed_limit_target_ms = float(CS._calc_speed_limit_target_ms(speed_units))
     except Exception:
-      pass
+      speed_limit_target_ms = 0.0
 
-    if adaptive_ceiling_ms > 0.1:
-      return float(adaptive_ceiling_ms), "adaptive_max"
+    if speed_limit_target_ms > 0.0:
+      return float(speed_limit_target_ms), "speed_limit_target"
     return None, "none"
 
   def update(self, CS, *, enabled: bool, frame: int, now_ms: Optional[int] = None) -> LongDecision:

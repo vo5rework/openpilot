@@ -90,6 +90,11 @@ class ACCController:
     self.lead_last_seen_time_ms = 0
     self._radar_sm = messaging.SubMaster(["radarState"])
 
+    self.acc_speed_kph = 0.0
+    self.speed_limit_kph = 0.0
+    self.prev_speed_limit_kph = 0.0
+    self._last_human_throttled = False
+
   @staticmethod
   def _button_direction(button: int) -> int:
     if CruiseButtons.is_accel(button):
@@ -110,12 +115,14 @@ class ACCController:
       and (int(now) - int(self.automated_action_time_ms)) < 1500
     )
 
+    self._last_human_throttled = False
     if changed and _button_should_be_throttled(btn) and not automated_echo:
       self.human_action_time_ms = int(now)
       self._awaiting_readback = False
       self._pending_reversal_direction = 0
       self._pending_reversal_since_ms = 0
       self._last_auto_direction = 0
+      self._last_human_throttled = True
 
     if changed and btn == int(CruiseButtons.IDLE):
       self._awaiting_readback = False
@@ -300,11 +307,26 @@ class ACCController:
     target_kph = float(desired_target_ms) * CV.MS_TO_KPH
     current_kph = float(current_set_speed_ms) * CV.MS_TO_KPH
 
-    max_target_kph = float(target_kph)
-    if max_accel_target_ms is not None and float(max_accel_target_ms) > 0.1:
-      max_target_kph = float(max_accel_target_ms) * CV.MS_TO_KPH
+    self.prev_speed_limit_kph = float(self.speed_limit_kph)
+    self.speed_limit_kph = float(max_accel_target_ms) * CV.MS_TO_KPH if (max_accel_target_ms is not None and float(max_accel_target_ms) > 0.1) else 0.0
 
-    available_speed_kph = float(max_target_kph) - float(current_kph)
+    # Unity parity: ACC keeps its own max allowed cruise speed and does not lower
+    # it when automation steps stock cruise down behind a lead.
+    if float(self.speed_limit_kph) > 0.0 and int(self.prev_speed_limit_kph) != int(self.speed_limit_kph):
+      self.acc_speed_kph = float(self.speed_limit_kph)
+
+    if float(self.acc_speed_kph) <= 0.0:
+      self.acc_speed_kph = max(float(current_kph), float(self.speed_limit_kph), float(v_ego_ms) * CV.MS_TO_KPH)
+
+    if self._last_human_throttled:
+      self.acc_speed_kph = max(float(current_kph), float(self.speed_limit_kph), float(v_ego_ms) * CV.MS_TO_KPH)
+
+    if float(self.speed_limit_kph) > 0.0:
+      self.acc_speed_kph = max(float(self.acc_speed_kph), float(self.speed_limit_kph))
+
+    self.acc_speed_kph = max(float(self.acc_speed_kph), float(v_ego_ms) * CV.MS_TO_KPH)
+
+    available_speed_kph = float(self.acc_speed_kph) - float(current_kph)
     speed_offset_kph = float(target_kph) - float(current_kph)
 
     button: Optional[int] = None
