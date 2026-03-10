@@ -5,7 +5,7 @@ from collections import Counter, defaultdict
 
 
 def main() -> int:
-  parser = argparse.ArgumentParser(description="Analyze second-stage XNOR planner block watch CSV.")
+  parser = argparse.ArgumentParser(description="Analyze second-stage XNOR planner root watcher CSV.")
   parser.add_argument("csv_path")
   args = parser.parse_args()
 

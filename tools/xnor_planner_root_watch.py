@@ -2,18 +2,55 @@
 import argparse
 import csv
 import math
-import os
 import sys
 import time
-from typing import Any, Iterable, Optional
+from pathlib import Path
+from typing import Any
 
 import numpy as np
-import cereal.messaging as messaging
-from openpilot.common.conversions import Conversions as CV
-from openpilot.common.numpy_fast import interp
-from openpilot.common.realtime import Ratekeeper
-from openpilot.selfdrive.modeld.constants import ModelConstants
-from openpilot.selfdrive.controls.lib.longitudinal_mpc_lib.long_mpc import T_IDXS as T_IDXS_MPC
+
+
+def _add_repo_root_to_path() -> None:
+  here = Path(__file__).resolve()
+  for parent in [here.parent] + list(here.parents):
+    if (parent / "selfdrive").exists() and (parent / "common").exists():
+      repo_root = str(parent)
+      if repo_root not in sys.path:
+        sys.path.insert(0, repo_root)
+      return
+
+
+_add_repo_root_to_path()
+
+import cereal.messaging as messaging  # noqa: E402
+
+try:
+  from common.conversions import Conversions as CV  # type: ignore  # noqa: E402
+except Exception:
+  from openpilot.common.conversions import Conversions as CV  # type: ignore  # noqa: E402
+
+try:
+  from common.numpy_fast import interp  # type: ignore  # noqa: E402
+except Exception:
+  from openpilot.common.numpy_fast import interp  # type: ignore  # noqa: E402
+
+try:
+  from common.realtime import Ratekeeper  # type: ignore  # noqa: E402
+except Exception:
+  from openpilot.common.realtime import Ratekeeper  # type: ignore  # noqa: E402
+
+try:
+  from selfdrive.modeld.constants import ModelConstants  # type: ignore  # noqa: E402
+except Exception:
+  from openpilot.selfdrive.modeld.constants import ModelConstants  # type: ignore  # noqa: E402
+
+try:
+  from selfdrive.controls.lib.longitudinal_mpc_lib.long_mpc import T_IDXS as T_IDXS_MPC  # type: ignore  # noqa: E402
+except Exception:
+  try:
+    from openpilot.selfdrive.controls.lib.longitudinal_mpc_lib.long_mpc import T_IDXS as T_IDXS_MPC  # type: ignore  # noqa: E402
+  except Exception:
+    T_IDXS_MPC = np.asarray(ModelConstants.T_IDXS, dtype=float)
 
 
 def nested_get(obj: Any, path: str, default: Any = None) -> Any:
@@ -70,7 +107,7 @@ def first_valid_speed_ms(car_state: Any) -> float:
   return max(speed, speed_cluster)
 
 
-def first_lp_speeds(lp: Any) -> tuple[float, float, float, float]:
+def plan_speeds(lp: Any) -> tuple[float, float, float, float]:
   speeds = list(getattr(lp, "speeds", []) or [])
   if not speeds:
     return 0.0, 0.0, 0.0, 0.0
@@ -95,13 +132,9 @@ def infer_blocker(
   lead_status: bool,
   lead_drel: float,
   lead_vrel: float,
-  lp0: float,
-  lp4: float,
-  lp8: float,
   lplast: float,
   lp_has_lead: bool,
   curve_near_ms: float,
-  curve_tail_ms: float,
   force_decel: bool,
 ) -> tuple[str, str]:
   if not active:
@@ -112,6 +145,17 @@ def infer_blocker(
     return "force_decel", "controlsState.forceDecel active"
 
   effective_ceiling_ms = max(controls_vcruise_ms, car_vcruise_ms, stock_set_ms)
+  planner_low = bool(
+    lplast > 0.1
+    and effective_ceiling_ms > max(v_ego, stock_set_ms) + 0.6
+    and lplast < effective_ceiling_ms - 0.6
+  )
+
+  if not planner_low:
+    if lplast > stock_set_ms + 0.7 and effective_ceiling_ms > stock_set_ms + 0.7:
+      return "acc_sync_block", "planner asks higher, stock set speed not following"
+    return "ok_or_no_block", "no clear speed-up block"
+
   lead_constraining = bool(
     lead_status
     and (
@@ -120,21 +164,6 @@ def infer_blocker(
       or lp_has_lead
     )
   )
-
-  planner_low = bool(
-    lplast > 0.1
-    and effective_ceiling_ms > max(v_ego, stock_set_ms) + 0.6
-    and lplast < effective_ceiling_ms - 0.6
-  )
-
-  if not planner_low:
-    if (
-      lplast > stock_set_ms + 0.7
-      and effective_ceiling_ms > stock_set_ms + 0.7
-    ):
-      return "acc_sync_block", "planner asks higher, stock set speed not following"
-    return "ok_or_no_block", "no clear speed-up block"
-
   if lead_constraining:
     return "lead_hold", "lead/plan still constraining planner target"
 
@@ -149,7 +178,7 @@ def infer_blocker(
 
 def main() -> int:
   parser = argparse.ArgumentParser(description="Second-stage cereal watcher for XNOR speed-up blocks.")
-  parser.add_argument("--out", default="/data/media/0/realdata/xnor_planner_block_watch.csv")
+  parser.add_argument("--out", default="/data/media/0/realdata/xnor_planner_root_watch.csv")
   parser.add_argument("--rate", type=float, default=10.0)
   parser.add_argument("--curve-factor", type=float, default=1.0)
   args = parser.parse_args()
@@ -209,7 +238,7 @@ def main() -> int:
       lead_drel = as_float(nested_get(lead, "dRel", 0.0), 0.0)
       lead_vrel = as_float(nested_get(lead, "vRel", 0.0), 0.0)
 
-      lp0, lp4, lp8, lplast = first_lp_speeds(lp)
+      lp0, lp4, lp8, lplast = plan_speeds(lp)
       lp_has_lead = as_bool(getattr(lp, "hasLead", False), False)
       lp_a_target = as_float(getattr(lp, "aTarget", 0.0), 0.0)
 
@@ -233,13 +262,9 @@ def main() -> int:
         lead_status=lead_status,
         lead_drel=lead_drel,
         lead_vrel=lead_vrel,
-        lp0=lp0,
-        lp4=lp4,
-        lp8=lp8,
         lplast=lplast,
         lp_has_lead=lp_has_lead,
         curve_near_ms=curve_near_ms,
-        curve_tail_ms=curve_tail_ms,
         force_decel=force_decel,
       )
 
