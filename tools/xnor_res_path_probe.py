@@ -55,12 +55,9 @@ def b(x):
 
 
 def parse_659(dat: bytes):
-  # Keep it simple: just record that 0x659 was sent, plus byte5 bits.
   b5 = dat[5] if len(dat) > 5 else 0
   return {
     "b5": b5,
-    "ap_dis": int(bool(b5 & 0x80)),
-    "ped_en": int(bool(b5 & 0x20)),
     "main_edge": int(bool(b5 & 0x02)),
     "cancel_edge": int(bool(b5 & 0x01)),
   }
@@ -83,11 +80,12 @@ def parse_xnor_log(msg: str):
     "cur": float(m_cur.group(1)) if m_cur else 0.0,
     "est": float(m_est.group(1)) if m_est else 0.0,
     "msg": msg,
+    "ts": time.time(),
   }
 
 
 def main():
-  parser = argparse.ArgumentParser(description="Probe XNOR speed-up path: module decision -> sendcan -> readback")
+  parser = argparse.ArgumentParser(description="Raw XNOR speed-up path probe: decision -> sendcan -> readback")
   parser.add_argument("--out", default="/data/media/0/realdata/xnor_res_path_probe.csv")
   parser.add_argument("--rate", type=float, default=10.0)
   args = parser.parse_args()
@@ -103,19 +101,18 @@ def main():
   fieldnames = [
     "ts_wall",
     "v_ego_ms",
-    "stock_cruise_enabled",
     "stock_set_ms",
-    "controls_vcruise",
-    "car_vcruise",
+    "controls_vcruise_kph",
+    "car_vcruise_kph",
     "lead_status",
-    "lead_drel",
-    "lead_vrel",
-    "lp_last",
+    "lead_drel_m",
+    "lead_vrel_ms",
+    "lp_last_ms",
     "lp_has_lead",
     "gas_pressed",
     "brake_pressed",
     "panda0_controls_allowed",
-    "xnor_log_seen",
+    "xnor_log_recent",
     "xnor_btn",
     "xnor_reason",
     "xnor_src",
@@ -123,11 +120,10 @@ def main():
     "xnor_cur",
     "xnor_est",
     "sendcan_659_seen",
-    "sendcan_659_count",
-    "sendcan_main_edge_count",
-    "sendcan_cancel_edge_count",
+    "sendcan_659_count_total",
+    "sendcan_main_edge_total",
+    "sendcan_cancel_edge_total",
     "sendcan_last_b5",
-    "notes",
   ]
 
   last_xnor = None
@@ -155,7 +151,11 @@ def main():
 
       sendcan_seen_this_row = 0
       if sm.updated.get("sendcan", False):
-        for m in sm["sendcan"]:
+        try:
+          msgs = sm["sendcan"]
+        except Exception:
+          msgs = []
+        for m in msgs:
           if i(safe_get(m, "address", 0), 0) == ADDR_659:
             sendcan_seen_this_row = 1
             sendcan_659_count += 1
@@ -171,7 +171,6 @@ def main():
       lead = safe_get(rs, "leadOne", None)
 
       v_ego_ms = f(safe_get(cs, "vEgo", 0.0), 0.0)
-      stock_cruise_enabled = b(safe_get_path(cs, "cruiseState.enabled", False))
       stock_set_ms = max(
         f(safe_get_path(cs, "cruiseState.speed", 0.0), 0.0),
         f(safe_get_path(cs, "cruiseState.speedCluster", 0.0), 0.0),
@@ -198,31 +197,25 @@ def main():
       except Exception:
         panda0_controls_allowed = 0
 
-      notes = []
-      demand_up = (max(controls_vcruise, car_vcruise) > 0.5 and max(controls_vcruise, car_vcruise) > stock_set_ms * 3.6 + 1.0) or (lp_last > stock_set_ms + 0.5)
-      if demand_up:
-        notes.append("speedup_demand")
-      if last_xnor and int(last_xnor.get("btn", 0)) != 0:
-        notes.append("xnor_decision")
-      if sendcan_seen_this_row:
-        notes.append("sendcan_659")
+      xnor_recent = 0
+      if last_xnor is not None and (time.time() - float(last_xnor.get("ts", 0.0))) < 0.75:
+        xnor_recent = 1
 
       writer.writerow({
         "ts_wall": f"{time.time():.3f}",
         "v_ego_ms": f"{v_ego_ms:.3f}",
-        "stock_cruise_enabled": stock_cruise_enabled,
         "stock_set_ms": f"{stock_set_ms:.3f}",
-        "controls_vcruise": f"{controls_vcruise:.3f}",
-        "car_vcruise": f"{car_vcruise:.3f}",
+        "controls_vcruise_kph": f"{controls_vcruise:.3f}",
+        "car_vcruise_kph": f"{car_vcruise:.3f}",
         "lead_status": lead_status,
-        "lead_drel": f"{lead_drel:.3f}",
-        "lead_vrel": f"{lead_vrel:.3f}",
-        "lp_last": f"{lp_last:.3f}",
+        "lead_drel_m": f"{lead_drel:.3f}",
+        "lead_vrel_ms": f"{lead_vrel:.3f}",
+        "lp_last_ms": f"{lp_last:.3f}",
         "lp_has_lead": lp_has_lead,
         "gas_pressed": gas_pressed,
         "brake_pressed": brake_pressed,
         "panda0_controls_allowed": panda0_controls_allowed,
-        "xnor_log_seen": int(last_xnor is not None),
+        "xnor_log_recent": xnor_recent,
         "xnor_btn": int(last_xnor.get("btn", 0)) if last_xnor else 0,
         "xnor_reason": last_xnor.get("reason", "") if last_xnor else "",
         "xnor_src": last_xnor.get("src", "") if last_xnor else "",
@@ -230,11 +223,10 @@ def main():
         "xnor_cur": f"{float(last_xnor.get('cur', 0.0)):.3f}" if last_xnor else "0.000",
         "xnor_est": f"{float(last_xnor.get('est', 0.0)):.3f}" if last_xnor else "0.000",
         "sendcan_659_seen": sendcan_seen_this_row,
-        "sendcan_659_count": sendcan_659_count,
-        "sendcan_main_edge_count": sendcan_main_edge_count,
-        "sendcan_cancel_edge_count": sendcan_cancel_edge_count,
+        "sendcan_659_count_total": sendcan_659_count,
+        "sendcan_main_edge_total": sendcan_main_edge_count,
+        "sendcan_cancel_edge_total": sendcan_cancel_edge_count,
         "sendcan_last_b5": f"0x{sendcan_last_b5:02x}",
-        "notes": "|".join(notes),
       })
       fcsv.flush()
 
