@@ -218,7 +218,11 @@ class ACCController:
     self.prev_speed_limit_kph = float(self.speed_limit_kph)
     if bool(set_speed_limit_active) and speed_limit_target_ms is not None and float(speed_limit_target_ms) > 0.0:
       self.speed_limit_kph = float(speed_limit_target_ms) * CV.MS_TO_KPH
-      if int(self.prev_speed_limit_kph) != int(self.speed_limit_kph):
+      # Unity's internal ACC ceiling should be seeded from the active speed-limit
+      # target itself. Do not wait only for integer limit changes; if the ceiling
+      # is still below the active limit (for example after engage or after a long
+      # period of lead-induced slowdowns), lift it back to the current limit.
+      if int(self.prev_speed_limit_kph) != int(self.speed_limit_kph) or float(self.acc_speed_kph) < (float(self.speed_limit_kph) - 0.1):
         self.acc_speed_kph = float(self.speed_limit_kph)
     else:
       self.speed_limit_kph = 0.0
@@ -230,7 +234,7 @@ class ACCController:
     if self.acc_speed_kph <= 0.0:
       self.acc_speed_kph = max(float(current_kph), float(v_ego_ms) * CV.MS_TO_KPH, float(self.speed_limit_kph))
     else:
-      self.acc_speed_kph = max(float(self.acc_speed_kph), float(current_kph))
+      self.acc_speed_kph = max(float(self.acc_speed_kph), float(current_kph), float(self.speed_limit_kph))
 
     stock_state = str(stock_cruise_state or "").upper()
     half_kph, full_kph = _cc_units_kph(speed_units)

@@ -114,18 +114,32 @@ class LongController:
       pass
 
   def _resolve_speed_limit_target_ms(self, CS, *, speed_units: str) -> tuple[Optional[float], bool, str]:
-    tinkla = getattr(CS, "_tinkla", None)
-    use_speed_limit = bool(tinkla and getattr(tinkla, "adjust_acc_with_speed_limit", False))
-    if not use_speed_limit:
-      return None, False, "none"
+    """
+    Unity-style speed-limit ownership for ACC.
 
+    Unity's LONG/ACC side owns whether the speed-limit ceiling is available and
+    passes it separately into ACC. Do not depend on the optional _tinkla wrapper
+    being present on CS; if CarState can compute a positive target, treat that as
+    an active ceiling source unless config explicitly disables it.
+    """
+    use_speed_limit = True
+    tinkla = getattr(CS, "_tinkla", None)
+    if tinkla is not None:
+      try:
+        use_speed_limit = bool(getattr(tinkla, "adjust_acc_with_speed_limit"))
+      except Exception:
+        use_speed_limit = True
+    if not use_speed_limit:
+      return None, False, "config_disabled"
+
+    speed_limit_target_ms = 0.0
     try:
       speed_limit_target_ms = float(CS._calc_speed_limit_target_ms(speed_units))
     except Exception:
       speed_limit_target_ms = 0.0
 
     if speed_limit_target_ms > 0.0:
-      return float(speed_limit_target_ms), True, "speed_limit_target"
+      return float(speed_limit_target_ms), True, "carstate_speed_limit_target"
     return None, False, "none"
 
   def update(self, CS, *, enabled: bool, frame: int, now_ms: Optional[int] = None) -> LongDecision:
@@ -135,7 +149,7 @@ class LongController:
     if (int(frame) % 20) != 0:
       return LongDecision(None, "gated: 5Hz(frame)")
 
-    controller_enabled = bool(enabled) and bool(getattr(CS, "enable_adaptive_cruise", False))
+    controller_enabled = bool(enabled) and bool(getattr(CS, "enable_adaptive_cruise", False) or getattr(CS, "enableACC", False))
     if not controller_enabled:
       self._last_active = False
       self._enabled_since_ms = 0
