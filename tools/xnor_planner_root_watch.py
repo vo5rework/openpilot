@@ -7,9 +7,6 @@ import time
 from pathlib import Path
 from typing import Any
 
-# Make repo-root imports work when run as:
-#   cd /data/openpilot
-#   python3 tools/xnor_planner_root_watch.py
 REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
   sys.path.insert(0, str(REPO_ROOT))
@@ -68,7 +65,6 @@ def compute_unity_curve_targets(model: Any, v_ego: float, factor: float = 1.0) -
     curvatures = np.interp(T_IDXS_MPC, ModelConstants.T_IDXS, ori_z) / np.clip(v, 0.3, 100.0)
     max_v = factor * np.sqrt(max_lat_accel / (np.abs(curvatures) + 1e-3)) - 2.0
     max_v = np.clip(max_v, 0.0, 100.0)
-
     near = float(np.min(max_v[:6])) if len(max_v) >= 6 else float(np.min(max_v))
     tail = float(np.min(max_v))
     return near, tail
@@ -98,7 +94,7 @@ def first_lp_speeds(lp: Any) -> tuple[float, float, float, float]:
 
 def infer_blocker(
   *,
-  active: bool,
+  module_active: bool,
   gas_pressed: bool,
   brake_pressed: bool,
   v_ego: float,
@@ -113,8 +109,8 @@ def infer_blocker(
   curve_near_ms: float,
   force_decel: bool,
 ) -> tuple[str, str]:
-  if not active:
-    return "not_active", "controls inactive"
+  if not module_active:
+    return "not_active", "stock cruise / adaptive path not active"
   if gas_pressed or brake_pressed:
     return "driver_override", "gas/brake pressed"
   if force_decel:
@@ -167,14 +163,15 @@ def main() -> int:
 
   fieldnames = [
     "ts_wall",
-    "active",
-    "enabled",
-    "long_state",
-    "force_decel",
-    "v_ego_ms",
+    "module_active",
+    "controls_enabled",
+    "stock_cruise_enabled",
+    "controls_long_state",
     "stock_set_ms",
+    "v_ego_ms",
     "controls_vcruise_kph",
     "car_vcruise_kph",
+    "force_decel",
     "lead_status",
     "lead_drel_m",
     "lead_vrel_ms",
@@ -209,6 +206,17 @@ def main() -> int:
       controls_vcruise_kph = as_float(getattr(controls, "vCruise", 0.0), 0.0)
       car_vcruise_kph = as_float(getattr(car_state, "vCruise", 0.0), 0.0)
 
+      controls_enabled = as_bool(getattr(controls, "enabled", False), False)
+      controls_long_state = str(getattr(controls, "longControlState", "") or "")
+      stock_cruise_enabled = as_bool(nested_get(car_state, "cruiseState.enabled", False), False)
+
+      module_active = bool(
+        stock_cruise_enabled
+        or stock_set_ms > 0.1
+        or car_vcruise_kph > 1.0
+        or controls_vcruise_kph > 1.0
+      )
+
       lead = nested_get(radar, "leadOne", None)
       lead_status = as_bool(nested_get(lead, "status", False), False)
       lead_drel = as_float(nested_get(lead, "dRel", 0.0), 0.0)
@@ -220,15 +228,12 @@ def main() -> int:
 
       curve_near_ms, curve_tail_ms = compute_unity_curve_targets(model, v_ego, factor=float(args.curve_factor))
 
-      enabled = as_bool(getattr(controls, "enabled", False), False)
-      long_state = str(getattr(controls, "longControlState", "") or "")
-      active = enabled and long_state not in ("off", "LongCtrlState.off")
       gas_pressed = as_bool(getattr(car_state, "gasPressed", False), False)
       brake_pressed = as_bool(getattr(car_state, "brakePressed", False), False)
       force_decel = as_bool(getattr(controls, "forceDecel", False), False)
 
       blocker, explanation = infer_blocker(
-        active=active,
+        module_active=module_active,
         gas_pressed=gas_pressed,
         brake_pressed=brake_pressed,
         v_ego=v_ego,
@@ -246,14 +251,15 @@ def main() -> int:
 
       writer.writerow({
         "ts_wall": f"{time.time():.3f}",
-        "active": int(active),
-        "enabled": int(enabled),
-        "long_state": long_state,
-        "force_decel": int(force_decel),
-        "v_ego_ms": f"{v_ego:.3f}",
+        "module_active": int(module_active),
+        "controls_enabled": int(controls_enabled),
+        "stock_cruise_enabled": int(stock_cruise_enabled),
+        "controls_long_state": controls_long_state,
         "stock_set_ms": f"{stock_set_ms:.3f}",
+        "v_ego_ms": f"{v_ego:.3f}",
         "controls_vcruise_kph": f"{controls_vcruise_kph:.3f}",
         "car_vcruise_kph": f"{car_vcruise_kph:.3f}",
+        "force_decel": int(force_decel),
         "lead_status": int(lead_status),
         "lead_drel_m": f"{lead_drel:.3f}",
         "lead_vrel_ms": f"{lead_vrel:.3f}",

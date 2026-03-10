@@ -41,9 +41,6 @@ def main() -> int:
       prev_blocker = blocker
     prev_ts = ts
 
-  if prev_blocker is not None:
-    spans[prev_blocker] = max(spans[prev_blocker], current_span)
-
   print("Counts:")
   for key, value in counts.most_common():
     print(f"  {key}: {value}")
