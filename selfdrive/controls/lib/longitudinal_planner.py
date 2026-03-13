@@ -21,7 +21,9 @@ A_CRUISE_MAX_VALS = [1.6, 1.2, 0.8, 0.6]
 A_CRUISE_MAX_BP = [0.0, 10.0, 25.0, 40.0]
 CONTROL_N_T_IDX = ModelConstants.T_IDXS[:CONTROL_N]
 MAX_VEL_ERR = 5.0
-
+CURVE_PEAK_THRESHOLD = 0.0022
+CURVE_AREA_THRESHOLD = 0.014
+CURVE_SLOWDOWN_MIN_DELTA = 0.5
 
 _A_TOTAL_MAX_V = [1.7, 3.2]
 _A_TOTAL_MAX_BP = [20.0, 40.0]
@@ -106,12 +108,19 @@ class LongitudinalPlanner:
 
     curve_detected = False
     if enable_turn_slowdown and len(getattr(model_msg.orientationRate, "z", [])) == ModelConstants.IDX_N:
-      max_lat_accel = np.interp(v_ego, [5.0, 10.0, 20.0], [1.5, 2.0, 3.0])
-      curvatures = np.interp(T_IDXS_MPC, ModelConstants.T_IDXS, model_msg.orientationRate.z) / np.clip(v, 0.3, 100.0)
-      max_v = float(turn_slowdown_factor) * np.sqrt(max_lat_accel / (np.abs(curvatures) + 1e-3)) - 2.0
-      v_clipped = np.minimum(max_v, v)
-      curve_detected = bool(np.any(v_clipped < (v - 0.05)))
-      v = v_clipped
+      raw_curvatures = np.abs(np.interp(T_IDXS_MPC, ModelConstants.T_IDXS, model_msg.orientationRate.z)) / np.clip(v, 0.3, 100.0)
+      curve_window = raw_curvatures[: min(len(raw_curvatures), 25)]
+      ahead_window = raw_curvatures[2: min(len(raw_curvatures), 20)]
+      curve_area = float(np.sum(curve_window) * 0.2) if len(curve_window) else 0.0
+      max_curv_ahead = float(np.max(ahead_window)) if len(ahead_window) else 0.0
+
+      if curve_area > CURVE_AREA_THRESHOLD or max_curv_ahead > CURVE_PEAK_THRESHOLD:
+        max_lat_accel = np.interp(v_ego, [5.0, 10.0, 20.0], [1.5, 2.0, 3.0])
+        max_v = float(turn_slowdown_factor) * np.sqrt(max_lat_accel / (raw_curvatures + 1e-3)) - 2.0
+        v_clipped = np.minimum(max_v, v)
+        curve_detected = bool(np.any(v_clipped < (v - CURVE_SLOWDOWN_MIN_DELTA)))
+        if curve_detected:
+          v = v_clipped
 
     return x, v, a, j, curve_detected
 
@@ -166,13 +175,15 @@ class LongitudinalPlanner:
 
     x, v, a, j, self.curve_detected = self.parse_model(sm["modelV2"], self.v_model_error, v_ego, True, 1.0)
 
+    v_target = v if self.curve_detected else np.maximum(v, v_cruise - 0.1)
+
     if self._mpc_update_first_param == "carstate":
-      self.mpc.update(sm["carState"], sm["radarState"], v_cruise, x, v, a, j, personality=personality)
+      self.mpc.update(sm["carState"], sm["radarState"], v_cruise, x, v_target, a, j, personality=personality)
     else:
       update_kwargs = {"personality": personality}
       if self._mpc_update_accepts_carstate:
         update_kwargs["carstate"] = sm["carState"]
-      self.mpc.update(sm["radarState"], v_cruise, x, v, a, j, **update_kwargs)
+      self.mpc.update(sm["radarState"], v_cruise, x, v_target, a, j, **update_kwargs)
 
     self.v_desired_trajectory_full = np.interp(ModelConstants.T_IDXS, T_IDXS_MPC, self.mpc.v_solution)
     self.a_desired_trajectory_full = np.interp(ModelConstants.T_IDXS, T_IDXS_MPC, self.mpc.a_solution)

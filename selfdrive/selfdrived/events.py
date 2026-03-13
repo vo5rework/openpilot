@@ -595,6 +595,22 @@ EVENTS: dict[int, dict[str, Alert | AlertCallbackType]] = {
       Priority.LOW, VisualAlert.none, AudibleAlert.none, .1),
   },
 
+  EventName.accEnabled: {
+    ET.WARNING: Alert(
+      "Adaptive Cruise Enabled",
+      "",
+      AlertStatus.normal, AlertSize.small,
+      Priority.LOW, VisualAlert.none, AudibleAlert.engage, 1.),
+  },
+
+  EventName.accDisabled: {
+    ET.WARNING: Alert(
+      "Adaptive Cruise Disabled",
+      "",
+      AlertStatus.userPrompt, AlertSize.small,
+      Priority.LOW, VisualAlert.none, AudibleAlert.disengage, 1.),
+  },
+
   EventName.steerSaturated: {
     ET.WARNING: Alert(
       "Take Control",
