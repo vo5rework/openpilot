@@ -174,15 +174,28 @@ class CarState(CarStateBase):
 
     hold_dir = 0
     one_lamp = bool(self.leftBlinkerLamp) != bool(self.rightBlinkerLamp)
+    alca_pre_engage = bool(getattr(self, "alca_pre_engage", False))
+    alca_engaged = bool(getattr(self, "alca_engaged", False))
+    alca_done = bool(getattr(self, "alca_done", False))
+
+    if alca_engaged:
+      # Once the lane change has started, the pre-engage tap latch is no longer needed.
+      self._alc_tap_latch_dir = 0
+      self._alc_tap_latch_until = 0
+
     if self.enableALC and int(self.turnSignalStalkState) == 0:
-      if one_lamp and int(getattr(self, "_alc_tap_latch_until", 0)) <= int(self._param_frame):
+      # Only extend the comfort tap once the planner has actually entered preLaneChange.
+      # This avoids turning ordinary non-ALC indicator taps into a virtual held blinker.
+      if alca_pre_engage and one_lamp and int(getattr(self, "_alc_tap_latch_until", 0)) <= int(self._param_frame):
         self._alc_tap_latch_dir = 1 if self.leftBlinkerLamp else 2
         dur_s = max(2.5, float(self.autoStartAlcaDelay) + 0.5)
         self._alc_tap_latch_until = int(self._param_frame + dur_s * 100)
 
-      if int(getattr(self, "alca_direction", 0) or 0) in (1, 2):
+      # Unity-style lifecycle: pre-engage owns the remembered tap, active change owns the blinker,
+      # then finishing must be allowed to clear so DesireHelper does not re-arm another lane change.
+      if alca_engaged and (not alca_done) and int(getattr(self, "alca_direction", 0) or 0) in (1, 2):
         hold_dir = int(self.alca_direction)
-      elif int(getattr(self, "_alc_tap_latch_until", 0)) > int(self._param_frame):
+      elif (not alca_engaged) and int(getattr(self, "_alc_tap_latch_until", 0)) > int(self._param_frame):
         hold_dir = int(getattr(self, "_alc_tap_latch_dir", 0) or 0)
 
     if hold_dir == 1:
