@@ -814,11 +814,9 @@ class CarState(CarStateBase):
       else:
         ret.cruiseState.speedCluster = max(float(ret.cruiseState.speed or 0.0), 1e-3)
 
-      ret.adaptiveCruiseEnabled = bool(now_adapt)
       self._prev_enable_adaptive_cruise = bool(now_adapt)
     except Exception:
-      ret.adaptiveCruiseEnabled = bool(getattr(self, "enable_adaptive_cruise", False))
-
+      pass
 
     return ret
 
@@ -1040,7 +1038,6 @@ class CarState(CarStateBase):
 
       pass
 
-    ret.adaptiveCruiseEnabled = bool(getattr(self, "enable_adaptive_cruise", False))
 
 
     return ret
