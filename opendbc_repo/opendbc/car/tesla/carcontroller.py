@@ -91,6 +91,7 @@ class CarController(CarControllerBase):
     self._xnor_diag_last_log_ms = 0
     self._body_controls_prev_turn = 0
     self._virtual_turn_prev = 0
+    self._virtual_turn_last_send_frame = -100000
 
     if CP.carFingerprint in LEGACY_CARS:
       if CP.carFingerprint in (CAR.TESLA_MODEL_S_HW1, CAR.TESLA_MODEL_X_HW1):
@@ -265,14 +266,28 @@ class CarController(CarControllerBase):
     # and send one explicit release when that ownership ends.
     if self.CP.carFingerprint in LEGACY_CARS:
       prev_hold_turn = int(getattr(self, "_virtual_turn_prev", 0) or 0)
-      if (self.frame % 10 == 0) and (hold_turn in (1, 2) or prev_hold_turn in (1, 2)):
+      last_send_frame = int(getattr(self, "_virtual_turn_last_send_frame", -100000) or -100000)
+
+      send_turn = None
+      if hold_turn in (1, 2):
+        # Align the virtual held-stalk cadence to the moment ownership starts, so the
+        # physical lamp continues with the same rhythm as the initial comfort tap.
+        if hold_turn != prev_hold_turn or (int(self.frame) - last_send_frame) >= 10:
+          send_turn = int(hold_turn)
+      elif prev_hold_turn in (1, 2):
+        # Release immediately when the owned lane change ends.
+        send_turn = 0
+
+      if send_turn is not None:
         self._send_stw(
           CS,
           can_sends,
           BTN_IDLE,
           bus=int(self._stw_bus(CS)),
-          turn_signal_stalk_state=(hold_turn if hold_turn in (1, 2) else 0),
+          turn_signal_stalk_state=int(send_turn),
         )
+        self._virtual_turn_last_send_frame = int(self.frame)
+
       self._virtual_turn_prev = int(hold_turn)
 
 
