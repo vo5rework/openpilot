@@ -203,12 +203,10 @@ class CarState(CarStateBase):
     raw_ts = int(raw_ts or 0)
     if raw_ts == 3:
       raw_ts = 0
-
     vturn = int(getattr(self, "_xnor_last_virtual_turn", 0) or 0)
     vms = int(getattr(self, "_xnor_last_virtual_turn_ms", 0) or 0)
     now_ms = int(self._now_ms())
-
-    if raw_ts in (1, 2) and raw_ts == vturn and (0 <= (now_ms - vms) <= 250):
+    if raw_ts in (1, 2) and raw_ts == vturn and 0 <= (now_ms - vms) <= 250:
       return 0
     return raw_ts
 

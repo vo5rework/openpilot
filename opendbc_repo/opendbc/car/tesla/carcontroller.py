@@ -16,6 +16,9 @@ from __future__ import annotations
 import numpy as np
 import time
 
+import cereal.messaging as messaging
+from cereal import log
+
 from openpilot.common.params import Params
 from openpilot.common.swaglog import cloudlog
 from openpilot.selfdrive.car.modules.LONG_module import LongController
@@ -90,7 +93,11 @@ class CarController(CarControllerBase):
     self._op_enabled_prev = False
     self._xnor_diag_last_log_ms = 0
     self._body_controls_prev_turn = 0
-    self._virtual_turn_prev = 0
+    self._stw_turn_prev = 0
+    try:
+      self._alc_sm = messaging.SubMaster(["modelV2"], ignore_avg_freq=True)
+    except Exception:
+      self._alc_sm = None
 
     if CP.carFingerprint in LEGACY_CARS:
       if CP.carFingerprint in (CAR.TESLA_MODEL_S_HW1, CAR.TESLA_MODEL_X_HW1):
@@ -211,15 +218,15 @@ class CarController(CarControllerBase):
         turn_signal_stalk_state=(None if turn_signal_stalk_state is None else int(turn_signal_stalk_state)),
       )
     )
+    now_ms = int(self._now_ms())
     # Mark last virtual stalk press so CarState can ignore it for adaptive double-pull detection.
     try:
-      now_ms = int(self._now_ms())
       if int(btn) != int(BTN_IDLE):
         CS._xnor_last_virtual_btn = int(btn)
-        CS._xnor_last_virtual_ms = now_ms
-      if turn_signal_stalk_state is not None:
+        CS._xnor_last_virtual_ms = int(now_ms)
+      if turn_signal_stalk_state in (1, 2):
         CS._xnor_last_virtual_turn = int(turn_signal_stalk_state)
-        CS._xnor_last_virtual_turn_ms = now_ms
+        CS._xnor_last_virtual_turn_ms = int(now_ms)
     except Exception:
       pass
     self._stw_seed_bus = int(b)
@@ -238,17 +245,42 @@ class CarController(CarControllerBase):
     self._stw_release_bus = int(self._stw_seed_bus)
     return True
 
-  def _process_stalk_actions(self, CS, can_sends) -> None:
-    hold_turn = 0
-    if self.CP.carFingerprint in LEGACY_CARS:
-      cs_out = getattr(CS, "out", None)
-      if cs_out is not None:
-        left = bool(getattr(cs_out, "leftBlinker", False))
-        right = bool(getattr(cs_out, "rightBlinker", False))
-        if left != right and int(getattr(CS, "turnSignalStalkState", 0) or 0) == 0:
-          hold_turn = 1 if left else 2
+  def _planner_virtual_turn(self) -> int:
+    sm = getattr(self, "_alc_sm", None)
+    if sm is None:
+      return 0
 
-    # Release pending cruise pulse, preserving any active virtual turn hold.
+    try:
+      sm.update(0)
+      model_v2 = sm["modelV2"]
+      meta = getattr(model_v2, "meta", None)
+      if meta is None:
+        return 0
+
+      lane_change_state = int(getattr(meta, "laneChangeState", 0) or 0)
+      lane_change_direction = getattr(meta, "laneChangeDirection", None)
+
+      active_states = {
+        int(log.LaneChangeState.laneChangeStarting),
+        int(log.LaneChangeState.laneChangeFinishing),
+      }
+      if lane_change_state not in active_states:
+        return 0
+
+      if lane_change_direction == int(log.LaneChangeDirection.left):
+        return 1
+      if lane_change_direction == int(log.LaneChangeDirection.right):
+        return 2
+    except Exception:
+      return 0
+
+    return 0
+
+  def _process_stalk_actions(self, CS, can_sends) -> None:
+    hold_turn = int(self._planner_virtual_turn()) if self.CP.carFingerprint in LEGACY_CARS else 0
+    prev_hold_turn = int(getattr(self, "_stw_turn_prev", 0) or 0)
+
+    # Release pending pulse, but preserve any active virtual turn hold.
     if int(self._stw_release_frame) == int(self.frame):
       self._send_stw(
         CS,
@@ -259,12 +291,10 @@ class CarController(CarControllerBase):
       )
       self._stw_release_frame = -1
 
-    # Legacy HW2 physical blinker hold follows STW_ACTN_RQ TurnIndLvr_Stat at ~10 Hz.
-    # Mirror the existing internal Unity-style blinker ownership already exposed via CS.out,
-    # and send one explicit release when that ownership ends.
     if self.CP.carFingerprint in LEGACY_CARS:
-      prev_hold_turn = int(getattr(self, "_virtual_turn_prev", 0) or 0)
-      if (self.frame % 10 == 0) and (hold_turn in (1, 2) or prev_hold_turn in (1, 2)):
+      release_now = prev_hold_turn in (1, 2) and hold_turn == 0
+      send_now = hold_turn in (1, 2) and (self.frame % 10 == 0)
+      if release_now or send_now:
         self._send_stw(
           CS,
           can_sends,
@@ -272,8 +302,8 @@ class CarController(CarControllerBase):
           bus=int(self._stw_bus(CS)),
           turn_signal_stalk_state=(hold_turn if hold_turn in (1, 2) else 0),
         )
-      self._virtual_turn_prev = int(hold_turn)
 
+    self._stw_turn_prev = hold_turn
 
   def _body_controls_turn(self, CS) -> int:
     if not bool(getattr(CS, "enableALC", False)):
@@ -291,7 +321,7 @@ class CarController(CarControllerBase):
 
   def _process_body_controls(self, CS, can_sends) -> None:
     if self.CP.carFingerprint in LEGACY_CARS:
-      self._body_controls_prev_turn = 0
+      self._body_controls_prev_turn = int(self._body_controls_turn(CS))
       return
 
     turn = int(self._body_controls_turn(CS))
@@ -329,13 +359,13 @@ class CarController(CarControllerBase):
       )
       return
 
-    # Don't overlap with explicit sequences, a pending pulse release, or legacy virtual turn hold.
     if self.CP.carFingerprint in LEGACY_CARS:
-      hold_turn = int(getattr(self, "_virtual_turn_prev", 0) or 0)
-      if hold_turn in (1, 2):
-        self._diag_log(f"[XNOR_CC_DIAG] gate=turn_hold turn={hold_turn}")
+      hold_turn = int(self._planner_virtual_turn())
+      if hold_turn in (1, 2) or int(getattr(self, "_stw_turn_prev", 0) or 0) in (1, 2):
+        self._diag_log(f"[XNOR_CC_DIAG] gate=turn_hold turn={hold_turn} prev={int(getattr(self, '_stw_turn_prev', 0) or 0)}")
         return
 
+    # Don't overlap with explicit sequences or a pending pulse release.
     if (int(self._stw_release_frame) >= 0):
       self._diag_log(f"[XNOR_CC_DIAG] gate=pending_release release_frame={int(self._stw_release_frame)} frame={int(self.frame)}")
       return

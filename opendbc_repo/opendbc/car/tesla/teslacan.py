@@ -95,25 +95,29 @@ class TeslaCAN:
 
   def create_stalk_request(self,
                            bus: int,
-                           msg_stw_actn_req: dict | None,
-                           *,
-                           cruise_button: int | None = None,
+                           msg_stw_actn_req: dict,
+                           cruise_button: int,
                            turn_signal_stalk_state: int | None = None) -> tuple[int, int, bytes]:
-    """Create STW_ACTN_RQ from the latest observed seed frame."""
-    values = dict(msg_stw_actn_req or {})
-    if cruise_button is not None:
-      values["SpdCtrlLvr_Stat"] = int(cruise_button)
+    """Create STW_ACTN_RQ seeded from the latest observed frame.
+
+    Legacy HW2 accepts physical blinker hold over STW_ACTN_RQ (TurnIndLvr_Stat),
+    not DAS_bodyControls.
+    """
+    if msg_stw_actn_req is None:
+      msg_stw_actn_req = {}
+    values = dict(msg_stw_actn_req)
+    values["SpdCtrlLvr_Stat"] = int(cruise_button)
     if turn_signal_stalk_state is not None:
       values["TurnIndLvr_Stat"] = int(turn_signal_stalk_state)
-
     counter = (int(values.get("MC_STW_ACTN_RQ", 0)) + 1) % 16
     values["MC_STW_ACTN_RQ"] = counter
     values["CRC_STW_ACTN_RQ"] = 0
 
-    msg = self.packer.make_can_msg("STW_ACTN_RQ", int(bus), values)
+    msg = self.packer.make_can_msg("STW_ACTN_RQ", bus, values)
     dat = msg[1]
-    values["CRC_STW_ACTN_RQ"] = _crc8_j1850(dat[:7])
-    return self.packer.make_can_msg("STW_ACTN_RQ", int(bus), values)
+    crc = _crc8_j1850(dat[:7])
+    values["CRC_STW_ACTN_RQ"] = crc
+    return self.packer.make_can_msg("STW_ACTN_RQ", bus, values)
 
   def create_action_request(self, bus: int, msg_stw_actn_req: dict, cruise_button: int) -> tuple[int, int, bytes]:
     """Create STW_ACTN_RQ to emulate cruise stalk up/down/cancel (Unity parity)."""
