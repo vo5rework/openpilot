@@ -2,11 +2,13 @@
 """
 Unity-parity stock cruise syncing for XNOR.
 
-This removes the downstream "flatten everything into lp_last" behavior that the
-swaglog showed repeatedly. LONG now mirrors Unity more closely:
-- consume the planner tail as the desired target
-- keep speed-limit handling separate from the planner target
-- let ACC own the adaptive max-speed ceiling internally
+Patch118 keeps the Patch116 speed-limit ownership split and restores
+lead-resume behaviour:
+- clear-road desired speed comes from the live CarState speed-limit target
+- planner tail can still drag that target down for genuine slowdowns
+- mere lead presence no longer latches the planner as the owner once the lead
+  stops materially constraining speed
+- ACC keeps ownership of the adaptive cruise ceiling internally
 
 XNOR architecture adaptations retained:
 - 5 Hz cruise stalk pacing
@@ -42,6 +44,9 @@ class LongDecision:
 class LongController:
   MIN_CRUISE_SPEED_MS = 17.1 * CV.MPH_TO_MS
   _LP_FRESH_NS = 1_500_000_000
+  _PLANNER_DRAG_MARGIN_MS = 0.6
+  _PLANNER_BELOW_EGO_MARGIN_MS = 0.4
+  _STRONG_DECEL_ATARGET_MS2 = -0.5
 
   def __init__(self) -> None:
     self.acc = ACCController()
@@ -49,6 +54,8 @@ class LongController:
 
     self._lp_target_ms: Optional[float] = None
     self._lp_last_ns: int = 0
+    self._lp_has_lead: bool = False
+    self._lp_a_target: float = 0.0
 
     self._lead_present: bool = False
     self._lead_drel: float = 0.0
@@ -93,6 +100,8 @@ class LongController:
       if (v_last is not None) and (lp_mono_ns > 0):
         self._lp_target_ms = float(v_last)
         self._lp_last_ns = int(lp_mono_ns)
+        self._lp_has_lead = bool(getattr(lp, "hasLead", False))
+        self._lp_a_target = float(getattr(lp, "aTarget", 0.0) or 0.0)
     except Exception:
       pass
 
@@ -117,10 +126,9 @@ class LongController:
     """
     Unity-style speed-limit ownership for ACC.
 
-    Unity's LONG/ACC side owns whether the speed-limit ceiling is available and
-    passes it separately into ACC. Do not depend on the optional _tinkla wrapper
-    being present on CS; if CarState can compute a positive target, treat that as
-    an active ceiling source unless config explicitly disables it.
+    LONG/ACC own whether a positive CarState target is available. If the optional
+    _tinkla wrapper exists, a false config disables it; otherwise a positive
+    CarState target is sufficient.
     """
     use_speed_limit = True
     tinkla = getattr(CS, "_tinkla", None)
@@ -141,6 +149,45 @@ class LongController:
     if speed_limit_target_ms > 0.0:
       return float(speed_limit_target_ms), True, "carstate_speed_limit_target"
     return None, False, "none"
+
+  def _lead_is_constraining(self, *, base_target_ms: float, v_ego_ms: float) -> bool:
+    if (not self._lead_present) or float(self._lead_drel) <= 0.0:
+      return False
+
+    lead_speed_ms = max(0.0, float(v_ego_ms) + float(self._lead_vrel))
+    lead_slower_than_base = lead_speed_ms < (float(base_target_ms) - 0.35)
+    closing = float(self._lead_vrel) < -0.3
+    near_gap_limit_m = min(80.0, max(25.0, float(v_ego_ms) * 2.2))
+    near_lead = float(self._lead_drel) < float(near_gap_limit_m)
+    return bool(lead_slower_than_base and (closing or near_lead))
+
+  def _planner_drag_reasons(self, *, base_target_ms: float, planner_ms: float, v_ego_ms: float) -> list[str]:
+    if float(planner_ms) <= 0.1:
+      return []
+
+    materially_below_base = float(planner_ms) < (float(base_target_ms) - float(self._PLANNER_DRAG_MARGIN_MS))
+    materially_below_ego = float(planner_ms) < (float(v_ego_ms) - float(self._PLANNER_BELOW_EGO_MARGIN_MS))
+    materially_below_clear = materially_below_base and materially_below_ego
+    lead_constraining = self._lead_is_constraining(
+      base_target_ms=float(base_target_ms),
+      v_ego_ms=float(v_ego_ms),
+    )
+    lp_lead_constraining = bool(self._lp_has_lead) and (
+      lead_constraining
+      or materially_below_clear
+      or (float(self._lp_a_target) <= float(self._STRONG_DECEL_ATARGET_MS2))
+    )
+
+    reasons: list[str] = []
+    if lead_constraining:
+      reasons.append("lead")
+    if lp_lead_constraining:
+      reasons.append("lp_hasLead")
+    if float(self._lp_a_target) <= float(self._STRONG_DECEL_ATARGET_MS2):
+      reasons.append("aTarget")
+    if materially_below_clear:
+      reasons.append("planner_low")
+    return reasons
 
   def update(self, CS, *, enabled: bool, frame: int, now_ms: Optional[int] = None) -> LongDecision:
     now = _mono_ms() if now_ms is None else int(now_ms)
@@ -187,8 +234,11 @@ class LongController:
     elif not lp_fresh:
       self._stable_plan_samples = 0
       self._last_lp_seen_ns = 0
+      self._lp_has_lead = False
+      self._lp_a_target = 0.0
 
     planner_ms = float(self._lp_target_ms) if (lp_fresh and self._lp_target_ms is not None) else float(current_set_ms)
+    desired_ms = float(planner_ms)
     src = "lp_last" if lp_fresh else "hold"
 
     startup_warmup = bool(self._enabled_since_ms and ((int(now) - int(self._enabled_since_ms)) < 2500))
@@ -205,18 +255,36 @@ class LongController:
         )
       )
     )
-    if startup_invalid_clear:
-      planner_ms = float(current_set_ms)
-      src = f"{src}+startup_hold"
-
-    if (not lp_fresh) and self._lead_present and (self._lead_drel < 80.0) and (self._lead_vrel < -0.5):
-      lead_speed_ms = max(0.0, float(v_ego_ms) + float(self._lead_vrel))
-      planner_ms = min(float(planner_ms), max(float(self.MIN_CRUISE_SPEED_MS), float(lead_speed_ms)))
-      src = f"{src}+stale_lead"
 
     speed_limit_target_ms, set_speed_limit_active, ceiling_src = self._resolve_speed_limit_target_ms(CS, speed_units=speed_units)
-    if set_speed_limit_active:
-      src = f"{src}+ceiling[{ceiling_src}]"
+
+    if set_speed_limit_active and speed_limit_target_ms is not None:
+      base_target_ms = float(speed_limit_target_ms)
+      desired_ms = float(base_target_ms)
+      src = f"speed_limit_target[{ceiling_src}]"
+
+      if lp_fresh and self._lp_target_ms is not None:
+        drag_reasons = self._planner_drag_reasons(
+          base_target_ms=float(base_target_ms),
+          planner_ms=float(self._lp_target_ms),
+          v_ego_ms=float(v_ego_ms),
+        )
+        if drag_reasons:
+          desired_ms = min(float(base_target_ms), float(self._lp_target_ms))
+          src = f"{src}+planner[{'+'.join(drag_reasons)}]"
+      elif self._lead_present and (self._lead_drel < 80.0) and (self._lead_vrel < -0.5):
+        lead_speed_ms = max(0.0, float(v_ego_ms) + float(self._lead_vrel))
+        desired_ms = min(float(base_target_ms), max(float(self.MIN_CRUISE_SPEED_MS), float(lead_speed_ms)))
+        src = f"{src}+stale_lead"
+    else:
+      if startup_invalid_clear:
+        desired_ms = float(current_set_ms)
+        src = f"{src}+startup_hold"
+
+      if (not lp_fresh) and self._lead_present and (self._lead_drel < 80.0) and (self._lead_vrel < -0.5):
+        lead_speed_ms = max(0.0, float(v_ego_ms) + float(self._lead_vrel))
+        desired_ms = min(float(desired_ms), max(float(self.MIN_CRUISE_SPEED_MS), float(lead_speed_ms)))
+        src = f"{src}+stale_lead"
 
     stock_cruise_enabled = stock_state in ("ENABLED", "OVERRIDE", "STANDSTILL")
     brake_pressed = bool(getattr(cs_out, "brakePressed", False))
@@ -229,7 +297,7 @@ class LongController:
       speed_units=speed_units,
       v_ego_ms=v_ego_ms,
       current_set_speed_ms=current_set_ms,
-      desired_speed_ms=float(planner_ms),
+      desired_speed_ms=float(desired_ms),
       cruise_buttons=cruise_buttons,
       brake_pressed=brake_pressed,
       speed_limit_target_ms=speed_limit_target_ms,
