@@ -195,6 +195,9 @@ class CarState(CarStateBase):
       ret.leftBlinker = bool(self.leftBlinkerLamp) and int(self.turnSignalStalkState) == 0 and int(self.tap_direction) == 1
       ret.rightBlinker = bool(self.rightBlinkerLamp) and int(self.turnSignalStalkState) == 0 and int(self.tap_direction) == 2
 
+  def _now_ms(self) -> int:
+    return int(time.monotonic() * 1000.0)
+
   def _filter_virtual_turn_stalk(self, raw_ts: int) -> int:
     """Ignore our own virtual STW turn-hold frames so they do not look like a real held stalk."""
     raw_ts = int(raw_ts or 0)
