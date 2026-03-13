@@ -86,8 +86,6 @@ class CarState(CarStateBase):
     self._prev_pull_button = 0
     self._xnor_last_virtual_btn = 0
     self._xnor_last_virtual_ms = 0
-    self._xnor_last_virtual_turn = 0
-    self._xnor_last_virtual_turn_ms = 0
 
     self.turnSignalStalkState = 0
     self.speed_units = "MPH"
@@ -112,8 +110,6 @@ class CarState(CarStateBase):
     self.tap_direction = 0
     self._alc_tap_latch_dir = 0
     self._alc_tap_latch_until = 0
-    self._alc_rearm_after_frame = 0
-    self._prev_alca_direction = 0
     self.alca_direction = 0  # 0-none, 1-left, 2-right
     self.alca_pre_engage = False
     self.prev_alca_pre_engage = False
@@ -174,24 +170,16 @@ class CarState(CarStateBase):
     self.blinker_controller.update_state(self, self._param_frame)
     self.tap_direction = int(self.blinker_controller.tap_direction)
 
-    current_alca_direction = int(getattr(self, "alca_direction", 0) or 0)
-    prev_alca_direction = int(getattr(self, "_prev_alca_direction", 0) or 0)
-    if prev_alca_direction in (1, 2) and current_alca_direction == 0:
-      # Prevent the trailing held lamp from being re-latched as a fresh tap.
-      self._alc_rearm_after_frame = int(self._param_frame + 55)
-    self._prev_alca_direction = current_alca_direction
-
     hold_dir = 0
     one_lamp = bool(self.leftBlinkerLamp) != bool(self.rightBlinkerLamp)
-    can_relatch = int(self._param_frame) >= int(getattr(self, "_alc_rearm_after_frame", 0))
     if self.enableALC and int(self.turnSignalStalkState) == 0:
-      if one_lamp and can_relatch and int(getattr(self, "_alc_tap_latch_until", 0)) <= int(self._param_frame):
+      if one_lamp and int(getattr(self, "_alc_tap_latch_until", 0)) <= int(self._param_frame):
         self._alc_tap_latch_dir = 1 if self.leftBlinkerLamp else 2
         dur_s = max(2.5, float(self.autoStartAlcaDelay) + 0.5)
         self._alc_tap_latch_until = int(self._param_frame + dur_s * 100)
 
-      if current_alca_direction in (1, 2):
-        hold_dir = current_alca_direction
+      if int(getattr(self, "alca_direction", 0) or 0) in (1, 2):
+        hold_dir = int(self.alca_direction)
       elif int(getattr(self, "_alc_tap_latch_until", 0)) > int(self._param_frame):
         hold_dir = int(getattr(self, "_alc_tap_latch_dir", 0) or 0)
 
@@ -204,23 +192,6 @@ class CarState(CarStateBase):
     else:
       ret.leftBlinker = bool(self.leftBlinkerLamp) and int(self.turnSignalStalkState) == 0 and int(self.tap_direction) == 1
       ret.rightBlinker = bool(self.rightBlinkerLamp) and int(self.turnSignalStalkState) == 0 and int(self.tap_direction) == 2
-
-  def _now_ms(self) -> int:
-    return int(time.monotonic_ns() // 1_000_000)
-
-  def _filter_virtual_turn_stalk(self, raw_ts: int) -> int:
-    """Ignore our own virtual STW turn-hold frames so they do not look like a real held stalk."""
-    raw_ts = int(raw_ts or 0)
-    if raw_ts == 3:
-      raw_ts = 0
-
-    vturn = int(getattr(self, "_xnor_last_virtual_turn", 0) or 0)
-    vms = int(getattr(self, "_xnor_last_virtual_turn_ms", 0) or 0)
-    now_ms = int(self._now_ms())
-
-    if raw_ts in (1, 2) and raw_ts == vturn and (0 <= (now_ms - vms) <= 250):
-      return 0
-    return raw_ts
 
   def _calc_speed_limit_target_ms(self, speed_units: str) -> float:
     """Compute target speed for speed-limit matching (Unity parity).
@@ -647,7 +618,7 @@ class CarState(CarStateBase):
 
 
       raw_ts = int(stw_seed.get("TurnIndLvr_Stat", 0))
-      self.turnSignalStalkState = self._filter_virtual_turn_stalk(raw_ts)
+      self.turnSignalStalkState = 0 if raw_ts == 3 else raw_ts
     else:
       ret.followDistanceS = self._last_follow_distance_s
       self.cruise_buttons = 0
@@ -825,9 +796,12 @@ class CarState(CarStateBase):
           pass
       else:
         ret.cruiseState.speedCluster = max(float(ret.cruiseState.speed or 0.0), 1e-3)
+
+      ret.adaptiveCruiseEnabled = bool(now_adapt)
       self._prev_enable_adaptive_cruise = bool(now_adapt)
     except Exception:
-      pass
+      ret.adaptiveCruiseEnabled = bool(getattr(self, "enable_adaptive_cruise", False))
+
 
     return ret
 
@@ -967,7 +941,7 @@ class CarState(CarStateBase):
         self.cruise_distance = 255
 
       raw_ts = int(stw.get("TurnIndLvr_Stat", 0))
-      self.turnSignalStalkState = self._filter_virtual_turn_stalk(raw_ts)
+      self.turnSignalStalkState = 0 if raw_ts == 3 else raw_ts
     else:
       self.cruise_buttons = 0
       self.turnSignalStalkState = 0
@@ -1048,6 +1022,8 @@ class CarState(CarStateBase):
 
 
       pass
+
+    ret.adaptiveCruiseEnabled = bool(getattr(self, "enable_adaptive_cruise", False))
 
 
     return ret
