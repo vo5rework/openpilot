@@ -241,21 +241,13 @@ class CarController(CarControllerBase):
   def _process_stalk_actions(self, CS, can_sends) -> None:
     hold_turn = 0
     if self.CP.carFingerprint in LEGACY_CARS:
-      # Unity parity for ownership: comfort tap covers preLaneChange.
-      # Only the active lane-change phase needs a virtual held stalk on HW2.
-      alca_engaged = bool(getattr(CS, "alca_engaged", False))
-      alca_done = bool(getattr(CS, "alca_done", False))
-      if alca_engaged and (not alca_done):
+      # patch141 fixed non-ALC taps by tightening the owned blinker lifecycle in CarState.
+      # For the physical HW2 hold, use the planner-owned ALC direction directly rather than
+      # the derived engaged/done booleans, which can clear too early on this base.
+      if int(getattr(CS, "turnSignalStalkState", 0) or 0) == 0:
         turn = int(getattr(CS, "alca_direction", 0) or 0)
         if turn in (1, 2):
           hold_turn = turn
-        else:
-          cs_out = getattr(CS, "out", None)
-          if cs_out is not None:
-            left = bool(getattr(cs_out, "leftBlinker", False))
-            right = bool(getattr(cs_out, "rightBlinker", False))
-            if left != right and int(getattr(CS, "turnSignalStalkState", 0) or 0) == 0:
-              hold_turn = 1 if left else 2
 
     # Release pending cruise pulse, preserving any active virtual turn hold.
     if int(self._stw_release_frame) == int(self.frame):
