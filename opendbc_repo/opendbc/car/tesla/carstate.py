@@ -86,6 +86,8 @@ class CarState(CarStateBase):
     self._prev_pull_button = 0
     self._xnor_last_virtual_btn = 0
     self._xnor_last_virtual_ms = 0
+    self._xnor_last_virtual_turn = 0
+    self._xnor_last_virtual_turn_ms = 0
 
     self.turnSignalStalkState = 0
     self.speed_units = "MPH"
@@ -192,6 +194,20 @@ class CarState(CarStateBase):
     else:
       ret.leftBlinker = bool(self.leftBlinkerLamp) and int(self.turnSignalStalkState) == 0 and int(self.tap_direction) == 1
       ret.rightBlinker = bool(self.rightBlinkerLamp) and int(self.turnSignalStalkState) == 0 and int(self.tap_direction) == 2
+
+  def _filter_virtual_turn_stalk(self, raw_ts: int) -> int:
+    """Ignore our own virtual STW turn-hold frames so they do not look like a real held stalk."""
+    raw_ts = int(raw_ts or 0)
+    if raw_ts == 3:
+      raw_ts = 0
+
+    vturn = int(getattr(self, "_xnor_last_virtual_turn", 0) or 0)
+    vms = int(getattr(self, "_xnor_last_virtual_turn_ms", 0) or 0)
+    now_ms = int(self._now_ms())
+
+    if raw_ts in (1, 2) and raw_ts == vturn and (0 <= (now_ms - vms) <= 250):
+      return 0
+    return raw_ts
 
   def _calc_speed_limit_target_ms(self, speed_units: str) -> float:
     """Compute target speed for speed-limit matching (Unity parity).
@@ -618,7 +634,7 @@ class CarState(CarStateBase):
 
 
       raw_ts = int(stw_seed.get("TurnIndLvr_Stat", 0))
-      self.turnSignalStalkState = 0 if raw_ts == 3 else raw_ts
+      self.turnSignalStalkState = self._filter_virtual_turn_stalk(raw_ts)
     else:
       ret.followDistanceS = self._last_follow_distance_s
       self.cruise_buttons = 0
@@ -941,7 +957,7 @@ class CarState(CarStateBase):
         self.cruise_distance = 255
 
       raw_ts = int(stw.get("TurnIndLvr_Stat", 0))
-      self.turnSignalStalkState = 0 if raw_ts == 3 else raw_ts
+      self.turnSignalStalkState = self._filter_virtual_turn_stalk(raw_ts)
     else:
       self.cruise_buttons = 0
       self.turnSignalStalkState = 0

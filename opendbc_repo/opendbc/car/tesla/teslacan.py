@@ -93,22 +93,31 @@ class TeslaCAN:
 
     return self.packer.make_can_msg("APS_eacMonitor", CANBUS.party, values)
 
-  def create_action_request(self, bus: int, msg_stw_actn_req: dict, cruise_button: int) -> tuple[int, int, bytes]:
-    """Create STW_ACTN_RQ to emulate cruise stalk up/down/cancel (Unity parity)."""
-    if msg_stw_actn_req is None:
-      msg_stw_actn_req = {}
-    values = dict(msg_stw_actn_req)
-    values["SpdCtrlLvr_Stat"] = int(cruise_button)
+  def create_stalk_request(self,
+                           bus: int,
+                           msg_stw_actn_req: dict | None,
+                           *,
+                           cruise_button: int | None = None,
+                           turn_signal_stalk_state: int | None = None) -> tuple[int, int, bytes]:
+    """Create STW_ACTN_RQ from the latest observed seed frame."""
+    values = dict(msg_stw_actn_req or {})
+    if cruise_button is not None:
+      values["SpdCtrlLvr_Stat"] = int(cruise_button)
+    if turn_signal_stalk_state is not None:
+      values["TurnIndLvr_Stat"] = int(turn_signal_stalk_state)
+
     counter = (int(values.get("MC_STW_ACTN_RQ", 0)) + 1) % 16
     values["MC_STW_ACTN_RQ"] = counter
     values["CRC_STW_ACTN_RQ"] = 0
 
-    msg = self.packer.make_can_msg("STW_ACTN_RQ", bus, values)
-    # msg[1] is bytes payload
+    msg = self.packer.make_can_msg("STW_ACTN_RQ", int(bus), values)
     dat = msg[1]
-    crc = _crc8_j1850(dat[:7])
-    values["CRC_STW_ACTN_RQ"] = crc
-    return self.packer.make_can_msg("STW_ACTN_RQ", bus, values)
+    values["CRC_STW_ACTN_RQ"] = _crc8_j1850(dat[:7])
+    return self.packer.make_can_msg("STW_ACTN_RQ", int(bus), values)
+
+  def create_action_request(self, bus: int, msg_stw_actn_req: dict, cruise_button: int) -> tuple[int, int, bytes]:
+    """Create STW_ACTN_RQ to emulate cruise stalk up/down/cancel (Unity parity)."""
+    return self.create_stalk_request(int(bus), msg_stw_actn_req, cruise_button=int(cruise_button))
 
 
 
