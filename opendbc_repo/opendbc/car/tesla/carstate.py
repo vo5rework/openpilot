@@ -8,6 +8,7 @@ from openpilot.selfdrive.car.modules.CFG_module import load_bool_param, load_flo
 from openpilot.selfdrive.car.modules.BLNK_module import BLNKController
 from openpilot.selfdrive.car.modules.ALC_module import ALCController
 from openpilot.selfdrive.car.modules.HSO_module import HSOController
+import cereal.messaging as messaging
 from opendbc.can import CANDefine, CANParser
 from opendbc.car import Bus, structs
 from opendbc.car.common.conversions import Conversions as CV
@@ -85,6 +86,8 @@ class CarState(CarStateBase):
     self._prev_pull_button = 0
     self._xnor_last_virtual_btn = 0
     self._xnor_last_virtual_ms = 0
+    self._xnor_last_virtual_turn = 0
+    self._xnor_last_virtual_turn_ms = 0
 
     self.turnSignalStalkState = 0
     self.speed_units = "MPH"
@@ -122,6 +125,8 @@ class CarState(CarStateBase):
     self.blinker_controller = BLNKController()
     self.alca_controller = ALCController()
     self.hso_controller = HSOController()
+    self._alc_plan_services = [s for s in ("modelV2", "lateralPlan") if s in messaging.SERVICE_LIST]
+    self._alc_sm = messaging.SubMaster(self._alc_plan_services, ignore_avg_freq=True) if self._alc_plan_services else None
     self._vego_nan_logged = False
     try:
       self._reload_tinkla_params()
@@ -146,6 +151,64 @@ class CarState(CarStateBase):
     self.enableHSO = bool(self._tinkla.enable_hso)
     self.hsoNumbPeriod = float(self._tinkla.hso_numb_period)
     self.enableACC = bool(self._tinkla.enable_acc)
+
+  def _update_alc_state_from_plan(self, enabled: bool) -> None:
+    if self._alc_sm is None:
+      self.alca_controller.update(False, self, self._param_frame, None)
+      return
+
+    try:
+      self._alc_sm.update(0)
+      plan_msg = None
+      if "modelV2" in self._alc_plan_services:
+        plan_msg = self._alc_sm["modelV2"]
+      if (plan_msg is None) and ("lateralPlan" in self._alc_plan_services):
+        plan_msg = self._alc_sm["lateralPlan"]
+      self.alca_controller.update(bool(enabled), self, self._param_frame, plan_msg)
+    except Exception:
+      self.alca_controller.update(False, self, self._param_frame, None)
+
+  def _apply_alc_blinkers(self, ret) -> None:
+    self.blinker_controller.update_state(self, self._param_frame)
+    self.tap_direction = int(self.blinker_controller.tap_direction)
+
+    hold_dir = 0
+    one_lamp = bool(self.leftBlinkerLamp) != bool(self.rightBlinkerLamp)
+    if self.enableALC and int(self.turnSignalStalkState) == 0:
+      if one_lamp and int(getattr(self, "_alc_tap_latch_until", 0)) <= int(self._param_frame):
+        self._alc_tap_latch_dir = 1 if self.leftBlinkerLamp else 2
+        dur_s = max(2.5, float(self.autoStartAlcaDelay) + 0.5)
+        self._alc_tap_latch_until = int(self._param_frame + dur_s * 100)
+
+      if int(getattr(self, "alca_direction", 0) or 0) in (1, 2):
+        hold_dir = int(self.alca_direction)
+      elif int(getattr(self, "_alc_tap_latch_until", 0)) > int(self._param_frame):
+        hold_dir = int(getattr(self, "_alc_tap_latch_dir", 0) or 0)
+
+    if hold_dir == 1:
+      ret.leftBlinker = True
+      ret.rightBlinker = False
+    elif hold_dir == 2:
+      ret.leftBlinker = False
+      ret.rightBlinker = True
+    else:
+      ret.leftBlinker = bool(self.leftBlinkerLamp) and int(self.turnSignalStalkState) == 0 and int(self.tap_direction) == 1
+      ret.rightBlinker = bool(self.rightBlinkerLamp) and int(self.turnSignalStalkState) == 0 and int(self.tap_direction) == 2
+
+  def _filter_virtual_turn_stalk(self, raw_ts: int) -> int:
+    """Ignore our own virtual STW turn-hold frames so they do not look like a real held stalk."""
+    raw_ts = int(raw_ts or 0)
+    if raw_ts == 3:
+      raw_ts = 0
+
+    vturn = int(getattr(self, "_xnor_last_virtual_turn", 0) or 0)
+    vms = int(getattr(self, "_xnor_last_virtual_turn_ms", 0) or 0)
+    now_ms = int(self._now_ms())
+
+    if raw_ts in (1, 2) and raw_ts == vturn and (0 <= (now_ms - vms) <= 250):
+      return 0
+    return raw_ts
+
   def _calc_speed_limit_target_ms(self, speed_units: str) -> float:
     """Compute target speed for speed-limit matching (Unity parity).
 
@@ -571,7 +634,7 @@ class CarState(CarStateBase):
 
 
       raw_ts = int(stw_seed.get("TurnIndLvr_Stat", 0))
-      self.turnSignalStalkState = 0 if raw_ts == 3 else raw_ts
+      self.turnSignalStalkState = self._filter_virtual_turn_stalk(raw_ts)
     else:
       ret.followDistanceS = self._last_follow_distance_s
       self.cruise_buttons = 0
@@ -593,31 +656,12 @@ class CarState(CarStateBase):
     ret.doorOpen = cp_party.vl["UI_warning"]["anyDoorOpen"] == 1
 
     # Blinkers
-    # Blinkers: modern Teslas report 1=blinking (stalk released), 2=stalk held
-    # Unity ALC uses tap-to-change; expose only "tap/comfort" blink to DesireHelper
+    # Modern Teslas report 1=blinking (stalk released), 2=stalk held.
     self.leftBlinkerLamp = cp_party.vl["UI_warning"]["leftBlinkerBlinking"] != 0
     self.rightBlinkerLamp = cp_party.vl["UI_warning"]["rightBlinkerBlinking"] != 0
 
-    self.blinker_controller.update_state(self, self._param_frame)
-    self.tap_direction = int(self.blinker_controller.tap_direction)
-
-    # Unity parity: latch tap/comfort blinkers so DesireHelper sees continuous one_blinker during auto-start delay
-    if self.enableALC and (self.turnSignalStalkState == 0):
-      one = (self.leftBlinkerLamp != self.rightBlinkerLamp)
-      if one and int(getattr(self, '_alc_tap_latch_until', 0)) <= self._param_frame:
-        self._alc_tap_latch_dir = 1 if self.leftBlinkerLamp else 2
-        dur_s = max(2.5, float(self.autoStartAlcaDelay) + 0.5)
-        self._alc_tap_latch_until = int(self._param_frame + dur_s * 100)
-      if int(getattr(self, '_alc_tap_latch_until', 0)) > self._param_frame:
-        ret.leftBlinker = (self._alc_tap_latch_dir == 1)
-        ret.rightBlinker = (self._alc_tap_latch_dir == 2)
-      else:
-        ret.leftBlinker = False
-        ret.rightBlinker = False
-    else:
-      # stock behavior (incl. full stalk)
-      ret.leftBlinker = self.leftBlinkerLamp
-      ret.rightBlinker = self.rightBlinkerLamp
+    self._update_alc_state_from_plan(bool(self.cruiseEnabled))
+    self._apply_alc_blinkers(ret)
 
     # HSO (Unity parity): use handsOnLevel for steeringPressed when enabled, but never during blinkers (preserve ALC)
     self.HSOSteeringPressed = bool(getattr(self, "hands_on_level", 0.0) >= float(self._tinkla.hands_on_level))
@@ -723,7 +767,7 @@ class CarState(CarStateBase):
     # Unity parity: separate max cruise (planner/UI) from actual stock set speed when adaptive is enabled.
     try:
       prev_adapt = bool(getattr(self, "_prev_enable_adaptive_cruise", False))
-      now_adapt = bool(getattr(self, "enable_adaptive_cruise", False) or getattr(self, "enableACC", False))
+      now_adapt = bool(getattr(self, "enable_adaptive_cruise", False))
       uom = str(getattr(self, "speed_units", "MPH") or "MPH")
       use_sl = bool(getattr(self._tinkla, "adjust_acc_with_speed_limit", False))
       sl_target_ms = float(self._calc_speed_limit_target_ms(uom)) if use_sl else 0.0
@@ -769,9 +813,10 @@ class CarState(CarStateBase):
       else:
         ret.cruiseState.speedCluster = max(float(ret.cruiseState.speed or 0.0), 1e-3)
 
+      ret.adaptiveCruiseEnabled = bool(now_adapt)
       self._prev_enable_adaptive_cruise = bool(now_adapt)
     except Exception:
-      pass
+      ret.adaptiveCruiseEnabled = bool(getattr(self, "enable_adaptive_cruise", False))
 
 
     return ret
@@ -912,7 +957,7 @@ class CarState(CarStateBase):
         self.cruise_distance = 255
 
       raw_ts = int(stw.get("TurnIndLvr_Stat", 0))
-      self.turnSignalStalkState = 0 if raw_ts == 3 else raw_ts
+      self.turnSignalStalkState = self._filter_virtual_turn_stalk(raw_ts)
     else:
       self.cruise_buttons = 0
       self.turnSignalStalkState = 0
@@ -938,26 +983,8 @@ class CarState(CarStateBase):
     self.leftBlinkerLamp = cp_chassis.vl["GTW_carState"]["BC_indicatorLStatus"] == 1
     self.rightBlinkerLamp = cp_chassis.vl["GTW_carState"]["BC_indicatorRStatus"] == 1
 
-    self.blinker_controller.update_state(self, self._param_frame)
-    self.tap_direction = int(self.blinker_controller.tap_direction)
-
-    # Unity parity: latch tap/comfort blinkers so DesireHelper sees continuous one_blinker during auto-start delay
-    if self.enableALC and (self.turnSignalStalkState == 0):
-      one = (self.leftBlinkerLamp != self.rightBlinkerLamp)
-      if one and int(getattr(self, '_alc_tap_latch_until', 0)) <= self._param_frame:
-        self._alc_tap_latch_dir = 1 if self.leftBlinkerLamp else 2
-        dur_s = max(2.5, float(self.autoStartAlcaDelay) + 0.5)
-        self._alc_tap_latch_until = int(self._param_frame + dur_s * 100)
-      if int(getattr(self, '_alc_tap_latch_until', 0)) > self._param_frame:
-        ret.leftBlinker = (self._alc_tap_latch_dir == 1)
-        ret.rightBlinker = (self._alc_tap_latch_dir == 2)
-      else:
-        ret.leftBlinker = False
-        ret.rightBlinker = False
-    else:
-      # stock behavior (incl. full stalk)
-      ret.leftBlinker = self.leftBlinkerLamp
-      ret.rightBlinker = self.rightBlinkerLamp
+    self._update_alc_state_from_plan(bool(self.cruiseEnabled))
+    self._apply_alc_blinkers(ret)
 
     # HSO (Unity parity): use handsOnLevel for steeringPressed when enabled, but never during blinkers (preserve ALC)
     self.HSOSteeringPressed = bool(getattr(self, "hands_on_level", 0.0) >= float(self._tinkla.hands_on_level))
@@ -1011,6 +1038,8 @@ class CarState(CarStateBase):
 
 
       pass
+
+    ret.adaptiveCruiseEnabled = bool(getattr(self, "enable_adaptive_cruise", False))
 
 
     return ret

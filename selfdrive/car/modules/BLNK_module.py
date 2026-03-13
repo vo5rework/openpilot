@@ -1,9 +1,10 @@
 """/data/openpilot/selfdrive/car/modules/BLNK_module.py
 
-Unity-style "tap blinker" detection.
+Unity-style "tap blinker" detection for Tesla ALC parity.
 
-- Tap/comfort indicator triggers ALC.
-- Tap direction is held until the indicator lamp turns off (comfort blink finished).
+- A short stalk tap is remembered as `tap_direction`.
+- The tap stays alive while the lane change is actively owned in that direction.
+- Once the comfort-blink window has elapsed and ALC is no longer using that direction, the tap clears.
 """
 
 from __future__ import annotations
@@ -15,6 +16,7 @@ from dataclasses import dataclass
 class _TapState:
   tap_direction: int = 0
   blinker_on_frame_start: int = 0
+  blinker_on_frame_end: int = 0
   prev_turnSignalStalkState: int = 0
 
 
@@ -34,35 +36,30 @@ class BLNKController:
   def _reset(self) -> None:
     self._s.tap_direction = 0
     self._s.blinker_on_frame_start = 0
-
-  def _lamp_active(self, CS) -> bool:
-    if self._s.tap_direction == 1:
-      return bool(getattr(CS, "leftBlinkerLamp", False))
-    if self._s.tap_direction == 2:
-      return bool(getattr(CS, "rightBlinkerLamp", False))
-    return False
+    self._s.blinker_on_frame_end = 0
 
   def update_state(self, CS, frame: int) -> None:
     stalk = int(getattr(CS, "turnSignalStalkState", 0) or 0)
+    alca_direction = int(getattr(CS, "alca_direction", 0) or 0)
 
-    # opposite direction => cancel
     if self._s.tap_direction and stalk and self._s.tap_direction != stalk:
       self._reset()
 
-    # rising edge
     if stalk and self._s.prev_turnSignalStalkState == 0:
       self._s.blinker_on_frame_start = int(frame)
-
-    # falling edge => tap?
-    elif stalk == 0 and self._s.prev_turnSignalStalkState:
-      dur = int(frame) - int(self._s.blinker_on_frame_start)
-      if 0 <= dur <= self.tap_detect_frames:
+    elif stalk == 0 and self._s.prev_turnSignalStalkState > 0:
+      if (int(frame) - int(self._s.blinker_on_frame_start)) <= self.tap_detect_frames:
         self._s.tap_direction = int(self._s.prev_turnSignalStalkState)
+        self._s.blinker_on_frame_end = int(frame)
       else:
         self._reset()
 
-    # keep tap until lamp ends
-    if self._s.tap_direction and stalk == 0 and (not self._lamp_active(CS)):
+    if (
+      self._s.tap_direction > 0
+      and (int(frame) - int(self._s.blinker_on_frame_start)) > self.tap_detect_frames
+      and (int(frame) - int(self._s.blinker_on_frame_end)) > self.tap_detect_frames
+      and int(alca_direction) != int(self._s.tap_direction)
+    ):
       self._reset()
 
     self._s.prev_turnSignalStalkState = stalk
