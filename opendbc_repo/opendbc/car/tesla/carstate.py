@@ -112,6 +112,8 @@ class CarState(CarStateBase):
     self.tap_direction = 0
     self._alc_tap_latch_dir = 0
     self._alc_tap_latch_until = 0
+    self._alc_rearm_after_frame = 0
+    self._prev_alca_direction = 0
     self.alca_direction = 0  # 0-none, 1-left, 2-right
     self.alca_pre_engage = False
     self.prev_alca_pre_engage = False
@@ -172,16 +174,24 @@ class CarState(CarStateBase):
     self.blinker_controller.update_state(self, self._param_frame)
     self.tap_direction = int(self.blinker_controller.tap_direction)
 
+    current_alca_direction = int(getattr(self, "alca_direction", 0) or 0)
+    prev_alca_direction = int(getattr(self, "_prev_alca_direction", 0) or 0)
+    if prev_alca_direction in (1, 2) and current_alca_direction == 0:
+      # Prevent the trailing held lamp from being re-latched as a fresh tap.
+      self._alc_rearm_after_frame = int(self._param_frame + 55)
+    self._prev_alca_direction = current_alca_direction
+
     hold_dir = 0
     one_lamp = bool(self.leftBlinkerLamp) != bool(self.rightBlinkerLamp)
+    can_relatch = int(self._param_frame) >= int(getattr(self, "_alc_rearm_after_frame", 0))
     if self.enableALC and int(self.turnSignalStalkState) == 0:
-      if one_lamp and int(getattr(self, "_alc_tap_latch_until", 0)) <= int(self._param_frame):
+      if one_lamp and can_relatch and int(getattr(self, "_alc_tap_latch_until", 0)) <= int(self._param_frame):
         self._alc_tap_latch_dir = 1 if self.leftBlinkerLamp else 2
         dur_s = max(2.5, float(self.autoStartAlcaDelay) + 0.5)
         self._alc_tap_latch_until = int(self._param_frame + dur_s * 100)
 
-      if int(getattr(self, "alca_direction", 0) or 0) in (1, 2):
-        hold_dir = int(self.alca_direction)
+      if current_alca_direction in (1, 2):
+        hold_dir = current_alca_direction
       elif int(getattr(self, "_alc_tap_latch_until", 0)) > int(self._param_frame):
         hold_dir = int(getattr(self, "_alc_tap_latch_dir", 0) or 0)
 
@@ -196,17 +206,19 @@ class CarState(CarStateBase):
       ret.rightBlinker = bool(self.rightBlinkerLamp) and int(self.turnSignalStalkState) == 0 and int(self.tap_direction) == 2
 
   def _now_ms(self) -> int:
-    return int(time.monotonic() * 1000.0)
+    return int(time.monotonic_ns() // 1_000_000)
 
   def _filter_virtual_turn_stalk(self, raw_ts: int) -> int:
     """Ignore our own virtual STW turn-hold frames so they do not look like a real held stalk."""
     raw_ts = int(raw_ts or 0)
     if raw_ts == 3:
       raw_ts = 0
+
     vturn = int(getattr(self, "_xnor_last_virtual_turn", 0) or 0)
     vms = int(getattr(self, "_xnor_last_virtual_turn_ms", 0) or 0)
     now_ms = int(self._now_ms())
-    if raw_ts in (1, 2) and raw_ts == vturn and 0 <= (now_ms - vms) <= 250:
+
+    if raw_ts in (1, 2) and raw_ts == vturn and (0 <= (now_ms - vms) <= 250):
       return 0
     return raw_ts
 
@@ -813,7 +825,6 @@ class CarState(CarStateBase):
           pass
       else:
         ret.cruiseState.speedCluster = max(float(ret.cruiseState.speed or 0.0), 1e-3)
-
       self._prev_enable_adaptive_cruise = bool(now_adapt)
     except Exception:
       pass
@@ -1037,7 +1048,6 @@ class CarState(CarStateBase):
 
 
       pass
-
 
 
     return ret
