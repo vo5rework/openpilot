@@ -367,7 +367,10 @@ static void generic_rx_checks(void) {
   regen_braking_prev = regen_braking;
 
   // exit controls on rising edge of steering override/disengage
-  if (steering_disengage && !steering_disengage_prev) {
+  // Tesla legacy keeps controls_allowed latched through temporary EPAS steering inhibits,
+  // and blocks only steering actuation locally in its tx hook so HSO can resume without
+  // requiring a fresh re-arm edge.
+  if ((current_safety_mode != SAFETY_TESLA_LEGACY) && steering_disengage && !steering_disengage_prev) {
     controls_allowed = false;
   }
   steering_disengage_prev = steering_disengage;
