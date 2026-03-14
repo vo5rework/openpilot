@@ -49,9 +49,10 @@ static bool tesla_legacy_autopilot_enabled = false;  // 0x399
 static bool tesla_legacy_eac_enabled = false;        // 0x219
 static bool tesla_legacy_autopark_enabled = false;   // 0x219
 
-// hands on wheel (from 0x370)
+// hands on wheel / temporary steer inhibit (from 0x370)
 static bool tesla_legacy_hands_on = false;
 static uint32_t tesla_legacy_hands_on_last_signal = 0U;
+static bool tesla_legacy_steer_inhibit = false;
 
 // time tracking for HUD hiding after disengage
 static uint32_t tesla_legacy_time_op_disengaged = 0U;
@@ -134,12 +135,13 @@ static void tesla_legacy_rx_hook(const CANPacket_t *msg) {
       tesla_legacy_hands_on = dt <= TESLA_LEGACY_TIME_FOR_HANDS_ON_US;
     }
 
-    // Unity parity: do NOT disengage on hands-on escalation; only on EPAS inhibit/error.
-    const bool disengage = ((eac_status == 0) && (eac_error_code == 9));
-    steering_disengage = disengage;
-    if (disengage) {
-      controls_allowed = false;
-    }
+    // Keep controls_allowed latched through temporary EPAS inhibits so lateral can resume
+    // after HSO without requiring a new engage edge. The tx hook blocks steer actuation
+    // while the inhibit is present.
+    tesla_legacy_steer_inhibit = (eac_status == 0);
+
+    // Unity parity: expose only the high-angle-rate safety event as steering_disengage.
+    steering_disengage = tesla_legacy_steer_inhibit && (eac_error_code == 9);
   }
 
   // Unity stalk gating on 0x45 (bus0)
@@ -206,7 +208,7 @@ static bool tesla_legacy_tx_hook(const CANPacket_t *msg) {
     tesla_legacy_op_autopilot_disabled = (b5 & 0x80U) != 0U;
     tesla_legacy_op_stalk_main_edge = (b5 & 0x02U) != 0U;
     tesla_legacy_op_stalk_cancel_edge = (b5 & 0x01U) != 0U;
-        if (tesla_legacy_op_stalk_enable && (!tesla_legacy_has_ap_hw || tesla_legacy_op_autopilot_disabled)) {
+    if (tesla_legacy_op_stalk_enable && (!tesla_legacy_has_ap_hw || tesla_legacy_op_autopilot_disabled)) {
       if (tesla_legacy_op_stalk_main_edge) {
         pcm_cruise_check(true);
       }
@@ -249,6 +251,16 @@ static bool tesla_legacy_tx_hook(const CANPacket_t *msg) {
 
       const int raw_angle_can = (((int)(msg->data[0] & 0x7FU)) << 8) | (int)msg->data[1];
       const int desired_angle = raw_angle_can - 16384;
+
+      if (tesla_legacy_steer_inhibit) {
+        if (steer_control_enabled) {
+          return false;
+        }
+        if ((desired_angle < (angle_meas.min - 1)) || (desired_angle > (angle_meas.max + 1))) {
+          return false;
+        }
+        return true;
+      }
 
       if (!controls_allowed) {
         if (!tesla_legacy_hands_on) {
@@ -353,7 +365,7 @@ static bool tesla_legacy_fwd_msg_hook(int bus_num, CANPacket_t *to_fwd) {
 
   // Unity mods only on main panda with AP HW
   if (!tesla_legacy_has_ap_hw) {
-        if (tesla_legacy_op_stalk_enable && (!tesla_legacy_has_ap_hw || tesla_legacy_op_autopilot_disabled)) {
+    if (tesla_legacy_op_stalk_enable && (!tesla_legacy_has_ap_hw || tesla_legacy_op_autopilot_disabled)) {
       if (tesla_legacy_op_stalk_main_edge) {
         pcm_cruise_check(true);
       }
@@ -436,6 +448,7 @@ static safety_config tesla_legacy_init(uint16_t param) {
 
   tesla_legacy_hands_on = false;
   tesla_legacy_hands_on_last_signal = 0U;
+  tesla_legacy_steer_inhibit = false;
 
   tesla_legacy_time_op_disengaged = microsecond_timer_get();
   tesla_legacy_controls_allowed_prev = false;
