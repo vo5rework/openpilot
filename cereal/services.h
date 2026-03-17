@@ -83,9 +83,12 @@ static std::map<std::string, service> services = {
   { "livestreamWideRoadEncodeData", {"livestreamWideRoadEncodeData", false, 20, -1}},
   { "livestreamRoadEncodeData", {"livestreamRoadEncodeData", false, 20, -1}},
   { "livestreamDriverEncodeData", {"livestreamDriverEncodeData", false, 20, -1}},
+  { "mapdOut", {"mapdOut", true, 20, 20}},
+  { "mapdExtendedOut", {"mapdExtendedOut", false, 1, -1}},
+  { "mapdIn", {"mapdIn", false, 0, -1}},
+  { "mapdCli", {"mapdCli", false, 0, -1}},
   { "customReservedRawData0", {"customReservedRawData0", true, 0, -1}},
   { "customReservedRawData1", {"customReservedRawData1", true, 0, -1}},
   { "customReservedRawData2", {"customReservedRawData2", true, 0, -1}},
 };
 #endif
-
