@@ -383,8 +383,39 @@ static bool tesla_legacy_fwd_msg_hook(int bus_num, CANPacket_t *to_fwd) {
     return false;
   }
 
-  // bus2 -> bus0: hide HUD faults for ~4s after disengage
+  // bus2 -> bus0: mutate forwarded HUD status for OP ownership on legacy AP cars
   if (bus_num == 2) {
+    // Active OP ownership: keep stock speed-limit fields, only lift status/failure bits.
+    if (controls_allowed && tesla_legacy_op_autopilot_disabled &&
+        !tesla_legacy_autopilot_enabled && !tesla_legacy_eac_enabled && !tesla_legacy_autopark_enabled) {
+      if (addr == 0x389) {
+        uint32_t w0 = (uint32_t)GET_BYTES(to_fwd, 0, 4);
+        uint32_t w1 = (uint32_t)GET_BYTES(to_fwd, 4, 4);
+        w0 &= 0xFFFF3FFFU;   // DAS_activationFailureStatus = 0
+        w1 &= 0x00FFFFFFU;   // clear checksum byte before recompute
+        to_fwd->data[0] = (uint8_t)(w0 & 0xFFU);
+        to_fwd->data[1] = (uint8_t)((w0 >> 8) & 0xFFU);
+        to_fwd->data[2] = (uint8_t)((w0 >> 16) & 0xFFU);
+        to_fwd->data[3] = (uint8_t)((w0 >> 24) & 0xFFU);
+        to_fwd->data[4] = (uint8_t)(w1 & 0xFFU);
+        to_fwd->data[5] = (uint8_t)((w1 >> 8) & 0xFFU);
+        to_fwd->data[6] = (uint8_t)((w1 >> 16) & 0xFFU);
+        to_fwd->data[7] = (uint8_t)((w1 >> 24) & 0xFFU);
+        tesla_legacy_set_last_byte_checksum(to_fwd);
+      } else if (addr == 0x399) {
+        // AutopilotStatus is the LOW nibble on this DBC. Unity HUD used state 5 when enabled.
+        to_fwd->data[0] = (to_fwd->data[0] & 0xF0U) | 0x05U;
+        tesla_legacy_set_last_byte_checksum(to_fwd);
+      } else if ((addr == 0x329) || (addr == 0x349) || (addr == 0x369)) {
+        for (int i = 0; i < GET_LEN(to_fwd); i++) {
+          to_fwd->data[i] = 0U;
+        }
+        tesla_legacy_set_last_byte_checksum(to_fwd);
+      } else {
+      }
+    }
+
+    // Just after disengage: keep the existing warning-hide behavior.
     if (!controls_allowed && !tesla_legacy_autopilot_enabled) {
       const uint32_t dt = get_ts_elapsed(microsecond_timer_get(), tesla_legacy_time_op_disengaged);
       if (dt <= TESLA_LEGACY_TIME_TO_HIDE_ERRORS_US) {
@@ -447,8 +478,6 @@ static safety_config tesla_legacy_init(uint16_t param) {
     {0x27D, 0, 3, .check_relay = false},  // APS_eacMonitor
     {0x659, 0, 8, .check_relay = false},  // OP->safety internal carrier (blocked in tx_hook)
     {0x45, 0, 8, .check_relay = false},  // STW_ACTN_RQ
-    {0x399, 0, 8, .check_relay = false},  // DAS_status / blue-D IC state
-    {0x389, 0, 8, .check_relay = false},  // DAS_status2 / paired IC state
 
   };
 
