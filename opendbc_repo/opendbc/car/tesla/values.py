@@ -182,9 +182,9 @@ class CarControllerParams:
   # EPAS faults above this angle
   360,  # deg
 
-  # Unity C3 parity angle rate limits
-  ([0., 5., 15.], [6.0, 5.0, 1.2]),   # up
-  ([0., 5., 15.], [6.0, 6.5, 3.0]),   # down
+  # Slightly stronger turn-in than the prior tune, while keeping the same shape.
+  ([0., 5., 15.], [7.0, 6.0, 1.5]),   # up
+  ([0., 5., 15.], [7.0, 7.3, 3.5]),   # down
 
   # v2 (vehicle model) fields unused by std limiter
   MAX_LATERAL_ACCEL=ISO_LATERAL_ACCEL + (ACCELERATION_DUE_TO_GRAVITY * AVERAGE_ROAD_ROLL),

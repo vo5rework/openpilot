@@ -268,8 +268,8 @@ static bool tesla_legacy_tx_hook(const CANPacket_t *msg) {
 
       const AngleSteeringParams params = {
         .slip_factor = -0.000580374383851451f,
-        .steer_ratio = 12.0f,
-        .wheelbase = 2.89f,
+        .steer_ratio = 15.0f,
+        .wheelbase = 2.96f,
       };
 
       return !steer_angle_cmd_checks_vm(desired_angle, steer_control_enabled, limits, params);

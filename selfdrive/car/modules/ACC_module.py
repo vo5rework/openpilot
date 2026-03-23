@@ -8,8 +8,8 @@ This keeps the Unity-style owner split:
 - Speed-limit changes may raise that ceiling, but automated slowdowns do not lower it.
 
 The acceleration side is tuned to feel more natural:
-- automated recovery uses only 1-step RES presses
-- cadence speeds up for large clear-road gaps
+- larger clear-road jumps begin with one or two 5-step RES pulses
+- recovery then tapers into 1-step RES pulses for a smoother finish
 - cadence stays slower just after a lead clears so recovery does not feel jerky
 """
 
@@ -55,9 +55,10 @@ class ACCController:
 
   _HUMAN_COOLDOWN_MS = 3000
   _AUTO_COOLDOWN_MS = 400
-  _AUTO_COOLDOWN_ACCEL_BASE_MS = 700
-  _AUTO_COOLDOWN_ACCEL_FAST_MS = 550
-  _AUTO_COOLDOWN_ACCEL_SLOW_MS = 950
+  _AUTO_COOLDOWN_ACCEL_BASE_MS = 650
+  _AUTO_COOLDOWN_ACCEL_FAST_MS = 500
+  _AUTO_COOLDOWN_ACCEL_SLOW_MS = 900
+  _AUTO_COOLDOWN_ACCEL_FULL_MS = 950
   _ACCEL_AFTER_LEAD_CLEAR_SETTLE_MS = 700
   _FAST_DECEL_RESUME_HOLDOFF_MS = 2000
   _LEAD_FRESH_MS = 700
@@ -76,6 +77,7 @@ class ACCController:
 
     self._last_auto_button = int(CruiseButtons.IDLE)
     self._last_auto_button_time_ms = 0
+    self._accel_burst_steps_remaining = 0
 
     self.fast_decel_time_ms = 0
     self.lead_last_seen_time_ms = 0
@@ -215,6 +217,76 @@ class ACCController:
 
     return int(self._AUTO_COOLDOWN_ACCEL_BASE_MS)
 
+
+  def _reset_accel_burst(self) -> None:
+    self._accel_burst_steps_remaining = 0
+
+  def _prime_accel_burst(self, *, speed_offset_kph: float, available_speed_kph: float, full_kph: float) -> None:
+    if float(available_speed_kph) < max(float(full_kph) - 0.2, 3.5):
+      self._accel_burst_steps_remaining = 0
+      return
+
+    if float(speed_offset_kph) >= (2.75 * float(full_kph)):
+      self._accel_burst_steps_remaining = 2
+    elif float(speed_offset_kph) >= (1.50 * float(full_kph)):
+      self._accel_burst_steps_remaining = 1
+    else:
+      self._accel_burst_steps_remaining = 0
+
+  def _choose_accel_button(
+    self,
+    *,
+    now_ms: int,
+    speed_units: str,
+    speed_offset_kph: float,
+    available_speed_kph: float,
+    lead: LeadInfo,
+  ) -> Optional[int]:
+    half_kph, full_kph = _cc_units_kph(speed_units)
+    single_threshold_kph = max(0.75 * float(half_kph), 0.8)
+    single_available_threshold_kph = max(float(half_kph) - 0.05, 0.5)
+    full_available_threshold_kph = max(float(full_kph) - 0.2, 3.5)
+    recent_lead_clear = (int(now_ms) - int(self._lead_cleared_time_ms)) <= int(self._ACCEL_AFTER_LEAD_CLEAR_SETTLE_MS)
+
+    if lead.status or recent_lead_clear:
+      self._reset_accel_burst()
+    elif int(self._accel_burst_steps_remaining) <= 0:
+      self._prime_accel_burst(
+        speed_offset_kph=float(speed_offset_kph),
+        available_speed_kph=float(available_speed_kph),
+        full_kph=float(full_kph),
+      )
+
+    if int(self._accel_burst_steps_remaining) > 0:
+      full_ready = self._no_automated_action_for(now_ms=now_ms, milliseconds=self._AUTO_COOLDOWN_ACCEL_FULL_MS)
+      full_gap_threshold_kph = max(1.10 * float(full_kph), single_threshold_kph)
+      if (
+        full_ready
+        and float(speed_offset_kph) >= float(full_gap_threshold_kph)
+        and float(available_speed_kph) >= float(full_available_threshold_kph)
+      ):
+        self._accel_burst_steps_remaining = max(0, int(self._accel_burst_steps_remaining) - 1)
+        return int(CruiseButtons.RES_ACCEL_2ND)
+
+      if float(speed_offset_kph) < float(full_gap_threshold_kph):
+        self._reset_accel_burst()
+
+    accel_cooldown_ms = self._accel_cooldown_ms(
+      now_ms=now_ms,
+      speed_offset_kph=float(speed_offset_kph),
+      available_speed_kph=float(available_speed_kph),
+      lead=lead,
+    )
+    accel_ready = self._no_automated_action_for(now_ms=now_ms, milliseconds=accel_cooldown_ms)
+    if (
+      accel_ready
+      and float(speed_offset_kph) >= float(single_threshold_kph)
+      and float(available_speed_kph) >= float(single_available_threshold_kph)
+    ):
+      return int(CruiseButtons.RES_ACCEL)
+
+    return None
+
   def _fast_decel_required(self, *, v_ego_ms: float, lead: LeadInfo) -> bool:
     if not lead.status or lead.d_rel <= 0.0:
       return False
@@ -336,8 +408,10 @@ class ACCController:
       if self._manual_lower_hold_active or float(self._manual_hold_restore_ceiling_kph) > 0.0:
         self._manual_hold_restore_requested = True
       self._manual_lower_hold_active = False
+      self._reset_accel_burst()
 
     if not enabled:
+      self._reset_accel_burst()
       return AccDecision(None, "gated: not enabled")
 
     target_kph_seed = max(float(current_kph), float(desired_speed_ms) * CV.MS_TO_KPH)
@@ -437,21 +511,20 @@ class ACCController:
     elif speed_offset_kph < (-0.9 * float(half_kph)) and current_kph > 0.0:
       button = int(CruiseButtons.DECEL_SET)
     elif float(v_ego_ms) > float(self.MIN_CRUISE_SPEED_MS):
-      accel_cooldown_ms = self._accel_cooldown_ms(
+      button = self._choose_accel_button(
         now_ms=now_ms,
+        speed_units=speed_units,
         speed_offset_kph=float(speed_offset_kph),
         available_speed_kph=float(available_speed_kph),
         lead=lead,
       )
-      accel_ready = self._no_automated_action_for(now_ms=now_ms, milliseconds=accel_cooldown_ms)
-      accel_threshold_kph = max(0.75 * float(half_kph), 0.8)
-      available_threshold_kph = max(float(half_kph) - 0.05, 0.5)
-      if accel_ready and speed_offset_kph >= float(accel_threshold_kph) and available_speed_kph >= float(available_threshold_kph):
-        button = int(CruiseButtons.RES_ACCEL)
 
     if button is None:
       reason = "no-op[min_hold]" if min_hold_active else "no-op"
       return AccDecision(None, reason, target_kph, current_kph, current_kph)
+
+    if button is not None and not CruiseButtons.is_accel(button):
+      self._reset_accel_burst()
 
     if CruiseButtons.is_decel(button):
       if int(button) == int(CruiseButtons.DECEL_2ND) and (float(current_kph) - float(full_kph)) < float(min_cruise_kph):
