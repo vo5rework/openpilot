@@ -179,18 +179,18 @@ class CruiseButtons:
     return btn in (cls.DECEL_SET, cls.DECEL_2ND)
 class CarControllerParams:
   ANGLE_LIMITS: AngleSteeringLimits = AngleSteeringLimits(
-  # EPAS faults above this angle
-  360,  # deg
+    # EPAS faults above this angle
+    360,  # deg
 
-  # Unity C3 parity angle rate limits
-  ([0., 5., 15.], [5., 4., 0.75]),   # up
-  ([0., 5., 15.], [5., 5.5, 2.4]),   # down
+    # Slightly quicker turn-in than Unity parity without reintroducing abrupt steering.
+    ([0., 5., 15.], [5.5, 4.5, 1.0]),   # up
+    ([0., 5., 15.], [5.5, 6.0, 2.8]),   # down
 
-  # v2 (vehicle model) fields unused by std limiter
-  MAX_LATERAL_ACCEL=ISO_LATERAL_ACCEL + (ACCELERATION_DUE_TO_GRAVITY * AVERAGE_ROAD_ROLL),
-  MAX_LATERAL_JERK=3.0 + (ACCELERATION_DUE_TO_GRAVITY * AVERAGE_ROAD_ROLL),
-  MAX_ANGLE_RATE=5,
-)
+    # v2 (vehicle model) fields unused by std limiter
+    MAX_LATERAL_ACCEL=ISO_LATERAL_ACCEL + (ACCELERATION_DUE_TO_GRAVITY * AVERAGE_ROAD_ROLL),
+    MAX_LATERAL_JERK=3.0 + (ACCELERATION_DUE_TO_GRAVITY * AVERAGE_ROAD_ROLL),
+    MAX_ANGLE_RATE=6.5,
+  )
 
   STEER_STEP = 2  # Angle command is sent at 50 Hz
   ACCEL_MAX = 2.0    # m/s^2

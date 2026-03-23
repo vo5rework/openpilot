@@ -73,7 +73,6 @@ class CarController(CarControllerBase):
     self.apply_angle_last = 0.0
     self._lat_active_prev = False
     self._steer_warmup_until_frame = -1
-    self._steer_settle_until_frame = -1
 
     self._speed_sync_last_frame = -100000
     # Unity-parity pacing for automated cruise stalk presses
@@ -92,7 +91,8 @@ class CarController(CarControllerBase):
     self._xnor_diag_last_log_ms = 0
     self._body_controls_prev_turn = 0
     self._virtual_turn_prev = 0
-    self._virtual_turn_last_observed_counter = None
+    self._virtual_turn_last_send_frame = -100000
+    self._hud_prev_enabled = False
 
     if CP.carFingerprint in LEGACY_CARS:
       if CP.carFingerprint in (CAR.TESLA_MODEL_S_HW1, CAR.TESLA_MODEL_X_HW1):
@@ -197,25 +197,6 @@ class CarController(CarControllerBase):
       self._action_can_by_bus.get(int(CANBUS.party)) or
       next(iter(self._action_can_by_bus.values()))
     )
-
-  def _stw_observed_counter(self, CS) -> int | None:
-    msg = getattr(CS, "msg_stw_actn_req", None)
-    if msg is None:
-      return None
-
-    try:
-      counter = msg.get("MC_STW_ACTN_RQ", None)
-    except Exception:
-      return None
-
-    if counter is None:
-      return None
-
-    try:
-      return int(counter)
-    except Exception:
-      return None
-
   def _send_stw(self, CS, can_sends, btn: int, *, bus: int | None = None, turn_signal_stalk_state: int | None = None) -> bool:
     msg = getattr(CS, "msg_stw_actn_req", None)
     if msg is None:
@@ -286,20 +267,13 @@ class CarController(CarControllerBase):
     # and send one explicit release when that ownership ends.
     if self.CP.carFingerprint in LEGACY_CARS:
       prev_hold_turn = int(getattr(self, "_virtual_turn_prev", 0) or 0)
-      observed_counter = self._stw_observed_counter(CS)
-      last_observed_counter = getattr(self, "_virtual_turn_last_observed_counter", None)
-
-      counter_advanced = (
-        observed_counter is not None and
-        last_observed_counter is not None and
-        int(observed_counter) != int(last_observed_counter)
-      )
+      last_send_frame = int(getattr(self, "_virtual_turn_last_send_frame", -100000) or -100000)
 
       send_turn = None
       if hold_turn in (1, 2):
-        # Unity parity: first hold frame sends immediately, then refreshes only when the
-        # incoming STW_ACTN_RQ counter advances instead of on a free-running controller timer.
-        if hold_turn != prev_hold_turn or bool(counter_advanced):
+        # Align the virtual held-stalk cadence to the moment ownership starts, so the
+        # physical lamp continues with the same rhythm as the initial comfort tap.
+        if hold_turn != prev_hold_turn or (int(self.frame) - last_send_frame) >= 10:
           send_turn = int(hold_turn)
       elif prev_hold_turn in (1, 2):
         # Release immediately when the owned lane change ends.
@@ -313,10 +287,81 @@ class CarController(CarControllerBase):
           bus=int(self._stw_bus(CS)),
           turn_signal_stalk_state=int(send_turn),
         )
+        self._virtual_turn_last_send_frame = int(self.frame)
 
       self._virtual_turn_prev = int(hold_turn)
-      self._virtual_turn_last_observed_counter = observed_counter
 
+
+
+  def _hud_alca_state(self, CS) -> int:
+    turn = int(getattr(CS, "alca_direction", 0) or 0)
+    if bool(getattr(CS, "alca_pre_engage", False) or getattr(CS, "alca_engaged", False)) and turn in (1, 2):
+      return 8 + turn
+    return 1
+
+  def _hud_speed_limit_uom(self, CS) -> float:
+    limit_ms = float(getattr(CS, "speed_limit_ms", 0.0) or 0.0)
+    units = str(getattr(CS, "speed_units", "MPH"))
+    return max(0.0, limit_ms * (CV.MS_TO_KPH if units == "KPH" else CV.MS_TO_MPH))
+
+  def _process_hud_status(self, CC, CS, can_sends, human_control: bool) -> None:
+    op_enabled = bool(getattr(CC, "enabled", False) or getattr(CC, "latActive", False))
+    prev_enabled = bool(getattr(self, "_hud_prev_enabled", False))
+    should_send = bool(self._cached_autopilot_disabled or op_enabled or prev_enabled)
+    if not should_send:
+      self._hud_prev_enabled = op_enabled
+      return
+
+    disable_edge = prev_enabled and (not op_enabled)
+    if (self.frame % 10 != 0) and (not disable_edge):
+      self._hud_prev_enabled = op_enabled
+      return
+
+    cs_out = getattr(CS, "out", None)
+    in_drive = not bool(getattr(CS, "carNotInDrive", False))
+    das_op_status = 5 if op_enabled else (2 if in_drive else 1)
+    das_csa_state = 2 if op_enabled else (1 if in_drive else 0)
+    hands_on_state = 3 if bool(human_control) else 2
+    cruise_speed_mph = 0.0
+    if cs_out is not None:
+      try:
+        cruise_speed_mph = float(getattr(cs_out.cruiseState, "speed", 0.0) or 0.0) * CV.MS_TO_MPH
+      except Exception:
+        cruise_speed_mph = 0.0
+      if cruise_speed_mph <= 0.0:
+        try:
+          cruise_speed_mph = float(getattr(cs_out, "vEgo", 0.0) or 0.0) * CV.MS_TO_MPH
+        except Exception:
+          cruise_speed_mph = 0.0
+
+    counter = (self.frame // 10) % 16
+    hud_can = self._action_can_for_bus(int(CANBUS.party))
+    can_sends.append(
+      hud_can.create_das_status(
+        das_op_status,
+        0,
+        0,
+        hands_on_state,
+        self._hud_alca_state(CS),
+        bool(getattr(cs_out, "leftBlindspot", False)) if cs_out is not None else False,
+        bool(getattr(cs_out, "rightBlindspot", False)) if cs_out is not None else False,
+        self._hud_speed_limit_uom(CS),
+        das_csa_state,
+        0,
+        int(CANBUS.party),
+        counter,
+      )
+    )
+    can_sends.append(
+      hud_can.create_das_status2(
+        das_csa_state,
+        cruise_speed_mph,
+        0,
+        int(CANBUS.party),
+        counter,
+      )
+    )
+    self._hud_prev_enabled = op_enabled
 
   def _body_controls_turn(self, CS) -> int:
     if not bool(getattr(CS, "enableALC", False)):
@@ -427,36 +472,27 @@ class CarController(CarControllerBase):
 
     self._process_stalk_actions(CS, can_sends)
     self._process_body_controls(CS, can_sends)
+    self._process_hud_status(CC, CS, can_sends, human_control)
 
     self._speed_limit_sync(CC, CS, can_sends)
-
-    if steer_inhibit:
-      # After EPAS temporary inhibit / steering disengage clears, wait before resuming lateral.
-      # This keeps controller re-entry aligned with rack recovery and avoids mismatch churn.
-      self._steer_settle_until_frame = int(self.frame) + 80  # ~0.8s at 100Hz
-
-    steer_resume_blocked = bool(
-      steer_inhibit or
-      (int(self.frame) < int(self._steer_settle_until_frame))
-    )
 
     lat_active = (
       bool(CC.latActive) and
       autopilot_disabled and
       (not CS.out.cruiseState.standstill) and
       (not human_control) and
-      (not steer_resume_blocked)
+      (not steer_inhibit)
     )
 
-    # Steering warm-up: after lateral becomes active, command current wheel angle briefly.
-    # This prevents an initial command step when resuming with the rack still settling.
+    # Steering warm-up: for a short window after lateral becomes active, command current wheel angle.
+    # This prevents an initial command step (EPS inhibit) when engaging with the wheel turned.
     if lat_active and (not bool(self._lat_active_prev)):
-      self._steer_warmup_until_frame = int(self.frame) + 50  # ~0.5s at 100Hz
+      self._steer_warmup_until_frame = int(self.frame) + 20  # ~0.2s at 100Hz
     self._lat_active_prev = bool(lat_active)
 
     # Steering (50Hz)
     if self.frame % 2 == 0:
-      if (not lat_active) or human_control or steer_resume_blocked or (int(self.frame) < int(self._steer_warmup_until_frame)):
+      if (not lat_active) or human_control or steer_inhibit or (int(self.frame) < int(self._steer_warmup_until_frame)):
         apply_angle = float(CS.out.steeringAngleDeg)
       else:
         apply_angle = float(apply_std_steer_angle_limits(
@@ -467,11 +503,17 @@ class CarController(CarControllerBase):
           lat_active,
           CarControllerParams.ANGLE_LIMITS,
         ))
-        # Extra guard against first-command steps even after limits
+        # Keep a guard against sudden angle jumps, but give the car more room to
+        # build steering angle before the saturation alert trips in faster corners.
+        steer_guard_delta = float(np.interp(
+          float(getattr(CS.out, "vEgoRaw", CS.out.vEgo)),
+          [0.0, 10.0, 20.0, 30.0],
+          [20.0, 22.0, 25.0, 28.0],
+        ))
         apply_angle = float(np.clip(
           apply_angle,
-          float(CS.out.steeringAngleDeg) - 25.0,
-          float(CS.out.steeringAngleDeg) + 25.0,
+          float(CS.out.steeringAngleDeg) - steer_guard_delta,
+          float(CS.out.steeringAngleDeg) + steer_guard_delta,
         ))
 
       self.apply_angle_last = float(apply_angle)
