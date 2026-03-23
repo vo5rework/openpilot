@@ -268,9 +268,6 @@ static bool tesla_legacy_tx_hook(const CANPacket_t *msg) {
 
       const AngleSteeringParams params = {
         .slip_factor = -0.000580374383851451f,
-        // Legacy S/X use a larger steering ratio and wheelbase than Model 3/Y.
-        // Matching the real platform here avoids safety rejecting otherwise
-        // reasonable angle requests in quicker corner entry.
         .steer_ratio = 15.0f,
         .wheelbase = 2.96f,
       };

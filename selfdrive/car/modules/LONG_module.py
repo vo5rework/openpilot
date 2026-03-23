@@ -51,7 +51,8 @@ class LongController:
   _CURVE_ENTRY_PERSIST_MS = 1000
   _CURVE_EXIT_PERSIST_MS = 600
   _CURVE_EXIT_RECOVERY_MS_PER_S = 1.0
-  _CURVE_MIN_CRUISE_HOLD_MARGIN_MS = 2.0 * CV.MPH_TO_MS
+  _CURVE_MIN_CRUISE_HOLD_MARGIN_MS = 5.0 * CV.MPH_TO_MS
+  _CURVE_MAPD_MIN_HOLD_MARGIN_MS = 0.5 * CV.MPH_TO_MS
   _CURVE_HARD_ENTRY_EXTRA_MS = 3.0 * CV.MPH_TO_MS
   _CURVE_RELEASE_NEAR_TARGET_MARGIN_MS = 1.0 * CV.MPH_TO_MS
   _CURVE_HOLD_DROP_DEADBAND_MS = 2.0 * CV.MPH_TO_MS
@@ -77,6 +78,8 @@ class LongController:
     self._lead_drel: float = 0.0
     self._lead_vrel: float = 0.0
     self._mapd_suggested_ms: Optional[float] = None
+    self._mapd_map_curve_ms: Optional[float] = None
+    self._mapd_vision_curve_ms: Optional[float] = None
     self._mapd_last_ns: int = 0
 
     self._last_info_log_ms: int = 0
@@ -168,6 +171,36 @@ class LongController:
     if not (math.isfinite(suggested_ms) and suggested_ms > 0.1):
       return None
     return suggested_ms
+
+  def _mapd_curve_floor_ms(self, *, now_ns: int) -> Optional[float]:
+    if int(self._mapd_last_ns) <= 0:
+      return None
+    if (int(now_ns) - int(self._mapd_last_ns)) >= int(self._MAPD_FRESH_NS):
+      return None
+
+    candidates: list[float] = []
+    for raw in (self._mapd_map_curve_ms, self._mapd_vision_curve_ms):
+      if raw is None:
+        continue
+      val = float(raw)
+      if math.isfinite(val) and val > 0.1:
+        candidates.append(val)
+    if not candidates:
+      return None
+    return float(max(candidates))
+
+  def _should_hold_min_cruise_for_curve(self, *, now_ns: int, desired_ms: float, no_lead: bool) -> bool:
+    if (not no_lead) or float(desired_ms) >= float(self.MIN_CRUISE_SPEED_MS):
+      return False
+
+    if float(desired_ms) >= (float(self.MIN_CRUISE_SPEED_MS) - float(self._CURVE_MIN_CRUISE_HOLD_MARGIN_MS)):
+      return True
+
+    curve_floor_ms = self._mapd_curve_floor_ms(now_ns=now_ns)
+    if curve_floor_ms is None:
+      return False
+
+    return float(curve_floor_ms) >= (float(self.MIN_CRUISE_SPEED_MS) - float(self._CURVE_MAPD_MIN_HOLD_MARGIN_MS))
 
   def _maybe_release_curve_hold_from_mapd(self, *, now_ms: int, now_ns: int, reference_ms: float) -> bool:
     if not self._curve_hold_active:
@@ -335,9 +368,16 @@ class LongController:
       if bool(self._sm.valid.get("mapdOut", False)):
         mo = self._sm["mapdOut"]
         suggested_ms = float(getattr(mo, "suggestedSpeed", 0.0) or 0.0)
+        map_curve_ms = float(getattr(mo, "mapCurveSpeed", 0.0) or 0.0)
+        vision_curve_ms = float(getattr(mo, "visionCurveSpeed", 0.0) or 0.0)
         mono_ns = int(self._sm.logMonoTime.get("mapdOut", 0) or 0)
-        if mono_ns > 0 and math.isfinite(suggested_ms) and suggested_ms > 0.1:
-          self._mapd_suggested_ms = suggested_ms
+        if mono_ns > 0:
+          if math.isfinite(suggested_ms) and suggested_ms > 0.1:
+            self._mapd_suggested_ms = suggested_ms
+          if math.isfinite(map_curve_ms) and map_curve_ms > 0.1:
+            self._mapd_map_curve_ms = map_curve_ms
+          if math.isfinite(vision_curve_ms) and vision_curve_ms > 0.1:
+            self._mapd_vision_curve_ms = vision_curve_ms
           self._mapd_last_ns = mono_ns
     except Exception:
       pass
@@ -612,6 +652,16 @@ class LongController:
         lead_speed_ms = max(0.0, float(v_ego_ms) + float(self._lead_vrel))
         desired_ms = min(float(desired_ms), max(float(self.MIN_CRUISE_SPEED_MS), float(lead_speed_ms)))
         src = f"{src}+stale_lead"
+
+    no_lead_curve_context = (not self._lead_present) and (not self._lp_has_lead)
+    if self._should_hold_min_cruise_for_curve(
+      now_ns=now_ns,
+      desired_ms=float(desired_ms),
+      no_lead=bool(no_lead_curve_context),
+    ):
+      desired_ms = max(float(desired_ms), float(self.MIN_CRUISE_SPEED_MS))
+      if "min_hold" not in src:
+        src = f"{src}+min_hold"
 
     stock_cruise_enabled = stock_state in ("ENABLED", "OVERRIDE", "STANDSTILL")
     brake_pressed = bool(getattr(cs_out, "brakePressed", False))

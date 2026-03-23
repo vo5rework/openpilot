@@ -63,6 +63,9 @@ class ACCController:
   _LEAD_FRESH_MS = 700
   _AUTOENGAGE_SPEED_WINDOW_MS = 0.8
   _AUTO_ECHO_IGNORE_MS = 750
+  _MIN_CRUISE_HOLD_MARGIN_MS = 5.0 * CV.MPH_TO_MS
+  _MIN_CRUISE_CANCEL_VEGO_MARGIN_MS = 1.0 * CV.MPH_TO_MS
+
 
   def __init__(self) -> None:
     self.human_action_time_ms = 0
@@ -403,18 +406,27 @@ class ACCController:
     if float(desired_speed_ms) <= 0.1 or float(current_set_speed_ms) <= 0.1:
       return AccDecision(None, "gated: missing target/current", current_kph, current_kph, current_kph)
 
-    target_kph = float(desired_speed_ms) * CV.MS_TO_KPH
+    # Keep emergency/below-min handling narrow. On no-lead curve/map targets that dip a
+    # little below Tesla's minimum set-speed, prefer holding MIN instead of dropping ACC.
+    fast_decel_required = self._fast_decel_required(v_ego_ms=v_ego_ms, lead=lead)
+    min_cruise_kph = float(self.MIN_CRUISE_SPEED_MS) * CV.MS_TO_KPH
+
+    min_hold_active = (
+      (not fast_decel_required)
+      and float(desired_speed_ms) < float(self.MIN_CRUISE_SPEED_MS)
+      and float(desired_speed_ms) >= (float(self.MIN_CRUISE_SPEED_MS) - float(self._MIN_CRUISE_HOLD_MARGIN_MS))
+      and float(v_ego_ms) >= (float(self.MIN_CRUISE_SPEED_MS) - float(self._MIN_CRUISE_CANCEL_VEGO_MARGIN_MS))
+      and float(current_set_speed_ms) >= (float(self.MIN_CRUISE_SPEED_MS) - (0.5 * CV.MPH_TO_MS))
+    )
+
+    target_speed_ms = max(float(desired_speed_ms), float(self.MIN_CRUISE_SPEED_MS)) if min_hold_active else float(desired_speed_ms)
+    target_kph = float(target_speed_ms) * CV.MS_TO_KPH
     speed_offset_kph = float(target_kph) - float(current_kph)
     available_speed_kph = max(0.0, float(self.acc_speed_kph) - float(current_kph))
 
     button: Optional[int] = None
 
-    # Keep emergency/below-min handling narrow. Unity primarily steps the set speed
-    # down; it does not use XNOR's earlier broad engaged-control cancel rules.
-    fast_decel_required = self._fast_decel_required(v_ego_ms=v_ego_ms, lead=lead)
-    min_cruise_kph = float(self.MIN_CRUISE_SPEED_MS) * CV.MS_TO_KPH
-
-    if float(desired_speed_ms) < float(self.MIN_CRUISE_SPEED_MS):
+    if float(desired_speed_ms) < float(self.MIN_CRUISE_SPEED_MS) and (not min_hold_active):
       button = int(CruiseButtons.CANCEL)
     elif fast_decel_required and self._seconds_to_collision(lead=lead) < 2.5 and float(current_kph) > 0.0:
       button = int(CruiseButtons.CANCEL)
@@ -438,7 +450,8 @@ class ACCController:
         button = int(CruiseButtons.RES_ACCEL)
 
     if button is None:
-      return AccDecision(None, "no-op", target_kph, current_kph, current_kph)
+      reason = "no-op[min_hold]" if min_hold_active else "no-op"
+      return AccDecision(None, reason, target_kph, current_kph, current_kph)
 
     if CruiseButtons.is_decel(button):
       if int(button) == int(CruiseButtons.DECEL_2ND) and (float(current_kph) - float(full_kph)) < float(min_cruise_kph):

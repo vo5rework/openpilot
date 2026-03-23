@@ -503,17 +503,17 @@ class CarController(CarControllerBase):
           lat_active,
           CarControllerParams.ANGLE_LIMITS,
         ))
-        # Keep a guard against sudden angle jumps, but give the car more room to
-        # build steering angle before the saturation alert trips in faster corners.
-        steer_guard_delta = float(np.interp(
+        # Extra guard against first-command steps even after limits, but let the
+        # controller build more angle at higher speeds instead of arriving late.
+        angle_guard_deg = float(np.interp(
           float(getattr(CS.out, "vEgoRaw", CS.out.vEgo)),
           [0.0, 10.0, 20.0, 30.0],
-          [20.0, 22.0, 25.0, 28.0],
+          [22.0, 25.0, 29.0, 33.0],
         ))
         apply_angle = float(np.clip(
           apply_angle,
-          float(CS.out.steeringAngleDeg) - steer_guard_delta,
-          float(CS.out.steeringAngleDeg) + steer_guard_delta,
+          float(CS.out.steeringAngleDeg) - angle_guard_deg,
+          float(CS.out.steeringAngleDeg) + angle_guard_deg,
         ))
 
       self.apply_angle_last = float(apply_angle)
