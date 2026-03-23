@@ -177,6 +177,41 @@ class ACCController:
       return 1e6
     return float(lead.d_rel) / max(1e-3, -float(lead.v_rel))
 
+
+  def _note_lead_transition(self, *, lead: LeadInfo, now_ms: int) -> None:
+    lead_present = bool(lead.status)
+
+    if bool(self._last_lead_status) and not lead_present:
+      self._lead_cleared_time_ms = int(now_ms)
+    elif lead_present:
+      # Treat a clearly opening, now-healthy lead as effectively cleared for the
+      # resume cadence logic so recovery can begin smoothly without feeling sticky.
+      opening_gap = float(lead.v_rel) > 0.5
+      healthy_gap = float(lead.d_rel) > 35.0
+      if opening_gap and healthy_gap:
+        self._lead_cleared_time_ms = int(now_ms)
+
+    self._last_lead_status = lead_present
+
+  def _accel_cooldown_ms(
+    self,
+    *,
+    now_ms: int,
+    speed_offset_kph: float,
+    available_speed_kph: float,
+    lead: LeadInfo,
+  ) -> int:
+    if lead.status:
+      return int(self._AUTO_COOLDOWN_ACCEL_SLOW_MS)
+
+    if (int(now_ms) - int(self._lead_cleared_time_ms)) <= int(self._ACCEL_AFTER_LEAD_CLEAR_SETTLE_MS):
+      return int(self._AUTO_COOLDOWN_ACCEL_SLOW_MS)
+
+    if float(speed_offset_kph) >= 8.0 and float(available_speed_kph) >= 4.0:
+      return int(self._AUTO_COOLDOWN_ACCEL_FAST_MS)
+
+    return int(self._AUTO_COOLDOWN_ACCEL_BASE_MS)
+
   def _fast_decel_required(self, *, v_ego_ms: float, lead: LeadInfo) -> bool:
     if not lead.status or lead.d_rel <= 0.0:
       return False
