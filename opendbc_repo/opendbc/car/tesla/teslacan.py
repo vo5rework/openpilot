@@ -207,6 +207,60 @@ class TeslaCAN:
     }
     return self.packer.make_can_msg("DAS_status2", int(bus), values)
 
+
+
+  def create_das_warning_matrix0(self, can_errors: int, steering_override: int, not_in_drive: int, bus: int):
+    dat = bytes((
+      0,
+      0,
+      0,
+      (int(steering_override) & 0x7F) | ((int(can_errors) & 0x01) << 7),
+      0,
+      ((int(not_in_drive) & 0x01) << 7),
+      0,
+      0,
+    ))
+    return (0x329, dat, int(bus))
+
+  def create_das_warning_matrix1(self, bus: int):
+    return (0x369, b"\x00\x00\x00\x00\x00\x00\x00\x00", int(bus))
+
+  def create_das_warning_matrix3(self,
+                                 gas_to_resume: int,
+                                 acc_no_seatbelt: int,
+                                 noisy_environment: int,
+                                 ap_unavailable: int,
+                                 lkas_unavailable: int,
+                                 lc_temp_unavailable_speed: int,
+                                 lc_temp_unavailable_road: int,
+                                 lc_aborting: int,
+                                 acc_camera_blind: int,
+                                 rack_detected: int,
+                                 driver_overriding: int,
+                                 stop_sign_warning: int,
+                                 stop_light_warning: int,
+                                 bus: int):
+    dat = bytes((
+      ((int(gas_to_resume) & 0x01) << 1) |
+      ((int(stop_sign_warning) & 0x01) << 3) |
+      ((int(stop_light_warning) & 0x01) << 4),
+      ((int(noisy_environment) & 0x01) << 1) |
+      ((int(ap_unavailable) & 0x01) << 5) |
+      ((int(lkas_unavailable) & 0x01) << 6) |
+      ((int(rack_detected) & 0x01) << 7),
+      ((int(acc_no_seatbelt) & 0x01) << 2) |
+      ((int(driver_overriding) & 0x01) << 7),
+      ((int(lc_temp_unavailable_speed) & 0x01) << 2) |
+      ((int(lc_temp_unavailable_road) & 0x01) << 3) |
+      ((int(lc_aborting) & 0x01) << 4) |
+      ((int(acc_camera_blind) & 0x01) << 5),
+      0,
+      0,
+      0,
+      0,
+    ))
+    return (0x349, dat, int(bus))
+
   def create_fake_das_msg(self, pedalEnabled: bool, autopilot_disabled: bool, bus: int = CANBUS.party, *,
 
 

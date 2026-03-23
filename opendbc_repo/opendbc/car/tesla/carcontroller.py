@@ -308,11 +308,12 @@ class CarController(CarControllerBase):
     op_enabled = bool(getattr(CC, "enabled", False) or getattr(CC, "latActive", False))
     prev_enabled = bool(getattr(self, "_hud_prev_enabled", False))
     should_send = bool(self._cached_autopilot_disabled or op_enabled or prev_enabled)
+    disable_edge = prev_enabled and (not op_enabled)
     if not should_send:
+      self._process_hud_warning_matrices(CS, can_sends, disable_edge)
       self._hud_prev_enabled = op_enabled
       return
 
-    disable_edge = prev_enabled and (not op_enabled)
     if (self.frame % 10 != 0) and (not disable_edge):
       self._hud_prev_enabled = op_enabled
       return
@@ -361,7 +362,21 @@ class CarController(CarControllerBase):
         counter,
       )
     )
+    self._process_hud_warning_matrices(CS, can_sends, disable_edge)
     self._hud_prev_enabled = op_enabled
+
+  def _process_hud_warning_matrices(self, CS, can_sends, disable_edge: bool) -> None:
+    op_owned = bool(self._cached_autopilot_disabled)
+    if (not op_owned) and (not disable_edge):
+      return
+
+    if (self.frame % 100 != 0) and (not disable_edge):
+      return
+
+    hud_can = self._action_can_for_bus(int(CANBUS.party))
+    can_sends.append(hud_can.create_das_warning_matrix0(0, 0, 0, int(CANBUS.party)))
+    can_sends.append(hud_can.create_das_warning_matrix1(int(CANBUS.party)))
+    can_sends.append(hud_can.create_das_warning_matrix3(0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, int(CANBUS.party)))
 
   def _body_controls_turn(self, CS) -> int:
     if not bool(getattr(CS, "enableALC", False)):
@@ -503,17 +518,11 @@ class CarController(CarControllerBase):
           lat_active,
           CarControllerParams.ANGLE_LIMITS,
         ))
-        # Extra guard against first-command steps even after limits, but let the
-        # controller build more angle at higher speeds instead of arriving late.
-        angle_guard_deg = float(np.interp(
-          float(getattr(CS.out, "vEgoRaw", CS.out.vEgo)),
-          [0.0, 10.0, 20.0, 30.0],
-          [22.0, 25.0, 29.0, 33.0],
-        ))
+        # Extra guard against first-command steps even after limits
         apply_angle = float(np.clip(
           apply_angle,
-          float(CS.out.steeringAngleDeg) - angle_guard_deg,
-          float(CS.out.steeringAngleDeg) + angle_guard_deg,
+          float(CS.out.steeringAngleDeg) - 20.0,
+          float(CS.out.steeringAngleDeg) + 20.0,
         ))
 
       self.apply_angle_last = float(apply_angle)
