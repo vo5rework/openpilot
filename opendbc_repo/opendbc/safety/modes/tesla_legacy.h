@@ -174,8 +174,8 @@ static void tesla_legacy_rx_hook(const CANPacket_t *msg) {
 
     if (!tesla_legacy_external_panda && tesla_legacy_has_ap_hw) {
       if (addr == 0x399) {
-        const uint8_t st = msg->data[0] & 0x0FU;  // AutopilotStatus low nibble on this DBC
-        tesla_legacy_autopilot_enabled = (st == 3U) || (st == 4U) || (st == 5U) || (st == 6U) || (st == 7U);
+        const uint8_t st = msg->data[0] & 0x0FU;  // AutopilotStatus is the LOW nibble on this DBC
+        tesla_legacy_autopilot_enabled = (st == 3U) || (st == 4U) || (st == 5U);
         if (tesla_legacy_autopilot_enabled) {
           controls_allowed = false;
         }
@@ -406,11 +406,6 @@ static bool tesla_legacy_fwd_msg_hook(int bus_num, CANPacket_t *to_fwd) {
         // AutopilotStatus is the LOW nibble on this DBC. Unity HUD used state 5 when enabled.
         to_fwd->data[0] = (to_fwd->data[0] & 0xF0U) | 0x05U;
         tesla_legacy_set_last_byte_checksum(to_fwd);
-      } else if ((addr == 0x329) || (addr == 0x349) || (addr == 0x369)) {
-        for (int i = 0; i < GET_LEN(to_fwd); i++) {
-          to_fwd->data[i] = 0U;
-        }
-        tesla_legacy_set_last_byte_checksum(to_fwd);
       } else {
       }
     }
@@ -474,16 +469,11 @@ static safety_config tesla_legacy_init(uint16_t param) {
   cruise_engaged_prev = false;
 
   static const CanMsg TESLA_LEGACY_TX_MSGS_LATERAL[] = {
-    {0x488, 0, 4, .check_relay = false},   // DAS_steeringControl
-    {0x27D, 0, 3, .check_relay = false},   // APS_eacMonitor
-    {0x3E9, 0, 8, .check_relay = false},   // DAS_bodyControls
-    {0x399, 0, 8, .check_relay = false},   // AutopilotStatus
-    {0x389, 0, 8, .check_relay = false},   // DAS_status2
-    {0x329, 0, 8, .check_relay = false},   // DAS_warningMatrix0
-    {0x369, 0, 8, .check_relay = false},   // DAS_warningMatrix1
-    {0x349, 0, 8, .check_relay = false},   // DAS_warningMatrix3
-    {0x659, 0, 8, .check_relay = false},   // OP->safety internal carrier (blocked in tx_hook)
-    {0x45, 0, 8, .check_relay = false},    // STW_ACTN_RQ
+    {0x488, 0, 4, .check_relay = false},  // DAS_steeringControl
+    {0x27D, 0, 3, .check_relay = false},  // APS_eacMonitor
+    {0x659, 0, 8, .check_relay = false},  // OP->safety internal carrier (blocked in tx_hook)
+    {0x45, 0, 8, .check_relay = false},  // STW_ACTN_RQ
+
   };
 
   static const CanMsg TESLA_LEGACY_TX_MSGS_LONG[] = {

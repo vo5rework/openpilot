@@ -305,78 +305,11 @@ class CarController(CarControllerBase):
     return max(0.0, limit_ms * (CV.MS_TO_KPH if units == "KPH" else CV.MS_TO_MPH))
 
   def _process_hud_status(self, CC, CS, can_sends, human_control: bool) -> None:
-    op_enabled = bool(getattr(CC, "enabled", False) or getattr(CC, "latActive", False))
-    prev_enabled = bool(getattr(self, "_hud_prev_enabled", False))
-    should_send = bool(self._cached_autopilot_disabled or op_enabled or prev_enabled)
-    disable_edge = prev_enabled and (not op_enabled)
-    if not should_send:
-      self._process_hud_warning_matrices(CS, can_sends, disable_edge)
-      self._hud_prev_enabled = op_enabled
-      return
-
-    if (self.frame % 10 != 0) and (not disable_edge):
-      self._hud_prev_enabled = op_enabled
-      return
-
-    cs_out = getattr(CS, "out", None)
-    in_drive = not bool(getattr(CS, "carNotInDrive", False))
-    das_op_status = 5 if op_enabled else (2 if in_drive else 1)
-    das_csa_state = 2 if op_enabled else (1 if in_drive else 0)
-    hands_on_state = 3 if bool(human_control) else 2
-    cruise_speed_mph = 0.0
-    if cs_out is not None:
-      try:
-        cruise_speed_mph = float(getattr(cs_out.cruiseState, "speed", 0.0) or 0.0) * CV.MS_TO_MPH
-      except Exception:
-        cruise_speed_mph = 0.0
-      if cruise_speed_mph <= 0.0:
-        try:
-          cruise_speed_mph = float(getattr(cs_out, "vEgo", 0.0) or 0.0) * CV.MS_TO_MPH
-        except Exception:
-          cruise_speed_mph = 0.0
-
-    counter = (self.frame // 10) % 16
-    hud_can = self._action_can_for_bus(int(CANBUS.party))
-    can_sends.append(
-      hud_can.create_das_status(
-        das_op_status,
-        0,
-        0,
-        hands_on_state,
-        self._hud_alca_state(CS),
-        bool(getattr(cs_out, "leftBlindspot", False)) if cs_out is not None else False,
-        bool(getattr(cs_out, "rightBlindspot", False)) if cs_out is not None else False,
-        self._hud_speed_limit_uom(CS),
-        das_csa_state,
-        0,
-        int(CANBUS.party),
-        counter,
-      )
-    )
-    can_sends.append(
-      hud_can.create_das_status2(
-        das_csa_state,
-        cruise_speed_mph,
-        0,
-        int(CANBUS.party),
-        counter,
-      )
-    )
-    self._process_hud_warning_matrices(CS, can_sends, disable_edge)
-    self._hud_prev_enabled = op_enabled
-
-  def _process_hud_warning_matrices(self, CS, can_sends, disable_edge: bool) -> None:
-    op_owned = bool(self._cached_autopilot_disabled)
-    if (not op_owned) and (not disable_edge):
-      return
-
-    if (self.frame % 100 != 0) and (not disable_edge):
-      return
-
-    hud_can = self._action_can_for_bus(int(CANBUS.party))
-    can_sends.append(hud_can.create_das_warning_matrix0(0, 0, 0, int(CANBUS.party)))
-    can_sends.append(hud_can.create_das_warning_matrix1(int(CANBUS.party)))
-    can_sends.append(hud_can.create_das_warning_matrix3(0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, int(CANBUS.party)))
+    # Do not emit partial Tesla HUD status from userspace.
+    # This tree already forwards stock 0x399/0x389 from AP-side, and dual ownership causes
+    # IC oscillation (blue/white D), flashing speed-limit icons, and startup availability alerts.
+    self._hud_prev_enabled = bool(getattr(CC, "enabled", False) or getattr(CC, "latActive", False))
+    return
 
   def _body_controls_turn(self, CS) -> int:
     if not bool(getattr(CS, "enableALC", False)):
