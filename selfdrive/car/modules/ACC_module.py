@@ -54,14 +54,14 @@ class ACCController:
   MIN_CRUISE_SPEED_MS = 17.1 * CV.MPH_TO_MS
 
   _HUMAN_COOLDOWN_MS = 3000
-  _AUTO_COOLDOWN_MS = 400
-  _AUTO_COOLDOWN_ACCEL_BASE_MS = 520
-  _AUTO_COOLDOWN_ACCEL_FAST_MS = 420
-  _AUTO_COOLDOWN_ACCEL_SLOW_MS = 720
-  _AUTO_COOLDOWN_ACCEL_FULL_MS = 620
-  _ACCEL_AFTER_LEAD_CLEAR_SETTLE_MS = 350
+  _AUTO_COOLDOWN_MS = 300
+  _AUTO_COOLDOWN_ACCEL_BASE_MS = 440
+  _AUTO_COOLDOWN_ACCEL_FAST_MS = 340
+  _AUTO_COOLDOWN_ACCEL_SLOW_MS = 520
+  _AUTO_COOLDOWN_ACCEL_FULL_MS = 440
+  _ACCEL_AFTER_LEAD_CLEAR_SETTLE_MS = 180
   _FAST_DECEL_RESUME_HOLDOFF_MS = 2000
-  _LEAD_FRESH_MS = 700
+  _LEAD_FRESH_MS = 450
   _AUTOENGAGE_SPEED_WINDOW_MS = 0.8
   _AUTO_ECHO_IGNORE_MS = 1400
   _MIN_CRUISE_HOLD_MARGIN_MS = 5.0 * CV.MPH_TO_MS
@@ -203,9 +203,9 @@ class ACCController:
     if not lead.status or lead.d_rel <= 0.0:
       return False
 
-    close_lead = float(lead.d_rel) < 45.0
-    medium_lead = float(lead.d_rel) < 80.0
-    not_opening = float(lead.v_rel) < 1.5
+    close_lead = float(lead.d_rel) < 30.0
+    medium_lead = float(lead.d_rel) < 55.0
+    not_opening = float(lead.v_rel) < 0.8
     return bool(close_lead or (medium_lead and not_opening))
 
   def _accel_cooldown_ms(
@@ -235,13 +235,13 @@ class ACCController:
     self._accel_burst_steps_remaining = 0
 
   def _prime_accel_burst(self, *, speed_offset_kph: float, available_speed_kph: float, full_kph: float) -> None:
-    if float(available_speed_kph) < max(0.85 * float(full_kph), 3.0):
+    if float(available_speed_kph) < max(0.60 * float(full_kph), 2.0):
       self._accel_burst_steps_remaining = 0
       return
 
-    if float(speed_offset_kph) >= (2.10 * float(full_kph)):
+    if float(speed_offset_kph) >= (1.90 * float(full_kph)):
       self._accel_burst_steps_remaining = 2
-    elif float(speed_offset_kph) >= (1.00 * float(full_kph)):
+    elif float(speed_offset_kph) >= (0.90 * float(full_kph)):
       self._accel_burst_steps_remaining = 1
     else:
       self._accel_burst_steps_remaining = 0
@@ -256,9 +256,9 @@ class ACCController:
     lead: LeadInfo,
   ) -> Optional[int]:
     half_kph, full_kph = _cc_units_kph(speed_units)
-    single_threshold_kph = max(0.75 * float(half_kph), 0.8)
-    single_available_threshold_kph = max(float(half_kph) - 0.05, 0.5)
-    full_available_threshold_kph = max(0.85 * float(full_kph), 3.0)
+    single_threshold_kph = max(0.60 * float(half_kph), 0.5)
+    single_available_threshold_kph = max(0.35 * float(half_kph), 0.3)
+    full_available_threshold_kph = max(0.60 * float(full_kph), 2.0)
     recent_lead_clear = (int(now_ms) - int(self._lead_cleared_time_ms)) <= int(self._ACCEL_AFTER_LEAD_CLEAR_SETTLE_MS)
     burst_blocked = self._lead_blocks_fast_accel(lead=lead)
 
@@ -273,7 +273,7 @@ class ACCController:
 
     if int(self._accel_burst_steps_remaining) > 0:
       full_ready = self._no_automated_action_for(now_ms=now_ms, milliseconds=self._AUTO_COOLDOWN_ACCEL_FULL_MS)
-      full_gap_threshold_kph = max(0.95 * float(full_kph), single_threshold_kph)
+      full_gap_threshold_kph = max(0.80 * float(full_kph), single_threshold_kph)
       if (
         full_ready
         and float(speed_offset_kph) >= float(full_gap_threshold_kph)
@@ -335,12 +335,14 @@ class ACCController:
 
     return True
 
-  def _record_button(self, *, now_ms: int, button: int) -> None:
+  def _record_button(self, *, now_ms: int, button: int, speed_units: str) -> None:
     self.automated_action_time_ms = int(now_ms)
     self._last_auto_button = int(button)
     self._last_auto_button_time_ms = int(now_ms)
     if int(button) == int(CruiseButtons.CANCEL):
       self.fast_decel_time_ms = int(now_ms)
+    else:
+      self._update_max_acc_speed_from_button(button=int(button), speed_units=speed_units)
 
   def _consume_recent_manual_raise_clear(
     self,
@@ -487,7 +489,7 @@ class ACCController:
         and self._no_automated_action_for(now_ms=now_ms, milliseconds=self._AUTO_COOLDOWN_MS)
         and self._should_autoengage_cc(now_ms=now_ms, v_ego_ms=v_ego_ms, brake_pressed=brake_pressed, lead=lead)
       ):
-        self._record_button(now_ms=now_ms, button=int(CruiseButtons.RES_ACCEL))
+        self._record_button(now_ms=now_ms, button=int(CruiseButtons.RES_ACCEL), speed_units=speed_units)
         return AccDecision(int(CruiseButtons.RES_ACCEL), "autoengage: RES", current_kph, current_kph, current_kph + float(half_kph))
       return AccDecision(None, "standby: no autoengage", current_kph, current_kph, current_kph)
 
@@ -522,7 +524,8 @@ class ACCController:
     target_speed_ms = max(float(desired_speed_ms), float(self.MIN_CRUISE_SPEED_MS)) if min_hold_active else float(desired_speed_ms)
     target_kph = float(target_speed_ms) * CV.MS_TO_KPH
     speed_offset_kph = float(target_kph) - float(current_kph)
-    available_speed_kph = max(0.0, float(self.acc_speed_kph) - float(current_kph))
+    desired_headroom_kph = max(float(self.acc_speed_kph), float(target_kph)) - float(current_kph)
+    available_speed_kph = max(0.0, float(desired_headroom_kph))
 
     button: Optional[int] = None
 
@@ -561,7 +564,7 @@ class ACCController:
       elif int(button) == int(CruiseButtons.DECEL_SET) and (float(current_kph) - float(half_kph)) < float(min_cruise_kph):
         button = None
 
-    self._record_button(now_ms=now_ms, button=int(button))
+    self._record_button(now_ms=now_ms, button=int(button), speed_units=speed_units)
 
     est_kph = float(current_kph)
     if int(button) == int(CruiseButtons.RES_ACCEL_2ND):

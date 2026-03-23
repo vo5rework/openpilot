@@ -435,7 +435,7 @@ class CarController(CarControllerBase):
     # Steering warm-up: for a short window after lateral becomes active, command current wheel angle.
     # This prevents an initial command step (EPS inhibit) when engaging with the wheel turned.
     if lat_active and (not bool(self._lat_active_prev)):
-      self._steer_warmup_until_frame = int(self.frame) + 8  # shorter warmup so turn-in starts sooner
+      self._steer_warmup_until_frame = int(self.frame) + 4  # shorter warmup so turn-in starts sooner
     self._lat_active_prev = bool(lat_active)
 
     # Steering (50Hz)
@@ -454,7 +454,7 @@ class CarController(CarControllerBase):
         steer_guard_deg = float(np.interp(
           float(getattr(CS.out, "vEgoRaw", CS.out.vEgo)),
           [0.0, 10.0, 20.0, 30.0],
-          [26.0, 31.0, 37.0, 44.0],
+          [28.0, 34.0, 41.0, 48.0],
         ))
         # Keep a measured-angle guard, but widen it with speed so the car can
         # build angle earlier into sharper corners instead of washing wide.

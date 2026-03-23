@@ -44,25 +44,25 @@ class LongDecision:
 class LongController:
   MIN_CRUISE_SPEED_MS = 17.1 * CV.MPH_TO_MS
   _LP_FRESH_NS = 1_500_000_000
-  _PLANNER_DRAG_MARGIN_MS = 0.5
-  _PLANNER_BELOW_EGO_MARGIN_MS = 0.3
+  _PLANNER_DRAG_MARGIN_MS = 0.35
+  _PLANNER_BELOW_EGO_MARGIN_MS = 0.15
   _STRONG_DECEL_ATARGET_MS2 = -0.5
 
   _CURVE_ENTRY_PERSIST_MS = 700
-  _CURVE_EXIT_PERSIST_MS = 250
-  _CURVE_EXIT_RECOVERY_MS_PER_S = 5.5
+  _CURVE_EXIT_PERSIST_MS = 120
+  _CURVE_EXIT_RECOVERY_MS_PER_S = 7.0
   _CURVE_MIN_CRUISE_HOLD_MARGIN_MS = 5.0 * CV.MPH_TO_MS
   _CURVE_MAPD_MIN_HOLD_MARGIN_MS = 0.5 * CV.MPH_TO_MS
   _CURVE_HARD_ENTRY_EXTRA_MS = 3.0 * CV.MPH_TO_MS
-  _CURVE_RELEASE_NEAR_TARGET_MARGIN_MS = 0.6 * CV.MPH_TO_MS
+  _CURVE_RELEASE_NEAR_TARGET_MARGIN_MS = 0.4 * CV.MPH_TO_MS
   _CURVE_HOLD_DROP_DEADBAND_MS = 2.0 * CV.MPH_TO_MS
   _MAPD_FRESH_NS = 1_500_000_000
-  _CURVE_MAPD_RELEASE_PERSIST_MS = 400
-  _LEAD_HOLD_PERSIST_MS = 650
-  _LEAD_HOLD_RELEASE_MARGIN_MS = 0.45 * CV.MPH_TO_MS
-  _LEAD_OPENING_VREL_MS = 0.25
-  _LEAD_OPENING_GAP_MIN_M = 24.0
-  _NO_LEAD_MAPD_CURRENT_GATE_MS = 1.0 * CV.MPH_TO_MS
+  _CURVE_MAPD_RELEASE_PERSIST_MS = 220
+  _LEAD_HOLD_PERSIST_MS = 420
+  _LEAD_HOLD_RELEASE_MARGIN_MS = 0.30 * CV.MPH_TO_MS
+  _LEAD_OPENING_VREL_MS = 0.10
+  _LEAD_OPENING_GAP_MIN_M = 20.0
+  _NO_LEAD_MAPD_CURRENT_GATE_MS = 0.5 * CV.MPH_TO_MS
 
   def __init__(self) -> None:
     self.acc = ACCController()
@@ -529,7 +529,7 @@ class LongController:
     desired_ms = float(planner_last_ms)
     src = "lp_last" if lp_fresh else "hold"
 
-    startup_warmup = bool(self._enabled_since_ms and ((int(now) - int(self._enabled_since_ms)) < 2500))
+    startup_warmup = bool(self._enabled_since_ms and ((int(now) - int(self._enabled_since_ms)) < 1800))
     startup_invalid_clear = (
       startup_warmup
       and (not self._lead_present)
