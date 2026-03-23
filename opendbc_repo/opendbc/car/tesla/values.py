@@ -183,8 +183,8 @@ class CarControllerParams:
   360,  # deg
 
   # Slightly stronger turn-in than the prior tune, while keeping the same shape.
-  ([0., 5., 15.], [7.0, 6.0, 1.5]),   # up
-  ([0., 5., 15.], [7.0, 7.3, 3.5]),   # down
+  ([0., 5., 15.], [8.0, 7.0, 2.0]),   # up
+  ([0., 5., 15.], [8.0, 8.2, 4.2]),   # down
 
   # v2 (vehicle model) fields unused by std limiter
   MAX_LATERAL_ACCEL=ISO_LATERAL_ACCEL + (ACCELERATION_DUE_TO_GRAVITY * AVERAGE_ROAD_ROLL),

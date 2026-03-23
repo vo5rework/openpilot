@@ -55,17 +55,18 @@ class ACCController:
 
   _HUMAN_COOLDOWN_MS = 3000
   _AUTO_COOLDOWN_MS = 400
-  _AUTO_COOLDOWN_ACCEL_BASE_MS = 650
-  _AUTO_COOLDOWN_ACCEL_FAST_MS = 500
-  _AUTO_COOLDOWN_ACCEL_SLOW_MS = 900
-  _AUTO_COOLDOWN_ACCEL_FULL_MS = 950
-  _ACCEL_AFTER_LEAD_CLEAR_SETTLE_MS = 700
+  _AUTO_COOLDOWN_ACCEL_BASE_MS = 520
+  _AUTO_COOLDOWN_ACCEL_FAST_MS = 420
+  _AUTO_COOLDOWN_ACCEL_SLOW_MS = 720
+  _AUTO_COOLDOWN_ACCEL_FULL_MS = 620
+  _ACCEL_AFTER_LEAD_CLEAR_SETTLE_MS = 350
   _FAST_DECEL_RESUME_HOLDOFF_MS = 2000
   _LEAD_FRESH_MS = 700
   _AUTOENGAGE_SPEED_WINDOW_MS = 0.8
-  _AUTO_ECHO_IGNORE_MS = 750
+  _AUTO_ECHO_IGNORE_MS = 1400
   _MIN_CRUISE_HOLD_MARGIN_MS = 5.0 * CV.MPH_TO_MS
   _MIN_CRUISE_CANCEL_VEGO_MARGIN_MS = 1.0 * CV.MPH_TO_MS
+  _MANUAL_LOWER_STALE_CLEAR_MS = 6000
 
 
   def __init__(self) -> None:
@@ -198,6 +199,15 @@ class ACCController:
 
     self._last_lead_status = lead_present
 
+  def _lead_blocks_fast_accel(self, *, lead: LeadInfo) -> bool:
+    if not lead.status or lead.d_rel <= 0.0:
+      return False
+
+    close_lead = float(lead.d_rel) < 45.0
+    medium_lead = float(lead.d_rel) < 80.0
+    not_opening = float(lead.v_rel) < 1.5
+    return bool(close_lead or (medium_lead and not_opening))
+
   def _accel_cooldown_ms(
     self,
     *,
@@ -206,29 +216,32 @@ class ACCController:
     available_speed_kph: float,
     lead: LeadInfo,
   ) -> int:
-    if lead.status:
+    if self._lead_blocks_fast_accel(lead=lead):
       return int(self._AUTO_COOLDOWN_ACCEL_SLOW_MS)
 
     if (int(now_ms) - int(self._lead_cleared_time_ms)) <= int(self._ACCEL_AFTER_LEAD_CLEAR_SETTLE_MS):
       return int(self._AUTO_COOLDOWN_ACCEL_SLOW_MS)
 
-    if float(speed_offset_kph) >= 8.0 and float(available_speed_kph) >= 4.0:
+    if float(speed_offset_kph) >= 10.0 and float(available_speed_kph) >= 7.0:
       return int(self._AUTO_COOLDOWN_ACCEL_FAST_MS)
 
-    return int(self._AUTO_COOLDOWN_ACCEL_BASE_MS)
+    if float(speed_offset_kph) >= 6.0 and float(available_speed_kph) >= 4.0:
+      return int(self._AUTO_COOLDOWN_ACCEL_BASE_MS)
+
+    return int(self._AUTO_COOLDOWN_ACCEL_SLOW_MS)
 
 
   def _reset_accel_burst(self) -> None:
     self._accel_burst_steps_remaining = 0
 
   def _prime_accel_burst(self, *, speed_offset_kph: float, available_speed_kph: float, full_kph: float) -> None:
-    if float(available_speed_kph) < max(float(full_kph) - 0.2, 3.5):
+    if float(available_speed_kph) < max(0.85 * float(full_kph), 3.0):
       self._accel_burst_steps_remaining = 0
       return
 
-    if float(speed_offset_kph) >= (2.75 * float(full_kph)):
+    if float(speed_offset_kph) >= (2.10 * float(full_kph)):
       self._accel_burst_steps_remaining = 2
-    elif float(speed_offset_kph) >= (1.50 * float(full_kph)):
+    elif float(speed_offset_kph) >= (1.00 * float(full_kph)):
       self._accel_burst_steps_remaining = 1
     else:
       self._accel_burst_steps_remaining = 0
@@ -245,10 +258,11 @@ class ACCController:
     half_kph, full_kph = _cc_units_kph(speed_units)
     single_threshold_kph = max(0.75 * float(half_kph), 0.8)
     single_available_threshold_kph = max(float(half_kph) - 0.05, 0.5)
-    full_available_threshold_kph = max(float(full_kph) - 0.2, 3.5)
+    full_available_threshold_kph = max(0.85 * float(full_kph), 3.0)
     recent_lead_clear = (int(now_ms) - int(self._lead_cleared_time_ms)) <= int(self._ACCEL_AFTER_LEAD_CLEAR_SETTLE_MS)
+    burst_blocked = self._lead_blocks_fast_accel(lead=lead)
 
-    if lead.status or recent_lead_clear:
+    if burst_blocked or recent_lead_clear:
       self._reset_accel_burst()
     elif int(self._accel_burst_steps_remaining) <= 0:
       self._prime_accel_burst(
@@ -259,7 +273,7 @@ class ACCController:
 
     if int(self._accel_burst_steps_remaining) > 0:
       full_ready = self._no_automated_action_for(now_ms=now_ms, milliseconds=self._AUTO_COOLDOWN_ACCEL_FULL_MS)
-      full_gap_threshold_kph = max(1.10 * float(full_kph), single_threshold_kph)
+      full_gap_threshold_kph = max(0.95 * float(full_kph), single_threshold_kph)
       if (
         full_ready
         and float(speed_offset_kph) >= float(full_gap_threshold_kph)
@@ -453,6 +467,18 @@ class ACCController:
 
     stock_state = str(stock_cruise_state or "").upper()
     half_kph, full_kph = _cc_units_kph(speed_units)
+
+    stale_manual_lower = (
+      self._manual_lower_hold_active
+      and (int(now_ms) - int(self._last_human_button_time_ms)) > int(self._MANUAL_LOWER_STALE_CLEAR_MS)
+      and (not lead.status)
+      and float(target_kph_seed) >= (float(current_kph) + float(full_kph))
+    )
+    if stale_manual_lower:
+      self.acc_speed_kph = max(float(self.acc_speed_kph), float(target_kph_seed), float(self.speed_limit_kph))
+      self._manual_lower_hold_active = False
+      self._manual_hold_restore_ceiling_kph = 0.0
+      self._manual_hold_restore_requested = False
 
     if stock_state == "STANDBY":
       if (

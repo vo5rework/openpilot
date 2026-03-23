@@ -48,13 +48,13 @@ class LongController:
   _PLANNER_BELOW_EGO_MARGIN_MS = 0.3
   _STRONG_DECEL_ATARGET_MS2 = -0.5
 
-  _CURVE_ENTRY_PERSIST_MS = 1000
-  _CURVE_EXIT_PERSIST_MS = 600
-  _CURVE_EXIT_RECOVERY_MS_PER_S = 1.0
+  _CURVE_ENTRY_PERSIST_MS = 700
+  _CURVE_EXIT_PERSIST_MS = 250
+  _CURVE_EXIT_RECOVERY_MS_PER_S = 5.5
   _CURVE_MIN_CRUISE_HOLD_MARGIN_MS = 5.0 * CV.MPH_TO_MS
   _CURVE_MAPD_MIN_HOLD_MARGIN_MS = 0.5 * CV.MPH_TO_MS
   _CURVE_HARD_ENTRY_EXTRA_MS = 3.0 * CV.MPH_TO_MS
-  _CURVE_RELEASE_NEAR_TARGET_MARGIN_MS = 1.0 * CV.MPH_TO_MS
+  _CURVE_RELEASE_NEAR_TARGET_MARGIN_MS = 0.6 * CV.MPH_TO_MS
   _CURVE_HOLD_DROP_DEADBAND_MS = 2.0 * CV.MPH_TO_MS
   _MAPD_FRESH_NS = 1_500_000_000
   _CURVE_MAPD_RELEASE_PERSIST_MS = 400
@@ -62,7 +62,7 @@ class LongController:
   _LEAD_HOLD_RELEASE_MARGIN_MS = 0.45 * CV.MPH_TO_MS
   _LEAD_OPENING_VREL_MS = 0.25
   _LEAD_OPENING_GAP_MIN_M = 24.0
-  _NO_LEAD_MAPD_CURRENT_GATE_MS = 2.0 * CV.MPH_TO_MS
+  _NO_LEAD_MAPD_CURRENT_GATE_MS = 1.0 * CV.MPH_TO_MS
 
   def __init__(self) -> None:
     self.acc = ACCController()
@@ -123,7 +123,7 @@ class LongController:
       return None
     valid_speeds: list[float] = []
     try:
-      count = max(1, int(math.ceil(len(speeds) * 0.6)))
+      count = max(3, int(math.ceil(len(speeds) * 0.35)))
       for v in speeds[:count]:
         vf = float(v)
         if math.isfinite(vf) and vf >= 0.0:
@@ -229,6 +229,24 @@ class LongController:
       self._reset_curve_hold()
       return True
     return False
+
+  def _should_force_curve_release(
+    self,
+    *,
+    now_ns: int,
+    reference_ms: float,
+    planner_last_ms: float,
+    planner_near_ms: float,
+  ) -> bool:
+    if not self._curve_hold_active:
+      return False
+
+    release_margin_ms = float(self._CURVE_RELEASE_NEAR_TARGET_MARGIN_MS)
+    planner_last_clear = float(planner_last_ms) >= (float(reference_ms) - release_margin_ms)
+    planner_near_clear = float(planner_near_ms) >= (float(reference_ms) - (1.4 * release_margin_ms))
+    mapd_floor_ms = self._mapd_curve_floor_ms(now_ns=now_ns)
+    mapd_clear = (mapd_floor_ms is None) or (float(mapd_floor_ms) >= (float(reference_ms) - release_margin_ms))
+    return bool(planner_last_clear and planner_near_clear and mapd_clear)
 
   def _reset_curve_hold(self) -> None:
     self._curve_entry_candidate_since_ms = 0
@@ -627,6 +645,15 @@ class LongController:
           ):
             curve_target_ms = float(resume_ceiling_ms)
             curve_state = "curve_clear(mapd)"
+          elif self._should_force_curve_release(
+            now_ns=now_ns,
+            reference_ms=float(resume_ceiling_ms),
+            planner_last_ms=float(planner_last_ms),
+            planner_near_ms=float(planner_near_ms),
+          ):
+            self._reset_curve_hold()
+            curve_target_ms = float(resume_ceiling_ms)
+            curve_state = "curve_clear(planner)"
           if float(curve_target_ms) < float(self.MIN_CRUISE_SPEED_MS):
             hold_floor_ms = float(self.MIN_CRUISE_SPEED_MS) - float(self._CURVE_MIN_CRUISE_HOLD_MARGIN_MS)
             if float(curve_target_ms) >= float(hold_floor_ms):
