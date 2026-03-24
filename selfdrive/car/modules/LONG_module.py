@@ -44,9 +44,9 @@ class LongDecision:
 class LongController:
   MIN_CRUISE_SPEED_MS = 17.1 * CV.MPH_TO_MS
   _LP_FRESH_NS = 1_500_000_000
-  _PLANNER_DRAG_MARGIN_MS = 0.35
-  _PLANNER_BELOW_EGO_MARGIN_MS = 0.15
-  _STRONG_DECEL_ATARGET_MS2 = -0.5
+  _PLANNER_DRAG_MARGIN_MS = 0.25
+  _PLANNER_BELOW_EGO_MARGIN_MS = 0.05
+  _STRONG_DECEL_ATARGET_MS2 = -0.7
 
   _CURVE_ENTRY_PERSIST_MS = 700
   _CURVE_EXIT_PERSIST_MS = 120
@@ -58,10 +58,14 @@ class LongController:
   _CURVE_HOLD_DROP_DEADBAND_MS = 2.0 * CV.MPH_TO_MS
   _MAPD_FRESH_NS = 1_500_000_000
   _CURVE_MAPD_RELEASE_PERSIST_MS = 220
-  _LEAD_HOLD_PERSIST_MS = 420
-  _LEAD_HOLD_RELEASE_MARGIN_MS = 0.30 * CV.MPH_TO_MS
-  _LEAD_OPENING_VREL_MS = 0.10
-  _LEAD_OPENING_GAP_MIN_M = 20.0
+  _LEAD_HOLD_PERSIST_MS = 240
+  _LEAD_HOLD_RELEASE_MARGIN_MS = 0.20 * CV.MPH_TO_MS
+  _LEAD_OPENING_VREL_MS = 0.02
+  _LEAD_OPENING_GAP_MIN_M = 14.0
+  _LEAD_OPENING_TIME_GAP_S = 1.15
+  _LEAD_CONSTRAIN_CLOSING_VREL_MS = -0.15
+  _LEAD_CONSTRAIN_GAP_MIN_M = 22.0
+  _LEAD_CONSTRAIN_TIME_GAP_S = 1.7
   _NO_LEAD_MAPD_CURRENT_GATE_MS = 0.5 * CV.MPH_TO_MS
 
   def __init__(self) -> None:
@@ -263,7 +267,7 @@ class LongController:
     if (not self._lead_present) or float(self._lead_drel) <= 0.0:
       return False
 
-    opening_gap_m = max(float(self._LEAD_OPENING_GAP_MIN_M), float(v_ego_ms) * 1.6)
+    opening_gap_m = max(float(self._LEAD_OPENING_GAP_MIN_M), float(v_ego_ms) * float(self._LEAD_OPENING_TIME_GAP_S))
     lead_speed_ms = max(0.0, float(v_ego_ms) + float(self._lead_vrel))
     return bool(
       float(self._lead_vrel) >= float(self._LEAD_OPENING_VREL_MS)
@@ -431,11 +435,13 @@ class LongController:
   def _lead_is_constraining(self, *, base_target_ms: float, v_ego_ms: float) -> bool:
     if (not self._lead_present) or float(self._lead_drel) <= 0.0:
       return False
+    if self._lead_is_opening_clear(base_target_ms=float(base_target_ms), v_ego_ms=float(v_ego_ms)):
+      return False
 
     lead_speed_ms = max(0.0, float(v_ego_ms) + float(self._lead_vrel))
-    lead_slower_than_base = lead_speed_ms < (float(base_target_ms) - 0.35)
-    closing = float(self._lead_vrel) < -0.3
-    near_gap_limit_m = min(80.0, max(25.0, float(v_ego_ms) * 2.2))
+    lead_slower_than_base = lead_speed_ms < (float(base_target_ms) - 0.25)
+    closing = float(self._lead_vrel) < float(self._LEAD_CONSTRAIN_CLOSING_VREL_MS)
+    near_gap_limit_m = min(80.0, max(float(self._LEAD_CONSTRAIN_GAP_MIN_M), float(v_ego_ms) * float(self._LEAD_CONSTRAIN_TIME_GAP_S)))
     near_lead = float(self._lead_drel) < float(near_gap_limit_m)
     return bool(lead_slower_than_base and (closing or near_lead))
 
@@ -450,7 +456,11 @@ class LongController:
       base_target_ms=float(base_target_ms),
       v_ego_ms=float(v_ego_ms),
     )
-    lp_lead_constraining = bool(self._lp_has_lead) and (
+    lead_opening_clear = self._lead_is_opening_clear(
+      base_target_ms=float(base_target_ms),
+      v_ego_ms=float(v_ego_ms),
+    )
+    lp_lead_constraining = bool(self._lp_has_lead) and (not lead_opening_clear) and (
       lead_constraining
       or materially_below_clear
       or (float(self._lp_a_target) <= float(self._STRONG_DECEL_ATARGET_MS2))
