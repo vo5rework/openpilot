@@ -182,15 +182,28 @@ class CarControllerParams:
   # EPAS faults above this angle
   360,  # deg
 
-  # Slightly stronger turn-in than the prior tune, while keeping the same shape.
-  ([0., 5., 15.], [9.0, 8.0, 2.4]),   # up
-  ([0., 5., 15.], [9.0, 9.2, 4.8]),   # down
+  # Give Tesla a little more turn-in and hold in real corners without making
+  # light bends darty.
+  ([0., 5., 15.], [11.5, 10.5, 3.6]),   # up
+  ([0., 5., 15.], [11.5, 11.5, 6.2]),   # down
 
   # v2 (vehicle model) fields unused by std limiter
   MAX_LATERAL_ACCEL=ISO_LATERAL_ACCEL + (ACCELERATION_DUE_TO_GRAVITY * AVERAGE_ROAD_ROLL),
-  MAX_LATERAL_JERK=3.0 + (ACCELERATION_DUE_TO_GRAVITY * AVERAGE_ROAD_ROLL),
+  MAX_LATERAL_JERK=3.2 + (ACCELERATION_DUE_TO_GRAVITY * AVERAGE_ROAD_ROLL),
   MAX_ANGLE_RATE=5,
 )
+
+  # Curvature-aware lane-positioning bias.
+  # Low curvature: stay close to stock to avoid ping-pong on straights.
+  # High curvature: progressively give the requested path more authority so the
+  # car turns in earlier and holds the inside of the lane better.
+  CURVE_ASSIST_ANGLE_BP = [0.0, 4.0, 10.0, 18.0]
+  CURVE_ASSIST_GAIN_V = [1.00, 1.02, 1.06, 1.10]
+  CURVE_ASSIST_EXTRA_DEG_V = [0.0, 0.15, 0.8, 1.8]
+  CURVE_ASSIST_SPEED_BP = [0.0, 8.0, 15.0, 25.0, 35.0]
+  CURVE_ASSIST_SPEED_GAIN_V = [0.0, 0.45, 0.80, 1.00, 1.10]
+  CURVE_ASSIST_MAX_DELTA_BP = [0.0, 10.0, 20.0, 30.0]
+  CURVE_ASSIST_MAX_DELTA_V = [0.8, 1.6, 3.0, 5.0]
 
   STEER_STEP = 2  # Angle command is sent at 50 Hz
   ACCEL_MAX = 2.0    # m/s^2

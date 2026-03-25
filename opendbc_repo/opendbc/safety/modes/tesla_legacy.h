@@ -55,14 +55,38 @@ static uint32_t tesla_legacy_hands_on_last_signal = 0U;
 
 // time tracking for HUD hiding after disengage
 static uint32_t tesla_legacy_time_op_disengaged = 0U;
+static bool tesla_legacy_controls_allowed_prev = false;
+
+// gear tracking for reverse -> drive re-arm
+static bool tesla_legacy_in_reverse = false;
+static uint8_t tesla_legacy_last_gear = 0U;
+
+// local safety reset used on reverse entry and reverse -> drive
+static void tesla_legacy_reset_after_gear_change(void) {
+  controls_allowed = false;
+  cruise_engaged_prev = false;
+  steering_disengage = false;
+
+  tesla_legacy_stock_lkas = false;
+  tesla_legacy_stock_aeb = false;
+  tesla_legacy_autopilot_enabled = false;
+  tesla_legacy_eac_enabled = false;
+  tesla_legacy_autopark_enabled = false;
+
+  tesla_legacy_op_stalk_main_edge = false;
+  tesla_legacy_op_stalk_cancel_edge = false;
+
+  tesla_legacy_time_op_disengaged = microsecond_timer_get();
+  tesla_legacy_controls_allowed_prev = false;
+}
+
 
 // --- helpers ---
-static bool tesla_legacy_controls_allowed_prev = false;
 
 static void tesla_legacy_track_controls_allowed_edge(void) {
   if (tesla_legacy_controls_allowed_prev && !controls_allowed) {
     tesla_legacy_time_op_disengaged = microsecond_timer_get();
-  tesla_legacy_controls_allowed_prev = false;
+    tesla_legacy_controls_allowed_prev = false;
   }
   tesla_legacy_controls_allowed_prev = controls_allowed;
 }
@@ -115,6 +139,23 @@ static void tesla_legacy_rx_hook(const CANPacket_t *msg) {
       UPDATE_VEHICLE_SPEED(speed_ms);
     } else {
     }
+  }
+
+  // Gear state (DI_torque2 0x280) on chassis / mirrored PT bus
+  if (((bus == tesla_legacy_chassis_bus) || (bus == 2)) && (addr == 0x280)) {
+    const uint8_t gear = (msg->data[1] >> 4) & 0x07U;
+    const bool prev_reverse = tesla_legacy_in_reverse;
+    const bool now_reverse = gear == 2U;  // DI_GEAR_R
+    const bool now_drive = gear == 4U;    // DI_GEAR_D
+
+    if (now_reverse && !prev_reverse) {
+      tesla_legacy_reset_after_gear_change();
+    } else if (prev_reverse && now_drive) {
+      tesla_legacy_reset_after_gear_change();
+    }
+
+    tesla_legacy_in_reverse = now_reverse;
+    tesla_legacy_last_gear = gear;
   }
 
   // EPAS_sysStatus (0x370) on bus0
@@ -267,8 +308,8 @@ static bool tesla_legacy_tx_hook(const CANPacket_t *msg) {
       };
 
       const AngleSteeringParams params = {
-        .slip_factor = -0.000580374383851451f,
-        .steer_ratio = 15.0f,
+        .slip_factor = -0.000750000000000000f,
+        .steer_ratio = 16.5f,
         .wheelbase = 2.96f,
       };
 
@@ -465,6 +506,8 @@ static safety_config tesla_legacy_init(uint16_t param) {
 
   tesla_legacy_time_op_disengaged = microsecond_timer_get();
   tesla_legacy_controls_allowed_prev = false;
+  tesla_legacy_in_reverse = false;
+  tesla_legacy_last_gear = 0U;
 
   cruise_engaged_prev = false;
 

@@ -311,6 +311,45 @@ class CarController(CarControllerBase):
     self._hud_prev_enabled = bool(getattr(CC, "enabled", False) or getattr(CC, "latActive", False))
     return
 
+  def _lane_positioned_target_angle(self, desired_angle_deg: float, current_angle_deg: float, v_ego: float) -> float:
+    desired_angle_deg = float(desired_angle_deg)
+    current_angle_deg = float(current_angle_deg)
+    v_ego = float(v_ego)
+
+    desired_mag = abs(desired_angle_deg)
+    if (desired_mag < 1.5) or (v_ego < 4.0):
+      return desired_angle_deg
+
+    assist_gain = float(np.interp(
+      desired_mag,
+      CarControllerParams.CURVE_ASSIST_ANGLE_BP,
+      CarControllerParams.CURVE_ASSIST_GAIN_V,
+    ))
+    assist_extra = float(np.interp(
+      desired_mag,
+      CarControllerParams.CURVE_ASSIST_ANGLE_BP,
+      CarControllerParams.CURVE_ASSIST_EXTRA_DEG_V,
+    ))
+    assist_speed_gain = float(np.interp(
+      v_ego,
+      CarControllerParams.CURVE_ASSIST_SPEED_BP,
+      CarControllerParams.CURVE_ASSIST_SPEED_GAIN_V,
+    ))
+    max_delta = float(np.interp(
+      v_ego,
+      CarControllerParams.CURVE_ASSIST_MAX_DELTA_BP,
+      CarControllerParams.CURVE_ASSIST_MAX_DELTA_V,
+    ))
+
+    assisted_angle = (desired_angle_deg * assist_gain) + (np.sign(desired_angle_deg) * assist_extra * assist_speed_gain)
+
+    # Keep the lane-positioning assist as a modest bias around the planner request.
+    return float(np.clip(
+      assisted_angle,
+      desired_angle_deg - max_delta,
+      desired_angle_deg + max_delta,
+    ))
+
   def _body_controls_turn(self, CS) -> int:
     if not bool(getattr(CS, "enableALC", False)):
       return 0
@@ -435,7 +474,7 @@ class CarController(CarControllerBase):
     # Steering warm-up: for a short window after lateral becomes active, command current wheel angle.
     # This prevents an initial command step (EPS inhibit) when engaging with the wheel turned.
     if lat_active and (not bool(self._lat_active_prev)):
-      self._steer_warmup_until_frame = int(self.frame) + 4  # shorter warmup so turn-in starts sooner
+      self._steer_warmup_until_frame = int(self.frame) + 2  # shorter warmup so turn-in starts sooner
     self._lat_active_prev = bool(lat_active)
 
     # Steering (50Hz)
@@ -443,8 +482,13 @@ class CarController(CarControllerBase):
       if (not lat_active) or human_control or steer_inhibit or (int(self.frame) < int(self._steer_warmup_until_frame)):
         apply_angle = float(CS.out.steeringAngleDeg)
       else:
-        apply_angle = float(apply_std_steer_angle_limits(
+        desired_angle = self._lane_positioned_target_angle(
           float(actuators.steeringAngleDeg),
+          float(CS.out.steeringAngleDeg),
+          float(getattr(CS.out, "vEgoRaw", CS.out.vEgo)),
+        )
+        apply_angle = float(apply_std_steer_angle_limits(
+          float(desired_angle),
           float(self.apply_angle_last),
           float(getattr(CS.out, "vEgoRaw", CS.out.vEgo)),
           float(CS.out.steeringAngleDeg),
@@ -454,7 +498,7 @@ class CarController(CarControllerBase):
         steer_guard_deg = float(np.interp(
           float(getattr(CS.out, "vEgoRaw", CS.out.vEgo)),
           [0.0, 10.0, 20.0, 30.0],
-          [28.0, 34.0, 41.0, 48.0],
+          [34.0, 42.0, 52.0, 62.0],
         ))
         # Keep a measured-angle guard, but widen it with speed so the car can
         # build angle earlier into sharper corners instead of washing wide.
