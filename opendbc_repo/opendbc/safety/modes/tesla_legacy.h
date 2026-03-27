@@ -56,6 +56,7 @@ static uint32_t tesla_legacy_hands_on_last_signal = 0U;
 // time tracking for HUD hiding after disengage
 static uint32_t tesla_legacy_time_op_disengaged = 0U;
 static bool tesla_legacy_controls_allowed_prev = false;
+static bool tesla_legacy_hide_errors_armed = false;
 
 // gear tracking for reverse -> drive re-arm
 static bool tesla_legacy_in_reverse = false;
@@ -76,8 +77,9 @@ static void tesla_legacy_reset_after_gear_change(void) {
   tesla_legacy_op_stalk_main_edge = false;
   tesla_legacy_op_stalk_cancel_edge = false;
 
-  tesla_legacy_time_op_disengaged = microsecond_timer_get();
+  tesla_legacy_time_op_disengaged = 0U;
   tesla_legacy_controls_allowed_prev = false;
+  tesla_legacy_hide_errors_armed = false;
 }
 
 
@@ -86,7 +88,10 @@ static void tesla_legacy_reset_after_gear_change(void) {
 static void tesla_legacy_track_controls_allowed_edge(void) {
   if (tesla_legacy_controls_allowed_prev && !controls_allowed) {
     tesla_legacy_time_op_disengaged = microsecond_timer_get();
+    tesla_legacy_hide_errors_armed = true;
     tesla_legacy_controls_allowed_prev = false;
+  } else if (controls_allowed) {
+    tesla_legacy_hide_errors_armed = false;
   }
   tesla_legacy_controls_allowed_prev = controls_allowed;
 }
@@ -452,7 +457,7 @@ static bool tesla_legacy_fwd_msg_hook(int bus_num, CANPacket_t *to_fwd) {
     }
 
     // Just after disengage: keep the existing warning-hide behavior.
-    if (!controls_allowed && !tesla_legacy_autopilot_enabled) {
+    if (tesla_legacy_hide_errors_armed && !controls_allowed && !tesla_legacy_autopilot_enabled) {
       const uint32_t dt = get_ts_elapsed(microsecond_timer_get(), tesla_legacy_time_op_disengaged);
       if (dt <= TESLA_LEGACY_TIME_TO_HIDE_ERRORS_US) {
         if (addr == 0x389) {
@@ -479,6 +484,8 @@ static bool tesla_legacy_fwd_msg_hook(int bus_num, CANPacket_t *to_fwd) {
           tesla_legacy_set_last_byte_checksum(to_fwd);
         } else {
         }
+      } else {
+        tesla_legacy_hide_errors_armed = false;
       }
     }
     return false;
@@ -504,8 +511,9 @@ static safety_config tesla_legacy_init(uint16_t param) {
   tesla_legacy_hands_on = false;
   tesla_legacy_hands_on_last_signal = 0U;
 
-  tesla_legacy_time_op_disengaged = microsecond_timer_get();
+  tesla_legacy_time_op_disengaged = 0U;
   tesla_legacy_controls_allowed_prev = false;
+  tesla_legacy_hide_errors_armed = false;
   tesla_legacy_in_reverse = false;
   tesla_legacy_last_gear = 0U;
 
