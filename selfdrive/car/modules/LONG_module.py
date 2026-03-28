@@ -79,6 +79,7 @@ class LongController:
   _MAPD_ONLY_HIGHWAY_SPEED_MS = 55.0 * CV.MPH_TO_MS
   _MAPD_ONLY_HIGHWAY_MAX_DROP_MS = 24.0 * CV.MPH_TO_MS
   _MAPD_ONLY_HIGHWAY_MAX_PLANNER_DELTA_MS = 16.0 * CV.MPH_TO_MS
+  _LEAD_CLEAR_MAPD_GRACE_MS = 900
 
   def __init__(self) -> None:
     self.acc = ACCController()
