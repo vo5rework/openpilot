@@ -183,6 +183,24 @@ class LongController:
       return None
     return suggested_ms
 
+  def _curve_specific_mapd_target_ms(self, *, now_ns: int) -> Optional[float]:
+    if int(self._mapd_last_ns) <= 0:
+      return None
+    if (int(now_ns) - int(self._mapd_last_ns)) >= int(self._MAPD_FRESH_NS):
+      return None
+
+    candidates: list[float] = []
+    for raw in (self._mapd_map_curve_ms, self._mapd_vision_curve_ms):
+      if raw is None:
+        continue
+      val = float(raw)
+      if math.isfinite(val) and val > 0.1:
+        candidates.append(val)
+
+    if not candidates:
+      return None
+    return float(min(candidates))
+
   def _mapd_curve_active_target_ms(self, *, now_ns: int) -> Optional[float]:
     curve_specific_ms = self._curve_specific_mapd_target_ms(now_ns=now_ns)
     if curve_specific_ms is not None:
