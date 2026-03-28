@@ -65,6 +65,7 @@ class LongController:
   _CURVE_MAPD_RELEASE_PERSIST_MS = 220
   _CURVE_PLANNER_RELEASE_PERSIST_MS = 180
   _CURVE_PLANNER_RELEASE_MAPD_TOLERANCE_MS = 3.0 * CV.MPH_TO_MS
+  _CURVE_PLANNER_RELEASE_OVERRIDE_MS = 420
   _LEAD_HOLD_PERSIST_MS = 240
   _LEAD_HOLD_RELEASE_MARGIN_MS = 0.20 * CV.MPH_TO_MS
   _LEAD_OPENING_VREL_MS = 0.02
@@ -386,6 +387,12 @@ class LongController:
       self._curve_planner_release_candidate_since_ms = 0
       return False
 
+    if int(self._curve_planner_release_candidate_since_ms) == 0:
+      self._curve_planner_release_candidate_since_ms = int(now_ms)
+      return False
+
+    elapsed_ms = max(0, int(now_ms) - int(self._curve_planner_release_candidate_since_ms))
+
     curve_specific_ms = self._curve_specific_mapd_target_ms(now_ns=now_ns)
     if curve_specific_ms is not None:
       mapd_release_margin_ms = max(
@@ -393,15 +400,10 @@ class LongController:
         float(self._CURVE_PLANNER_RELEASE_MAPD_TOLERANCE_MS),
       )
       mapd_clear = float(curve_specific_ms) >= (float(reference_ms) - mapd_release_margin_ms)
-      if not mapd_clear:
-        self._curve_planner_release_candidate_since_ms = 0
+      if (not mapd_clear) and (elapsed_ms < int(self._CURVE_PLANNER_RELEASE_OVERRIDE_MS)):
         return False
 
-    if int(self._curve_planner_release_candidate_since_ms) == 0:
-      self._curve_planner_release_candidate_since_ms = int(now_ms)
-      return False
-
-    return (int(now_ms) - int(self._curve_planner_release_candidate_since_ms)) >= int(self._CURVE_PLANNER_RELEASE_PERSIST_MS)
+    return elapsed_ms >= int(self._CURVE_PLANNER_RELEASE_PERSIST_MS)
 
   def _reset_curve_hold(self) -> None:
     self._curve_entry_candidate_since_ms = 0
@@ -772,23 +774,35 @@ class LongController:
             current_set_ms=float(current_set_ms),
             v_ego_ms=float(v_ego_ms),
           )
-          mapd_target_ms = self._mapd_curve_active_target_ms(now_ns=now_ns)
-          gate_ms = float(self._NO_LEAD_MAPD_CURRENT_GATE_MS)
-          if (
-            mapd_target_ms is not None
-            and float(mapd_target_ms) < (float(reference_ms) - float(self._CURVE_RELEASE_NEAR_TARGET_MARGIN_MS))
-            and float(mapd_target_ms) < (float(v_ego_ms) - gate_ms)
+
+          if self._should_force_curve_release(
+            now_ms=int(now),
+            now_ns=now_ns,
+            reference_ms=float(reference_ms),
+            planner_last_ms=float(planner_last_ms),
+            planner_near_ms=float(planner_near_ms),
           ):
-            curve_target_ms, curve_state = self._stabilize_no_lead_curve_target(
-              now_ms=int(now),
-              raw_target_ms=float(mapd_target_ms),
-              reference_ms=float(reference_ms),
-            )
-            if float(curve_target_ms) < float(base_target_ms):
-              desired_ms = min(float(base_target_ms), float(curve_target_ms))
-              src = f"{src}+{curve_state}[mapd]"
-          else:
             self._reset_curve_hold()
+            desired_ms = float(base_target_ms)
+            src = f"{src}+curve_clear(planner)"
+          else:
+            mapd_target_ms = self._mapd_curve_active_target_ms(now_ns=now_ns)
+            gate_ms = float(self._NO_LEAD_MAPD_CURRENT_GATE_MS)
+            if (
+              mapd_target_ms is not None
+              and float(mapd_target_ms) < (float(reference_ms) - float(self._CURVE_RELEASE_NEAR_TARGET_MARGIN_MS))
+              and float(mapd_target_ms) < (float(v_ego_ms) - gate_ms)
+            ):
+              curve_target_ms, curve_state = self._stabilize_no_lead_curve_target(
+                now_ms=int(now),
+                raw_target_ms=float(mapd_target_ms),
+                reference_ms=float(reference_ms),
+              )
+              if float(curve_target_ms) < float(base_target_ms):
+                desired_ms = min(float(base_target_ms), float(curve_target_ms))
+                src = f"{src}+{curve_state}[mapd]"
+            else:
+              self._reset_curve_hold()
         else:
           self._reset_curve_hold()
           self._reset_lead_hold()
