@@ -569,8 +569,10 @@ class ACCController:
         # Re-engage should keep the manually lowered ceiling latched.
         self.acc_speed_kph = max(float(self.acc_speed_kph), float(current_kph), 0.0)
       else:
-        # Re-engage should restore a sane ceiling from the live set speed / ego speed.
+        # Re-engage should preserve any higher clear-road ceiling ACC already had,
+        # instead of resetting down to a slower follow-speed snapshot.
         self.acc_speed_kph = max(
+          float(self.acc_speed_kph),
           float(current_kph),
           float(v_ego_ms) * CV.MS_TO_KPH,
           float(self.speed_limit_kph),

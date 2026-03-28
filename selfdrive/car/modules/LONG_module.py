@@ -64,7 +64,7 @@ class LongController:
   _MAPD_FRESH_NS = 1_500_000_000
   _CURVE_MAPD_RELEASE_PERSIST_MS = 220
   _CURVE_PLANNER_RELEASE_PERSIST_MS = 180
-  _CURVE_PLANNER_RELEASE_MAPD_TOLERANCE_MS = 3.0 * CV.MPH_TO_MS
+  _CURVE_PLANNER_RELEASE_MAPD_TOLERANCE_MS = 4.0 * CV.MPH_TO_MS
   _CURVE_PLANNER_RELEASE_OVERRIDE_MS = 420
   _LEAD_HOLD_PERSIST_MS = 240
   _LEAD_HOLD_RELEASE_MARGIN_MS = 0.20 * CV.MPH_TO_MS
@@ -77,6 +77,8 @@ class LongController:
   _NO_LEAD_MAPD_CURRENT_GATE_MS = 0.5 * CV.MPH_TO_MS
   _MAPD_ONLY_ENTRY_PERSIST_MS = 180
   _MAPD_ONLY_HIGHWAY_ENTRY_PERSIST_MS = 460
+  _MAPD_ONLY_ENTRY_MIN_DROP_MS = 2.5 * CV.MPH_TO_MS
+  _MAPD_DUAL_SOURCE_AGREE_MS = 4.0 * CV.MPH_TO_MS
   _MAPD_ONLY_HIGHWAY_SPEED_MS = 55.0 * CV.MPH_TO_MS
   _MAPD_ONLY_HIGHWAY_MAX_DROP_MS = 24.0 * CV.MPH_TO_MS
   _MAPD_ONLY_HIGHWAY_MAX_PLANNER_DELTA_MS = 16.0 * CV.MPH_TO_MS
@@ -218,6 +220,23 @@ class LongController:
       return None
     return float(min(candidates))
 
+  def _curve_specific_mapd_sources(self, *, now_ns: int) -> tuple[Optional[float], Optional[float]]:
+    if int(self._mapd_last_ns) <= 0:
+      return None, None
+    if (int(now_ns) - int(self._mapd_last_ns)) >= int(self._MAPD_FRESH_NS):
+      return None, None
+
+    def _clean(raw: Optional[float]) -> Optional[float]:
+      if raw is None:
+        return None
+      val = float(raw)
+      if math.isfinite(val) and val > 0.1:
+        return val
+      return None
+
+    return _clean(self._mapd_map_curve_ms), _clean(self._mapd_vision_curve_ms)
+
+
   def _mapd_curve_active_target_ms(self, *, now_ns: int) -> Optional[float]:
     curve_specific_ms = self._curve_specific_mapd_target_ms(now_ns=now_ns)
     if curve_specific_ms is not None:
@@ -247,7 +266,13 @@ class LongController:
     current_angle_deg = abs(float(current_angle_deg))
 
     release_margin_ms = float(self._CURVE_RELEASE_NEAR_TARGET_MARGIN_MS)
+    entry_threshold_ms = float(self._curve_entry_threshold_ms(reference_ms))
+    mapd_only_min_drop_ms = max(float(self._MAPD_ONLY_ENTRY_MIN_DROP_MS), float(entry_threshold_ms))
     if float(curve_specific_ms) >= (reference_ms - max(float(self._NO_LEAD_MAPD_CURRENT_GATE_MS), release_margin_ms)):
+      self._mapd_entry_candidate_since_ms = 0
+      return None
+
+    if (not bool(planner_curve_active)) and float(curve_specific_ms) >= (reference_ms - mapd_only_min_drop_ms):
       self._mapd_entry_candidate_since_ms = 0
       return None
 
@@ -261,12 +286,18 @@ class LongController:
     mapd_much_lower_than_planner = planner_near_ms >= (float(curve_specific_ms) + float(self._MAPD_ONLY_HIGHWAY_MAX_EXTRA_DROP_WITH_PLANNER_MS))
     near_straight = current_angle_deg <= float(self._MAPD_ONLY_HIGHWAY_NEAR_STEER_DEG)
     recent_lead_clear = int(now_ms) <= int(self._lead_recently_cleared_until_ms)
+    map_curve_ms, vision_curve_ms = self._curve_specific_mapd_sources(now_ns=now_ns)
+    dual_source_agreement = (
+      map_curve_ms is not None
+      and vision_curve_ms is not None
+      and abs(float(map_curve_ms) - float(vision_curve_ms)) <= float(self._MAPD_DUAL_SOURCE_AGREE_MS)
+    )
 
     if bool(planner_curve_active):
       if highway_speed:
         suspicious_large_drop = float(curve_specific_ms) <= (reference_ms - float(self._MAPD_ONLY_HIGHWAY_MAX_DROP_MS))
         mismatch_without_support = mapd_much_lower_than_planner and near_straight and (not planner_supports_meaningful_drop)
-        if suspicious_large_drop and (planner_far_from_mapd or mismatch_without_support or recent_lead_clear):
+        if suspicious_large_drop and (not dual_source_agreement) and (mismatch_without_support or recent_lead_clear):
           self._mapd_entry_candidate_since_ms = 0
           return None
       self._mapd_entry_candidate_since_ms = 0
@@ -275,11 +306,15 @@ class LongController:
     persist_ms = int(self._MAPD_ONLY_ENTRY_PERSIST_MS)
     if highway_speed:
       suspicious_large_drop = float(curve_specific_ms) <= (reference_ms - float(self._MAPD_ONLY_HIGHWAY_MAX_DROP_MS))
-      mismatch_without_support = mapd_much_lower_than_planner and near_straight
+      mismatch_without_support = mapd_much_lower_than_planner and near_straight and (not dual_source_agreement)
       if suspicious_large_drop and (planner_far_from_mapd or mismatch_without_support):
-        self._mapd_entry_candidate_since_ms = 0
-        return None
+        if not dual_source_agreement:
+          self._mapd_entry_candidate_since_ms = 0
+          return None
       persist_ms = int(self._MAPD_ONLY_HIGHWAY_ENTRY_PERSIST_MS)
+
+    if dual_source_agreement:
+      persist_ms = min(int(persist_ms), 220)
 
     if recent_lead_clear:
       persist_ms = max(int(persist_ms), int(self._LEAD_CLEAR_MAPD_GRACE_MS))
@@ -896,6 +931,16 @@ class LongController:
             if float(curve_target_ms) >= float(hold_floor_ms):
               curve_target_ms = float(self.MIN_CRUISE_SPEED_MS)
               curve_state = f"{curve_state}+min_hold"
+
+          near_resume_tolerance_ms = max(
+            float(self._CURVE_RELEASE_NEAR_TARGET_MARGIN_MS),
+            1.2 * CV.MPH_TO_MS,
+          )
+          if float(curve_target_ms) >= (float(resume_ceiling_ms) - float(near_resume_tolerance_ms)):
+            self._reset_curve_hold()
+            curve_target_ms = float(resume_ceiling_ms)
+            curve_state = "curve_clear(snap)"
+
           desired_ms = min(float(resume_ceiling_ms), float(curve_target_ms))
           src = f"lp_near[{curve_state}]"
         else:
