@@ -99,6 +99,7 @@ class ACCController:
     self._manual_lower_pending_time_ms = 0
     self._manual_raise_pending = False
     self._manual_raise_pending_time_ms = 0
+    self._clear_road_ceiling_kph = 0.0
     self._last_current_set_speed_kph = 0.0
 
     self._radar_sm = messaging.SubMaster(["radarState"])
@@ -555,6 +556,13 @@ class ACCController:
     if disabled_edge:
       # Preserve a manual-lower hold across disengage; only an explicit manual
       # raise should clear it.
+      if not self._manual_lower_hold_active:
+        self._clear_road_ceiling_kph = max(
+          float(self._clear_road_ceiling_kph),
+          float(self.acc_speed_kph),
+          float(current_kph),
+          float(self.speed_limit_kph),
+        )
       self._reset_accel_burst()
       self._clear_manual_pending()
 
@@ -564,15 +572,29 @@ class ACCController:
       return AccDecision(None, "gated: not enabled")
 
     target_kph_seed = max(float(current_kph), float(desired_speed_ms) * CV.MS_TO_KPH)
+    if (
+      stock_state in ("ENABLED", "OVERRIDE", "STANDSTILL")
+      and not bool(brake_pressed)
+      and not bool(lead.status)
+      and not bool(self._manual_lower_hold_active)
+      and float(desired_speed_ms) >= (float(current_set_speed_ms) - (0.30 * CV.MPH_TO_MS))
+    ):
+      self._clear_road_ceiling_kph = max(
+        float(self._clear_road_ceiling_kph),
+        float(self.acc_speed_kph),
+        float(current_kph),
+        float(v_ego_ms) * CV.MS_TO_KPH,
+        float(self.speed_limit_kph),
+        float(target_kph_seed),
+      )
+
     if enabled_edge or self.acc_speed_kph <= 0.0:
       if self._manual_lower_hold_active:
         # Re-engage should keep the manually lowered ceiling latched.
         self.acc_speed_kph = max(float(self.acc_speed_kph), float(current_kph), 0.0)
       else:
-        # Re-engage should preserve any higher clear-road ceiling ACC already had,
-        # instead of resetting down to a slower follow-speed snapshot.
+        # Re-engage should restore a sane ceiling from the live set speed / ego speed.
         self.acc_speed_kph = max(
-          float(self.acc_speed_kph),
           float(current_kph),
           float(v_ego_ms) * CV.MS_TO_KPH,
           float(self.speed_limit_kph),
@@ -588,6 +610,7 @@ class ACCController:
         float(self.speed_limit_kph),
         float(target_kph_seed),
         float(self._manual_hold_restore_ceiling_kph),
+        float(self._clear_road_ceiling_kph),
       )
       self.acc_speed_kph = max(float(self.acc_speed_kph), float(restore_kph))
       self._manual_lower_hold_active = False
@@ -602,7 +625,13 @@ class ACCController:
       # clear-road ceiling so engage and post-curve recovery do not get stuck at
       # the initial set speed. Only raise the ceiling here; slowdowns still come
       # from the desired target path, not by lowering acc_speed_kph.
-      self.acc_speed_kph = max(float(self.acc_speed_kph), float(current_kph), float(self.speed_limit_kph), float(target_kph_seed))
+      self.acc_speed_kph = max(
+        float(self.acc_speed_kph),
+        float(current_kph),
+        float(self.speed_limit_kph),
+        float(target_kph_seed),
+        float(self._clear_road_ceiling_kph),
+      )
       self._manual_hold_restore_ceiling_kph = 0.0
 
     half_kph, full_kph = _cc_units_kph(speed_units)
