@@ -48,9 +48,14 @@ class LongController:
   _PLANNER_BELOW_EGO_MARGIN_MS = 0.05
   _STRONG_DECEL_ATARGET_MS2 = -0.7
 
-  _CURVE_ENTRY_PERSIST_MS = 700
+  _CURVE_ENTRY_PERSIST_MS = 320
   _CURVE_EXIT_PERSIST_MS = 120
   _CURVE_EXIT_RECOVERY_MS_PER_S = 7.0
+  _CURVE_HOLD_ENTRY_FREEZE_MS = 650
+  _CURVE_HOLD_DROP_PERSIST_MS = 260
+  _CURVE_HOLD_DROP_RATE_MS_PER_S = 1.8
+  _CURVE_HOLD_HARD_DROP_EXTRA_MS = 5.0 * CV.MPH_TO_MS
+  _CURVE_ENTRY_PREVIEW_DROP_MS = 2.0 * CV.MPH_TO_MS
   _CURVE_MIN_CRUISE_HOLD_MARGIN_MS = 5.0 * CV.MPH_TO_MS
   _CURVE_MAPD_MIN_HOLD_MARGIN_MS = 0.5 * CV.MPH_TO_MS
   _CURVE_HARD_ENTRY_EXTRA_MS = 3.0 * CV.MPH_TO_MS
@@ -127,7 +132,7 @@ class LongController:
       return None
     valid_speeds: list[float] = []
     try:
-      count = max(3, int(math.ceil(len(speeds) * 0.35)))
+      count = max(4, int(math.ceil(len(speeds) * 0.40)))
       for v in speeds[:count]:
         vf = float(v)
         if math.isfinite(vf) and vf >= 0.0:
@@ -136,7 +141,9 @@ class LongController:
       return None
     if not valid_speeds:
       return None
-    return float(min(valid_speeds))
+    ordered = sorted(valid_speeds)
+    quantile_idx = min(len(ordered) - 1, max(0, int(round((len(ordered) - 1) * 0.25))))
+    return float(ordered[quantile_idx])
 
   @staticmethod
   def _curve_entry_threshold_ms(reference_ms: float) -> float:
@@ -175,6 +182,24 @@ class LongController:
     if not (math.isfinite(suggested_ms) and suggested_ms > 0.1):
       return None
     return suggested_ms
+
+  def _curve_specific_mapd_target_ms(self, *, now_ns: int) -> Optional[float]:
+    if int(self._mapd_last_ns) <= 0:
+      return None
+    if (int(now_ns) - int(self._mapd_last_ns)) >= int(self._MAPD_FRESH_NS):
+      return None
+
+    candidates: list[float] = []
+    for raw in (self._mapd_map_curve_ms, self._mapd_vision_curve_ms):
+      if raw is None:
+        continue
+      val = float(raw)
+      if math.isfinite(val) and val > 0.1:
+        candidates.append(val)
+
+    if not candidates:
+      return None
+    return float(min(candidates))
 
   def _mapd_curve_floor_ms(self, *, now_ns: int) -> Optional[float]:
     if int(self._mapd_last_ns) <= 0:
@@ -215,7 +240,8 @@ class LongController:
       self._curve_mapd_release_candidate_since_ms = 0
       return False
 
-    mapd_target_ms = self._mapd_curve_target_ms(now_ns=now_ns)
+    curve_mapd_target_ms = self._curve_specific_mapd_target_ms(now_ns=now_ns)
+    mapd_target_ms = curve_mapd_target_ms if curve_mapd_target_ms is not None else self._mapd_curve_target_ms(now_ns=now_ns)
     if mapd_target_ms is None:
       self._curve_mapd_release_candidate_since_ms = 0
       return False
@@ -247,9 +273,9 @@ class LongController:
 
     release_margin_ms = float(self._CURVE_RELEASE_NEAR_TARGET_MARGIN_MS)
     planner_last_clear = float(planner_last_ms) >= (float(reference_ms) - release_margin_ms)
-    planner_near_clear = float(planner_near_ms) >= (float(reference_ms) - (1.4 * release_margin_ms))
-    mapd_floor_ms = self._mapd_curve_floor_ms(now_ns=now_ns)
-    mapd_clear = (mapd_floor_ms is None) or (float(mapd_floor_ms) >= (float(reference_ms) - release_margin_ms))
+    planner_near_clear = float(planner_near_ms) >= (float(reference_ms) - (2.2 * release_margin_ms))
+    curve_mapd_ms = self._curve_specific_mapd_target_ms(now_ns=now_ns)
+    mapd_clear = (curve_mapd_ms is None) or (float(curve_mapd_ms) >= (float(reference_ms) - release_margin_ms))
     return bool(planner_last_clear and planner_near_clear and mapd_clear)
 
   def _reset_curve_hold(self) -> None:
@@ -306,7 +332,10 @@ class LongController:
     if not self._curve_hold_active:
       if delta_ms >= hard_entry_threshold_ms:
         self._curve_hold_active = True
-        self._curve_hold_target_ms = raw_target_ms
+        self._curve_hold_target_ms = max(
+          float(raw_target_ms),
+          float(reference_ms) - float(self._CURVE_ENTRY_PREVIEW_DROP_MS),
+        )
         self._curve_hold_last_update_ms = int(now_ms)
         self._curve_entry_candidate_since_ms = 0
         self._curve_exit_candidate_since_ms = 0
@@ -315,34 +344,56 @@ class LongController:
       if delta_ms >= entry_threshold_ms:
         if int(self._curve_entry_candidate_since_ms) == 0:
           self._curve_entry_candidate_since_ms = int(now_ms)
-        if (int(now_ms) - int(self._curve_entry_candidate_since_ms)) >= int(self._CURVE_ENTRY_PERSIST_MS):
+        elapsed_ms = max(0, int(now_ms) - int(self._curve_entry_candidate_since_ms))
+        preview_ratio = min(1.0, float(elapsed_ms) / max(1.0, float(self._CURVE_ENTRY_PERSIST_MS)))
+        preview_drop_ms = min(float(self._CURVE_ENTRY_PREVIEW_DROP_MS), float(delta_ms)) * preview_ratio
+        preview_target_ms = max(float(raw_target_ms), float(reference_ms) - preview_drop_ms)
+        if elapsed_ms >= int(self._CURVE_ENTRY_PERSIST_MS):
           self._curve_hold_active = True
-          self._curve_hold_target_ms = raw_target_ms
+          self._curve_hold_target_ms = float(preview_target_ms)
           self._curve_hold_last_update_ms = int(now_ms)
+          self._curve_entry_candidate_since_ms = 0
           self._curve_exit_candidate_since_ms = 0
           return float(self._curve_hold_target_ms), "curve_hold(entry)"
-        return reference_ms, "curve_gate(wait)"
+        return float(preview_target_ms), "curve_gate(wait)"
       self._curve_entry_candidate_since_ms = 0
       return reference_ms, "curve_gate(clear)"
 
-    dt_s = max(0.0, (int(now_ms) - int(self._curve_hold_last_update_ms)) / 1000.0)
+    time_since_hold_update_ms = max(0, int(now_ms) - int(self._curve_hold_last_update_ms))
+    dt_s = max(0.0, float(time_since_hold_update_ms) / 1000.0)
+    freeze_active = time_since_hold_update_ms < int(self._CURVE_HOLD_ENTRY_FREEZE_MS)
     self._curve_hold_last_update_ms = int(now_ms)
-    self._curve_entry_candidate_since_ms = 0
 
     drop_deadband_ms = float(self._CURVE_HOLD_DROP_DEADBAND_MS)
+    hard_drop_ms = float(drop_deadband_ms + self._CURVE_HOLD_HARD_DROP_EXTRA_MS)
+
     if raw_target_ms < (float(self._curve_hold_target_ms) - drop_deadband_ms):
-      self._curve_hold_target_ms = float(raw_target_ms)
-      self._curve_exit_candidate_since_ms = 0
+      immediate_hard_drop = raw_target_ms < (float(self._curve_hold_target_ms) - hard_drop_ms)
+      if freeze_active and (not immediate_hard_drop):
+        self._curve_exit_candidate_since_ms = 0
+      else:
+        if int(self._curve_entry_candidate_since_ms) == 0:
+          self._curve_entry_candidate_since_ms = int(now_ms)
+        drop_persist_satisfied = immediate_hard_drop or (
+          (int(now_ms) - int(self._curve_entry_candidate_since_ms)) >= int(self._CURVE_HOLD_DROP_PERSIST_MS)
+        )
+        if drop_persist_satisfied:
+          max_drop_ms = float(self._CURVE_HOLD_DROP_RATE_MS_PER_S) * max(dt_s, 0.20)
+          self._curve_hold_target_ms = max(float(raw_target_ms), float(self._curve_hold_target_ms) - max_drop_ms)
+          self._curve_entry_candidate_since_ms = 0
+          self._curve_exit_candidate_since_ms = 0
     elif raw_target_ms > (float(self._curve_hold_target_ms) + exit_margin_ms):
+      self._curve_entry_candidate_since_ms = 0
       if int(self._curve_exit_candidate_since_ms) == 0:
         self._curve_exit_candidate_since_ms = int(now_ms)
       if (int(now_ms) - int(self._curve_exit_candidate_since_ms)) >= int(self._CURVE_EXIT_PERSIST_MS):
         recovery_ms = float(self._CURVE_EXIT_RECOVERY_MS_PER_S) * dt_s
         self._curve_hold_target_ms = min(float(raw_target_ms), float(self._curve_hold_target_ms) + recovery_ms)
     else:
+      self._curve_entry_candidate_since_ms = 0
       self._curve_exit_candidate_since_ms = 0
 
-    desired_ms = min(float(self._curve_hold_target_ms), float(raw_target_ms))
+    desired_ms = float(self._curve_hold_target_ms)
     if (float(raw_target_ms) >= (float(desired_ms) - 0.05)) and (delta_ms < (0.5 * entry_threshold_ms)):
       self._reset_curve_hold()
       return float(raw_target_ms), "curve_release"
@@ -643,9 +694,26 @@ class LongController:
           self._reset_curve_hold()
         elif (not self._lead_present) and (not self._lp_has_lead):
           self._reset_lead_hold()
+          raw_curve_target_ms = float(planner_near_ms)
+          curve_src = "planner"
+          curve_mapd_ms = self._curve_specific_mapd_target_ms(now_ns=now_ns)
+          mapd_gate_ms = max(0.8 * CV.MPH_TO_MS, 0.4 * CV.KPH_TO_MS)
+          planner_clear_margin_ms = max(0.35 * CV.MPH_TO_MS, 0.2 * CV.KPH_TO_MS)
+
+          if curve_mapd_ms is not None:
+            planner_missing_curve = (
+              float(planner_near_ms) >= (float(resume_ceiling_ms) - float(planner_clear_margin_ms))
+              and float(curve_mapd_ms) < (float(resume_ceiling_ms) - float(self._curve_entry_threshold_ms(float(resume_ceiling_ms))))
+            )
+            mapd_materially_lower = float(curve_mapd_ms) < (float(planner_near_ms) - float(mapd_gate_ms))
+
+            if planner_missing_curve or mapd_materially_lower:
+              raw_curve_target_ms = min(float(raw_curve_target_ms), float(curve_mapd_ms))
+              curve_src = "planner+mapd"
+
           curve_target_ms, curve_state = self._stabilize_no_lead_curve_target(
             now_ms=int(now),
-            raw_target_ms=float(planner_near_ms),
+            raw_target_ms=float(raw_curve_target_ms),
             reference_ms=float(resume_ceiling_ms),
           )
           if self._maybe_release_curve_hold_from_mapd(
@@ -670,7 +738,7 @@ class LongController:
               curve_target_ms = float(self.MIN_CRUISE_SPEED_MS)
               curve_state = f"{curve_state}+min_hold"
           desired_ms = min(float(resume_ceiling_ms), float(curve_target_ms))
-          src = f"lp_near[{curve_state}]"
+          src = f"lp_near[{curve_state}:{curve_src}]"
         else:
           self._reset_curve_hold()
           self._reset_lead_hold()
