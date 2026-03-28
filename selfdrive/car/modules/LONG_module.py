@@ -527,6 +527,7 @@ class LongController:
     return float(desired_ms), "curve_hold"
 
   def _poll_plan_and_lead(self, *, now_ns: int) -> None:
+    prev_lead_present = bool(self._lead_present_prev)
     try:
       self._sm.update(0)
     except Exception:
