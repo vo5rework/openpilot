@@ -532,6 +532,7 @@ class ACCController:
       self.speed_limit_kph = 0.0
 
     current_kph = float(current_set_speed_ms) * CV.MS_TO_KPH
+    stock_state = str(stock_cruise_state or "").upper()
     self._observe_manual_set_speed_change(
       now_ms=now_ms,
       current_kph=float(current_kph),
@@ -602,7 +603,6 @@ class ACCController:
       self.acc_speed_kph = max(float(self.acc_speed_kph), float(current_kph), float(self.speed_limit_kph), float(target_kph_seed))
       self._manual_hold_restore_ceiling_kph = 0.0
 
-    stock_state = str(stock_cruise_state or "").upper()
     half_kph, full_kph = _cc_units_kph(speed_units)
 
     # An explicit manual raise is the only thing that should clear a manual-lower hold.
