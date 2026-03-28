@@ -343,7 +343,7 @@ class CarController(CarControllerBase):
 
     lag_deg = float(desired_angle_deg - current_angle_deg)
     lag_boost = 0.0
-    if np.sign(lag_deg) == np.sign(desired_angle_deg) and abs(lag_deg) > 0.20:
+    if np.sign(lag_deg) == np.sign(desired_angle_deg) and abs(lag_deg) > 0.10:
       lag_boost = float(np.clip(
         lag_deg,
         -1.0 * lag_boost_cap * assist_speed_gain,
@@ -509,7 +509,7 @@ class CarController(CarControllerBase):
         steer_guard_deg = float(np.interp(
           float(getattr(CS.out, "vEgoRaw", CS.out.vEgo)),
           [0.0, 10.0, 20.0, 30.0],
-          [34.0, 42.0, 52.0, 62.0],
+          [36.0, 45.0, 56.0, 66.0],
         ))
         # Keep a measured-angle guard, but widen it with speed so the car can
         # build angle earlier into sharper corners instead of washing wide.
