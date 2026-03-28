@@ -325,7 +325,7 @@ class CarController(CarControllerBase):
       CarControllerParams.CURVE_ASSIST_ANGLE_BP,
       CarControllerParams.CURVE_ASSIST_GAIN_V,
     ))
-    assist_extra = float(np.interp(
+    lag_boost_cap = float(np.interp(
       desired_mag,
       CarControllerParams.CURVE_ASSIST_ANGLE_BP,
       CarControllerParams.CURVE_ASSIST_EXTRA_DEG_V,
@@ -341,14 +341,25 @@ class CarController(CarControllerBase):
       CarControllerParams.CURVE_ASSIST_MAX_DELTA_V,
     ))
 
-    assisted_angle = (desired_angle_deg * assist_gain) + (np.sign(desired_angle_deg) * assist_extra * assist_speed_gain)
+    lag_deg = float(desired_angle_deg - current_angle_deg)
+    lag_boost = 0.0
+    if np.sign(lag_deg) == np.sign(desired_angle_deg) and abs(lag_deg) > 0.20:
+      lag_boost = float(np.clip(
+        lag_deg,
+        -1.0 * lag_boost_cap * assist_speed_gain,
+        lag_boost_cap * assist_speed_gain,
+      ))
 
-    # Keep the lane-positioning assist as a modest bias around the planner request.
+    assisted_angle = (desired_angle_deg * assist_gain) + lag_boost
+
+    # Use the measured wheel angle only to catch up when steering is behind;
+    # avoid a fixed signed inside-bias that can make the car tuck into curves.
     return float(np.clip(
       assisted_angle,
       desired_angle_deg - max_delta,
       desired_angle_deg + max_delta,
     ))
+
 
   def _body_controls_turn(self, CS) -> int:
     if not bool(getattr(CS, "enableALC", False)):

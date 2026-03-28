@@ -74,6 +74,11 @@ class LongController:
   _LEAD_CONSTRAIN_GAP_MIN_M = 22.0
   _LEAD_CONSTRAIN_TIME_GAP_S = 1.7
   _NO_LEAD_MAPD_CURRENT_GATE_MS = 0.5 * CV.MPH_TO_MS
+  _MAPD_ONLY_ENTRY_PERSIST_MS = 180
+  _MAPD_ONLY_HIGHWAY_ENTRY_PERSIST_MS = 460
+  _MAPD_ONLY_HIGHWAY_SPEED_MS = 55.0 * CV.MPH_TO_MS
+  _MAPD_ONLY_HIGHWAY_MAX_DROP_MS = 24.0 * CV.MPH_TO_MS
+  _MAPD_ONLY_HIGHWAY_MAX_PLANNER_DELTA_MS = 16.0 * CV.MPH_TO_MS
 
   def __init__(self) -> None:
     self.acc = ACCController()
@@ -106,6 +111,7 @@ class LongController:
     self._curve_hold_last_update_ms: int = 0
     self._curve_mapd_release_candidate_since_ms: int = 0
     self._curve_planner_release_candidate_since_ms: int = 0
+    self._mapd_entry_candidate_since_ms: int = 0
     self._lead_hold_until_ms: int = 0
 
   def _rate_log(self, msg: str) -> None:
@@ -210,6 +216,53 @@ class LongController:
     if curve_specific_ms is not None:
       return float(curve_specific_ms)
     return self._mapd_curve_target_ms(now_ns=now_ns)
+
+
+  def _mapd_entry_target_ms(
+    self,
+    *,
+    now_ms: int,
+    now_ns: int,
+    reference_ms: float,
+    planner_near_ms: float,
+    v_ego_ms: float,
+    planner_curve_active: bool,
+  ) -> Optional[float]:
+    curve_specific_ms = self._curve_specific_mapd_target_ms(now_ns=now_ns)
+    if curve_specific_ms is None:
+      self._mapd_entry_candidate_since_ms = 0
+      return None
+
+    release_margin_ms = float(self._CURVE_RELEASE_NEAR_TARGET_MARGIN_MS)
+    if float(curve_specific_ms) >= (float(reference_ms) - max(float(self._NO_LEAD_MAPD_CURRENT_GATE_MS), float(release_margin_ms))):
+      self._mapd_entry_candidate_since_ms = 0
+      return None
+
+    if float(curve_specific_ms) >= (float(v_ego_ms) - (0.10 * CV.MPH_TO_MS)):
+      self._mapd_entry_candidate_since_ms = 0
+      return None
+
+    if bool(planner_curve_active):
+      self._mapd_entry_candidate_since_ms = 0
+      return float(curve_specific_ms)
+
+    persist_ms = int(self._MAPD_ONLY_ENTRY_PERSIST_MS)
+    if float(v_ego_ms) >= float(self._MAPD_ONLY_HIGHWAY_SPEED_MS):
+      suspicious_large_drop = float(curve_specific_ms) <= (float(reference_ms) - float(self._MAPD_ONLY_HIGHWAY_MAX_DROP_MS))
+      planner_far_from_mapd = float(planner_near_ms) >= (float(curve_specific_ms) + float(self._MAPD_ONLY_HIGHWAY_MAX_PLANNER_DELTA_MS))
+      if suspicious_large_drop and planner_far_from_mapd:
+        self._mapd_entry_candidate_since_ms = 0
+        return None
+      persist_ms = int(self._MAPD_ONLY_HIGHWAY_ENTRY_PERSIST_MS)
+
+    if int(self._mapd_entry_candidate_since_ms) == 0:
+      self._mapd_entry_candidate_since_ms = int(now_ms)
+      return None
+
+    if (int(now_ms) - int(self._mapd_entry_candidate_since_ms)) < int(persist_ms):
+      return None
+
+    return float(curve_specific_ms)
 
   def _mapd_curve_floor_ms(self, *, now_ns: int) -> Optional[float]:
     if int(self._mapd_last_ns) <= 0:
@@ -333,6 +386,7 @@ class LongController:
     self._curve_hold_last_update_ms = 0
     self._curve_mapd_release_candidate_since_ms = 0
     self._curve_planner_release_candidate_since_ms = 0
+    self._mapd_entry_candidate_since_ms = 0
 
   def _reset_lead_hold(self) -> None:
     self._lead_hold_until_ms = 0
@@ -745,23 +799,25 @@ class LongController:
           planner_curve_active = float(planner_near_ms) < (
             float(resume_ceiling_ms) - float(self._CURVE_RELEASE_NEAR_TARGET_MARGIN_MS)
           )
-          curve_specific_mapd_ms = self._curve_specific_mapd_target_ms(now_ns=now_ns)
-          curve_specific_active = (
-            curve_specific_mapd_ms is not None
-            and float(curve_specific_mapd_ms) < (float(resume_ceiling_ms) - float(self._NO_LEAD_MAPD_CURRENT_GATE_MS))
-            and float(curve_specific_mapd_ms) < (float(v_ego_ms) - (0.10 * CV.MPH_TO_MS))
+          curve_specific_mapd_ms = self._mapd_entry_target_ms(
+            now_ms=int(now),
+            now_ns=now_ns,
+            reference_ms=float(resume_ceiling_ms),
+            planner_near_ms=float(planner_near_ms),
+            v_ego_ms=float(v_ego_ms),
+            planner_curve_active=bool(planner_curve_active),
           )
 
           curve_candidates_ms: list[float] = []
           curve_owner_parts: list[str] = []
 
-          if curve_specific_active and curve_specific_mapd_ms is not None:
-            curve_candidates_ms.append(float(curve_specific_mapd_ms))
-            curve_owner_parts.append("mapd")
-
           if planner_curve_active:
             curve_candidates_ms.append(float(planner_near_ms))
             curve_owner_parts.append("planner")
+
+          if curve_specific_mapd_ms is not None:
+            curve_candidates_ms.append(float(curve_specific_mapd_ms))
+            curve_owner_parts.append("mapd")
 
           if curve_candidates_ms:
             raw_curve_target_ms = float(min(curve_candidates_ms))

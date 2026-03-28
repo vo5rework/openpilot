@@ -6,6 +6,7 @@ This keeps the Unity-style owner split:
 - LONG provides the desired speed target.
 - ACC owns the adaptive cruise ceiling internally.
 - Speed-limit changes may raise that ceiling, but automated slowdowns do not lower it.
+- A manual stalk-down latches a temporary lower hold until the driver manually raises again.
 
 The acceleration side is tuned to feel more natural:
 - larger clear-road jumps begin with one or two 5-step RES pulses
@@ -63,10 +64,13 @@ class ACCController:
   _FAST_DECEL_RESUME_HOLDOFF_MS = 2000
   _LEAD_FRESH_MS = 450
   _AUTOENGAGE_SPEED_WINDOW_MS = 0.8
-  _AUTO_ECHO_IGNORE_MS = 1400
+  _AUTO_ECHO_IGNORE_MS = 550
   _MIN_CRUISE_HOLD_MARGIN_MS = 5.0 * CV.MPH_TO_MS
   _MIN_CRUISE_CANCEL_VEGO_MARGIN_MS = 1.0 * CV.MPH_TO_MS
   _MANUAL_LOWER_STALE_CLEAR_MS = 6000
+  _MANUAL_CONFIRM_WINDOW_MS = 1500
+  _MANUAL_PENDING_TIMEOUT_MS = 1800
+  _MANUAL_LATCH_SUPPRESS_AFTER_AUTO_DECEL_MS = 2600
 
 
   def __init__(self) -> None:
@@ -91,6 +95,11 @@ class ACCController:
     self._manual_lower_hold_active = False
     self._manual_hold_restore_ceiling_kph = 0.0
     self._manual_hold_restore_requested = False
+    self._manual_lower_pending = False
+    self._manual_lower_pending_time_ms = 0
+    self._manual_raise_pending = False
+    self._manual_raise_pending_time_ms = 0
+    self._last_current_set_speed_kph = 0.0
 
     self._radar_sm = messaging.SubMaster(["radarState"])
 
@@ -114,6 +123,107 @@ class ACCController:
     self.acc_speed_kph = min(float(self.acc_speed_kph), 170.0)
     self.acc_speed_kph = max(float(self.acc_speed_kph), 0.0)
 
+
+  def _recent_auto_button_direction(self, *, now_ms: int) -> int:
+    if (int(now_ms) - int(self._last_auto_button_time_ms)) > int(self._AUTO_ECHO_IGNORE_MS):
+      return 0
+    return self._button_direction(int(self._last_auto_button))
+
+  def _observe_manual_set_speed_change(
+    self,
+    *,
+    now_ms: int,
+    current_kph: float,
+    desired_kph: float,
+    speed_limit_kph: float,
+    speed_units: str,
+    brake_pressed: bool = False,
+    stock_cruise_state: str = "",
+  ) -> None:
+    half_kph, _ = _cc_units_kph(speed_units)
+    threshold_kph = max(0.55 * float(half_kph), 0.5)
+    previous_kph = float(self._last_current_set_speed_kph)
+
+    if float(current_kph) <= 0.0:
+      self._last_current_set_speed_kph = float(current_kph)
+      self._clear_manual_pending()
+      return
+
+    if float(previous_kph) <= 0.0:
+      self._last_current_set_speed_kph = float(current_kph)
+      return
+
+    if bool(brake_pressed) or str(stock_cruise_state or "").upper() == "STANDBY":
+      self._last_current_set_speed_kph = float(current_kph)
+      self._clear_manual_pending()
+      return
+
+    delta_kph = float(current_kph) - float(previous_kph)
+    recent_auto_dir = self._recent_auto_button_direction(now_ms=now_ms)
+    recent_auto_age_ms = int(now_ms) - int(self._last_auto_button_time_ms)
+    recent_auto_decel = (
+      CruiseButtons.is_decel(int(self._last_auto_button))
+      and recent_auto_age_ms <= int(self._MANUAL_LATCH_SUPPRESS_AFTER_AUTO_DECEL_MS)
+    )
+    recent_auto_accel = (
+      CruiseButtons.is_accel(int(self._last_auto_button))
+      and recent_auto_age_ms <= int(self._MANUAL_LATCH_SUPPRESS_AFTER_AUTO_DECEL_MS)
+    )
+
+    if not self._pending_manual_lower(now_ms=now_ms):
+      self._manual_lower_pending = False
+      self._manual_lower_pending_time_ms = 0
+    if not self._pending_manual_raise(now_ms=now_ms):
+      self._manual_raise_pending = False
+      self._manual_raise_pending_time_ms = 0
+
+    system_target_kph = max(float(desired_kph), float(speed_limit_kph))
+    driver_is_lowering_below_system_target = float(current_kph) < (
+      float(system_target_kph) - max(0.35 * float(half_kph), 0.4)
+    )
+
+    if (
+      delta_kph <= (-1.0 * float(threshold_kph))
+      and int(recent_auto_dir) >= 0
+      and (not recent_auto_decel)
+      and self._pending_manual_lower(now_ms=now_ms)
+      and driver_is_lowering_below_system_target
+    ):
+      if not self._manual_lower_hold_active:
+        self._manual_hold_restore_ceiling_kph = max(
+          float(self._manual_hold_restore_ceiling_kph),
+          float(self.acc_speed_kph),
+          float(self.speed_limit_kph),
+          float(previous_kph),
+          float(desired_kph),
+          float(speed_limit_kph),
+        )
+      self._manual_lower_hold_active = True
+      self._manual_hold_restore_requested = False
+      self.acc_speed_kph = max(float(current_kph), 0.0)
+      self._manual_lower_pending = False
+      self._manual_lower_pending_time_ms = 0
+      self._manual_raise_pending = False
+      self._manual_raise_pending_time_ms = 0
+
+    elif (
+      delta_kph >= float(threshold_kph)
+      and int(recent_auto_dir) <= 0
+      and (not recent_auto_accel)
+      and self._pending_manual_raise(now_ms=now_ms)
+      and (self._manual_lower_hold_active or float(self._manual_hold_restore_ceiling_kph) > 0.0)
+      and float(current_kph) >= (float(previous_kph) + (0.40 * float(half_kph)))
+    ):
+      self._manual_hold_restore_requested = True
+      self._manual_lower_hold_active = False
+      self._manual_raise_pending = False
+      self._manual_raise_pending_time_ms = 0
+      self._manual_lower_pending = False
+      self._manual_lower_pending_time_ms = 0
+
+    self._last_current_set_speed_kph = float(current_kph)
+
+
   def note_human_buttons(self, cruise_buttons: int, *, speed_units: str, now_ms: Optional[int] = None) -> None:
     now = _now_ms() if now_ms is None else int(now_ms)
     btn = int(cruise_buttons or 0)
@@ -135,16 +245,28 @@ class ACCController:
       self._last_human_button_time_ms = int(now)
       if CruiseButtons.is_decel(btn):
         if not self._manual_lower_hold_active:
-          self._manual_hold_restore_ceiling_kph = max(float(self._manual_hold_restore_ceiling_kph), float(self.acc_speed_kph), float(self.speed_limit_kph))
-        self._manual_lower_hold_active = True
+          self._manual_hold_restore_ceiling_kph = max(
+            float(self._manual_hold_restore_ceiling_kph),
+            float(self.acc_speed_kph),
+            float(self.speed_limit_kph),
+          )
         self._manual_hold_restore_requested = False
+        self._manual_lower_pending = True
+        self._manual_lower_pending_time_ms = int(now)
+        self._manual_raise_pending = False
+        self._manual_raise_pending_time_ms = 0
       elif CruiseButtons.is_accel(btn):
+        self._manual_raise_pending = True
+        self._manual_raise_pending_time_ms = int(now)
+        self._manual_lower_pending = False
+        self._manual_lower_pending_time_ms = 0
         if self._manual_lower_hold_active or float(self._manual_hold_restore_ceiling_kph) > 0.0:
           self._manual_hold_restore_requested = True
         self._manual_lower_hold_active = False
-      self._update_max_acc_speed_from_button(button=btn, speed_units=speed_units)
+        self._update_max_acc_speed_from_button(button=btn, speed_units=speed_units)
 
     self.prev_cruise_buttons = btn
+
 
   def _no_human_action_for(self, *, now_ms: int, milliseconds: int) -> bool:
     return int(now_ms) >= int(self.human_action_time_ms) + int(milliseconds)
@@ -399,17 +521,26 @@ class ACCController:
     self.prev_speed_limit_kph = float(self.speed_limit_kph)
     if bool(set_speed_limit_active) and speed_limit_target_ms is not None and float(speed_limit_target_ms) > 0.0:
       self.speed_limit_kph = float(speed_limit_target_ms) * CV.MS_TO_KPH
-      # A real posted-limit change should reseed the ACC ceiling and clear any
-      # temporary manual lower hold from the previous limit context.
-      if int(self.prev_speed_limit_kph) != int(self.speed_limit_kph):
+      # A real posted-limit change may reseed the ACC ceiling, but an active
+      # manual-lower hold must remain latched until the driver explicitly raises
+      # it with the stalk.
+      if int(self.prev_speed_limit_kph) != int(self.speed_limit_kph) and not self._manual_lower_hold_active:
         self.acc_speed_kph = float(self.speed_limit_kph)
-        self._manual_lower_hold_active = False
         self._manual_hold_restore_ceiling_kph = 0.0
         self._manual_hold_restore_requested = False
     else:
       self.speed_limit_kph = 0.0
 
     current_kph = float(current_set_speed_ms) * CV.MS_TO_KPH
+    self._observe_manual_set_speed_change(
+      now_ms=now_ms,
+      current_kph=float(current_kph),
+      desired_kph=float(desired_speed_ms) * CV.MS_TO_KPH,
+      speed_limit_kph=float(self.speed_limit_kph),
+      speed_units=speed_units,
+      brake_pressed=bool(brake_pressed),
+      stock_cruise_state=stock_state,
+    )
     manual_raise_cleared_to_limit = self._consume_recent_manual_raise_clear(
       now_ms=now_ms,
       speed_limit_kph=float(self.speed_limit_kph),
@@ -421,28 +552,32 @@ class ACCController:
     self._prev_enabled = bool(enabled)
 
     if disabled_edge:
-      if self._manual_lower_hold_active or float(self._manual_hold_restore_ceiling_kph) > 0.0:
-        self._manual_hold_restore_requested = True
-      self._manual_lower_hold_active = False
+      # Preserve a manual-lower hold across disengage; only an explicit manual
+      # raise should clear it.
       self._reset_accel_burst()
+      self._clear_manual_pending()
 
     if not enabled:
       self._reset_accel_burst()
+      self._clear_manual_pending()
       return AccDecision(None, "gated: not enabled")
 
     target_kph_seed = max(float(current_kph), float(desired_speed_ms) * CV.MS_TO_KPH)
     if enabled_edge or self.acc_speed_kph <= 0.0:
-      # Re-engage should restore a sane ceiling from the live set speed / ego speed.
-      self.acc_speed_kph = max(
-        float(current_kph),
-        float(v_ego_ms) * CV.MS_TO_KPH,
-        float(self.speed_limit_kph),
-        float(target_kph_seed),
-        float(self._manual_hold_restore_ceiling_kph),
-      )
-      self._manual_lower_hold_active = False
-      self._manual_hold_restore_ceiling_kph = 0.0
-      self._manual_hold_restore_requested = False
+      if self._manual_lower_hold_active:
+        # Re-engage should keep the manually lowered ceiling latched.
+        self.acc_speed_kph = max(float(self.acc_speed_kph), float(current_kph), 0.0)
+      else:
+        # Re-engage should restore a sane ceiling from the live set speed / ego speed.
+        self.acc_speed_kph = max(
+          float(current_kph),
+          float(v_ego_ms) * CV.MS_TO_KPH,
+          float(self.speed_limit_kph),
+          float(target_kph_seed),
+          float(self._manual_hold_restore_ceiling_kph),
+        )
+        self._manual_hold_restore_ceiling_kph = 0.0
+        self._manual_hold_restore_requested = False
     elif self._manual_hold_restore_requested:
       restore_kph = max(
         float(current_kph),
@@ -470,17 +605,7 @@ class ACCController:
     stock_state = str(stock_cruise_state or "").upper()
     half_kph, full_kph = _cc_units_kph(speed_units)
 
-    stale_manual_lower = (
-      self._manual_lower_hold_active
-      and (int(now_ms) - int(self._last_human_button_time_ms)) > int(self._MANUAL_LOWER_STALE_CLEAR_MS)
-      and (not lead.status)
-      and float(target_kph_seed) >= (float(current_kph) + float(full_kph))
-    )
-    if stale_manual_lower:
-      self.acc_speed_kph = max(float(self.acc_speed_kph), float(target_kph_seed), float(self.speed_limit_kph))
-      self._manual_lower_hold_active = False
-      self._manual_hold_restore_ceiling_kph = 0.0
-      self._manual_hold_restore_requested = False
+    # An explicit manual raise is the only thing that should clear a manual-lower hold.
 
     if stock_state == "STANDBY":
       if (
@@ -523,8 +648,16 @@ class ACCController:
 
     target_speed_ms = max(float(desired_speed_ms), float(self.MIN_CRUISE_SPEED_MS)) if min_hold_active else float(desired_speed_ms)
     target_kph = float(target_speed_ms) * CV.MS_TO_KPH
-    speed_offset_kph = float(target_kph) - float(current_kph)
-    desired_headroom_kph = max(float(self.acc_speed_kph), float(target_kph)) - float(current_kph)
+
+    # A manual stalk-down hold is meant to be a real ceiling override until the driver
+    # explicitly clears it with a manual raise. Clamp the effective target used for
+    # automated accel decisions so LONG/mapd cannot silently climb back to the posted limit.
+    effective_target_kph = float(target_kph)
+    if self._manual_lower_hold_active and not self._manual_hold_restore_requested:
+      effective_target_kph = min(float(effective_target_kph), float(self.acc_speed_kph))
+
+    speed_offset_kph = float(effective_target_kph) - float(current_kph)
+    desired_headroom_kph = max(float(self.acc_speed_kph), float(effective_target_kph)) - float(current_kph)
     available_speed_kph = max(0.0, float(desired_headroom_kph))
 
     button: Optional[int] = None
@@ -550,7 +683,7 @@ class ACCController:
 
     if button is None:
       reason = "no-op[min_hold]" if min_hold_active else "no-op"
-      return AccDecision(None, reason, target_kph, current_kph, current_kph)
+      return AccDecision(None, reason, effective_target_kph, current_kph, current_kph)
 
     if button is not None and not CruiseButtons.is_accel(button):
       self._reset_accel_burst()
@@ -563,6 +696,10 @@ class ACCController:
           button = None
       elif int(button) == int(CruiseButtons.DECEL_SET) and (float(current_kph) - float(half_kph)) < float(min_cruise_kph):
         button = None
+
+    if button is None:
+      reason = "no-op[min_cruise_guard]" if min_hold_active else "no-op[min_cruise_guard]"
+      return AccDecision(None, reason, effective_target_kph, current_kph, current_kph)
 
     self._record_button(now_ms=now_ms, button=int(button), speed_units=speed_units)
 
@@ -579,4 +716,17 @@ class ACCController:
       est_kph = 0.0
 
     reason = "cancel" if int(button) == int(CruiseButtons.CANCEL) else "press"
-    return AccDecision(int(button), reason, target_kph, current_kph, est_kph)
+    return AccDecision(int(button), reason, effective_target_kph, current_kph, est_kph)
+
+  def _clear_manual_pending(self) -> None:
+    self._manual_lower_pending = False
+    self._manual_lower_pending_time_ms = 0
+    self._manual_raise_pending = False
+    self._manual_raise_pending_time_ms = 0
+
+  def _pending_manual_lower(self, *, now_ms: int) -> bool:
+    return bool(self._manual_lower_pending) and (int(now_ms) - int(self._manual_lower_pending_time_ms)) <= int(self._MANUAL_PENDING_TIMEOUT_MS)
+
+  def _pending_manual_raise(self, *, now_ms: int) -> bool:
+    return bool(self._manual_raise_pending) and (int(now_ms) - int(self._manual_raise_pending_time_ms)) <= int(self._MANUAL_PENDING_TIMEOUT_MS)
+
