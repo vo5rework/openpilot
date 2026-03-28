@@ -71,7 +71,7 @@ class LongController:
   _LEAD_CONSTRAIN_CLOSING_VREL_MS = -0.15
   _LEAD_CONSTRAIN_GAP_MIN_M = 22.0
   _LEAD_CONSTRAIN_TIME_GAP_S = 1.7
-  _NO_LEAD_MAPD_CURRENT_GATE_MS = 0.30 * CV.MPH_TO_MS
+  _NO_LEAD_MAPD_CURRENT_GATE_MS = 0.15 * CV.MPH_TO_MS
 
   def __init__(self) -> None:
     self.acc = ACCController()
@@ -715,12 +715,12 @@ class LongController:
             )
 
             if planner_curve_active:
-              merge_gate_ms = max(0.25 * CV.MPH_TO_MS, 0.5 * mapd_takeover_gate_ms)
+              merge_gate_ms = max(0.15 * CV.MPH_TO_MS, 0.4 * mapd_takeover_gate_ms)
               if float(mapd_curve_target_ms) < (float(raw_curve_target_ms) - merge_gate_ms):
                 raw_curve_target_ms = float(mapd_curve_target_ms)
                 curve_state_hint = "planner+mapd"
             elif mapd_curve_active:
-              early_mapd_gate_ms = max(1.0 * CV.MPH_TO_MS, 0.5 * float(self._curve_entry_threshold_ms(float(resume_ceiling_ms))))
+              early_mapd_gate_ms = max(0.60 * CV.MPH_TO_MS, 0.4 * float(self._curve_entry_threshold_ms(float(resume_ceiling_ms))))
               if float(mapd_curve_target_ms) < (float(resume_ceiling_ms) - early_mapd_gate_ms):
                 raw_curve_target_ms = float(mapd_curve_target_ms)
                 curve_state_hint = "mapd"
