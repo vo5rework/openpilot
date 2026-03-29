@@ -101,6 +101,7 @@ class ACCController:
     self._manual_raise_pending_time_ms = 0
     self._clear_road_ceiling_kph = 0.0
     self._last_current_set_speed_kph = 0.0
+    self._last_confirmed_manual_decel_time_ms = 0
 
     self._radar_sm = messaging.SubMaster(["radarState"])
 
@@ -188,6 +189,7 @@ class ACCController:
       and int(recent_auto_dir) >= 0
       and (not recent_auto_decel)
       and self._pending_manual_lower(now_ms=now_ms)
+      and self._recent_confirmed_manual_decel(now_ms=now_ms)
       and driver_is_lowering_below_system_target
     ):
       if not self._manual_lower_hold_active:
@@ -206,6 +208,7 @@ class ACCController:
       self._manual_lower_pending_time_ms = 0
       self._manual_raise_pending = False
       self._manual_raise_pending_time_ms = 0
+      self._last_confirmed_manual_decel_time_ms = 0
 
     elif (
       delta_kph >= float(threshold_kph)
@@ -256,11 +259,18 @@ class ACCController:
         self._manual_lower_pending_time_ms = int(now)
         self._manual_raise_pending = False
         self._manual_raise_pending_time_ms = 0
+        recent_auto_decel = (
+          CruiseButtons.is_decel(int(self._last_auto_button))
+          and (now - int(self._last_auto_button_time_ms)) <= int(self._MANUAL_LATCH_SUPPRESS_AFTER_AUTO_DECEL_MS)
+        )
+        if not recent_auto_decel:
+          self._last_confirmed_manual_decel_time_ms = int(now)
       elif CruiseButtons.is_accel(btn):
         self._manual_raise_pending = True
         self._manual_raise_pending_time_ms = int(now)
         self._manual_lower_pending = False
         self._manual_lower_pending_time_ms = 0
+        self._last_confirmed_manual_decel_time_ms = 0
         if self._manual_lower_hold_active or float(self._manual_hold_restore_ceiling_kph) > 0.0:
           self._manual_hold_restore_requested = True
         self._manual_lower_hold_active = False
@@ -470,6 +480,53 @@ class ACCController:
     if CruiseButtons.is_accel(int(button)):
       self._update_max_acc_speed_from_button(button=int(button), speed_units=speed_units)
 
+  def _recent_confirmed_manual_decel(self, *, now_ms: int) -> bool:
+    if int(self._last_confirmed_manual_decel_time_ms) <= 0:
+      return False
+    return (int(now_ms) - int(self._last_confirmed_manual_decel_time_ms)) <= int(self._MANUAL_CONFIRM_WINDOW_MS)
+
+  def note_disabled(
+    self,
+    *,
+    now_ms: int,
+    current_set_speed_ms: float,
+    desired_speed_ms: float,
+    v_ego_ms: float,
+    speed_limit_target_ms: Optional[float] = None,
+    set_speed_limit_active: bool = False,
+  ) -> None:
+    speed_limit_kph = 0.0
+    if bool(set_speed_limit_active) and speed_limit_target_ms is not None and float(speed_limit_target_ms) > 0.0:
+      speed_limit_kph = float(speed_limit_target_ms) * CV.MS_TO_KPH
+
+    current_kph = float(current_set_speed_ms) * CV.MS_TO_KPH
+    target_kph_seed = max(
+      float(current_kph),
+      float(desired_speed_ms) * CV.MS_TO_KPH,
+      float(v_ego_ms) * CV.MS_TO_KPH,
+      float(speed_limit_kph),
+    )
+
+    if bool(self._prev_enabled):
+      if not self._manual_lower_hold_active:
+        self._clear_road_ceiling_kph = max(
+          float(self._clear_road_ceiling_kph),
+          float(self.acc_speed_kph),
+          float(current_kph),
+          float(speed_limit_kph),
+          float(target_kph_seed),
+        )
+      self._reset_accel_burst()
+      self._clear_manual_pending()
+      self._last_confirmed_manual_decel_time_ms = 0
+
+    self._prev_enabled = False
+    self._last_current_set_speed_kph = float(current_kph)
+    self.automated_action_time_ms = 0
+    self._last_auto_button = int(CruiseButtons.IDLE)
+    self._last_auto_button_time_ms = 0
+    self._last_confirmed_manual_decel_time_ms = 0
+
   def _consume_recent_manual_raise_clear(
     self,
     *,
@@ -499,6 +556,7 @@ class ACCController:
     self._manual_hold_restore_requested = False
     self._last_human_button = int(CruiseButtons.IDLE)
     self._last_human_button_time_ms = 0
+    self._last_confirmed_manual_decel_time_ms = 0
     return True
 
 
@@ -574,6 +632,7 @@ class ACCController:
     if not enabled:
       self._reset_accel_burst()
       self._clear_manual_pending()
+      self._last_confirmed_manual_decel_time_ms = 0
       return AccDecision(None, "gated: not enabled")
 
     if (
