@@ -536,6 +536,7 @@ class ACCController:
       self.speed_limit_kph = 0.0
 
     current_kph = float(current_set_speed_ms) * CV.MS_TO_KPH
+    target_kph_seed = max(float(current_kph), float(desired_speed_ms) * CV.MS_TO_KPH)
     stock_state = str(stock_cruise_state or "").upper()
     self._observe_manual_set_speed_change(
       now_ms=now_ms,
@@ -575,18 +576,16 @@ class ACCController:
       self._clear_manual_pending()
       return AccDecision(None, "gated: not enabled")
 
-    target_kph_seed = max(float(current_kph), float(desired_speed_ms) * CV.MS_TO_KPH)
     if (
       stock_state in ("ENABLED", "OVERRIDE", "STANDSTILL")
       and not bool(brake_pressed)
-      and not bool(lead.status)
       and not bool(self._manual_lower_hold_active)
-      and float(desired_speed_ms) >= (float(current_set_speed_ms) - (0.30 * CV.MPH_TO_MS))
     ):
       self._clear_road_ceiling_kph = max(
         float(self._clear_road_ceiling_kph),
         float(self.acc_speed_kph),
         float(current_kph),
+        float(self._last_current_set_speed_kph),
         float(v_ego_ms) * CV.MS_TO_KPH,
         float(self.speed_limit_kph),
         float(target_kph_seed),
