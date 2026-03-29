@@ -398,14 +398,14 @@ class SelfdriveD:
 
     # Check for FCW
     stock_long_is_braking = self.enabled and not self.CP.openpilotLongitudinalControl and CS.aEgo < -1.25
-    fcw_stopped_or_creeping = CS.standstill or CS.vEgo < 0.5
+    fcw_low_speed_suppress = CS.standstill or CS.vEgo < 1.5
     model_fcw = (
       self.sm['modelV2'].meta.hardBrakePredicted
       and not CS.brakePressed
       and not stock_long_is_braking
-      and not fcw_stopped_or_creeping
+      and not fcw_low_speed_suppress
     )
-    planner_fcw = self.sm['longitudinalPlan'].fcw and self.enabled
+    planner_fcw = self.sm['longitudinalPlan'].fcw and self.enabled and not fcw_low_speed_suppress
     if (planner_fcw or model_fcw) and not self.CP.notCar:
       self.events.add(EventName.fcw)
 
