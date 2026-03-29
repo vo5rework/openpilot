@@ -64,8 +64,8 @@ class LongController:
   _MAPD_FRESH_NS = 1_500_000_000
   _CURVE_MAPD_RELEASE_PERSIST_MS = 220
   _CURVE_PLANNER_RELEASE_PERSIST_MS = 180
-  _CURVE_PLANNER_RELEASE_MAPD_TOLERANCE_MS = 4.0 * CV.MPH_TO_MS
-  _CURVE_PLANNER_RELEASE_OVERRIDE_MS = 420
+  _CURVE_PLANNER_RELEASE_MAPD_TOLERANCE_MS = 5.5 * CV.MPH_TO_MS
+  _CURVE_PLANNER_RELEASE_OVERRIDE_MS = 260
   _LEAD_HOLD_PERSIST_MS = 240
   _LEAD_HOLD_RELEASE_MARGIN_MS = 0.20 * CV.MPH_TO_MS
   _LEAD_OPENING_VREL_MS = 0.02
@@ -86,9 +86,16 @@ class LongController:
   _MAPD_ONLY_HIGHWAY_MAX_EXTRA_DROP_WITH_PLANNER_MS = 12.0 * CV.MPH_TO_MS
   _MAPD_ONLY_HIGHWAY_NEAR_STEER_DEG = 2.5
   _LEAD_CLEAR_MAPD_GRACE_MS = 900
-  _CURVE_REENTRY_BLOCK_MS = 1400
+  _CURVE_REENTRY_BLOCK_MS = 1800
   _CURVE_REENTRY_ALLOW_DROP_MS = 4.0 * CV.MPH_TO_MS
   _CURVE_REENTRY_ALLOW_STEER_DEG = 3.0
+  _PLANNER_ONLY_REENTRY_BLOCK_DROP_MS = 3.0 * CV.MPH_TO_MS
+  _PLANNER_ONLY_REENTRY_ALLOW_STEER_DEG = 3.0
+  _PLANNER_CURVE_ENTRY_MARGIN_MS = 1.0 * CV.MPH_TO_MS
+  _MAPD_LOW_SPEED_ENTRY_SPEED_MS = 45.0 * CV.MPH_TO_MS
+  _MAPD_LOW_SPEED_SHARP_DROP_MS = 5.0 * CV.MPH_TO_MS
+  _MAPD_LOW_SPEED_PLANNER_HINT_DROP_MS = 1.0 * CV.MPH_TO_MS
+  _MAPD_LOW_SPEED_STEER_HINT_DEG = 1.0
   _SHARP_CURVE_FAST_ENTRY_DROP_MS = 6.0 * CV.MPH_TO_MS
 
   def __init__(self) -> None:
@@ -318,6 +325,21 @@ class LongController:
         or dual_source_agreement
       )
     )
+
+    low_speed = v_ego_ms <= float(self._MAPD_LOW_SPEED_ENTRY_SPEED_MS)
+    low_speed_sharp_entry = (
+      low_speed
+      and float(curve_specific_ms) <= (reference_ms - float(self._MAPD_LOW_SPEED_SHARP_DROP_MS))
+      and (
+        dual_source_agreement
+        or planner_near_ms <= (reference_ms - float(self._MAPD_LOW_SPEED_PLANNER_HINT_DROP_MS))
+        or current_angle_deg >= float(self._MAPD_LOW_SPEED_STEER_HINT_DEG)
+      )
+    )
+
+    if low_speed_sharp_entry:
+      self._mapd_entry_candidate_since_ms = 0
+      return float(curve_specific_ms)
 
     if bool(planner_curve_active):
       if highway_speed:
@@ -908,16 +930,29 @@ class LongController:
           self._reset_curve_hold()
         elif (not self._lead_present) and (not self._lp_has_lead):
           self._reset_lead_hold()
-          planner_curve_active = float(planner_near_ms) < (
-            float(resume_ceiling_ms) - float(self._CURVE_RELEASE_NEAR_TARGET_MARGIN_MS)
+          current_angle_deg = abs(float(getattr(cs_out, "steeringAngleDeg", 0.0) or 0.0))
+          planner_curve_margin_ms = max(
+            float(self._CURVE_RELEASE_NEAR_TARGET_MARGIN_MS),
+            float(self._PLANNER_CURVE_ENTRY_MARGIN_MS),
           )
+          planner_curve_active = float(planner_near_ms) < (
+            float(resume_ceiling_ms) - float(planner_curve_margin_ms)
+          )
+
+          if (
+            int(now) <= int(self._curve_recent_clear_until_ms)
+            and current_angle_deg <= float(self._PLANNER_ONLY_REENTRY_ALLOW_STEER_DEG)
+            and float(planner_near_ms) >= (float(resume_ceiling_ms) - float(self._PLANNER_ONLY_REENTRY_BLOCK_DROP_MS))
+          ):
+            planner_curve_active = False
+
           curve_specific_mapd_ms = self._mapd_entry_target_ms(
             now_ms=int(now),
             now_ns=now_ns,
             reference_ms=float(resume_ceiling_ms),
             planner_near_ms=float(planner_near_ms),
             v_ego_ms=float(v_ego_ms),
-            current_angle_deg=float(getattr(cs_out, "steeringAngleDeg", 0.0) or 0.0),
+            current_angle_deg=float(current_angle_deg),
             planner_curve_active=bool(planner_curve_active),
           )
 
@@ -965,9 +1000,14 @@ class LongController:
 
           near_resume_tolerance_ms = max(
             float(self._CURVE_RELEASE_NEAR_TARGET_MARGIN_MS),
-            2.2 * CV.MPH_TO_MS,
+            2.4 * CV.MPH_TO_MS,
           )
-          if float(curve_target_ms) >= (float(resume_ceiling_ms) - float(near_resume_tolerance_ms)):
+          planner_near_resume_clear = float(planner_near_ms) >= (
+            float(resume_ceiling_ms) - max(float(self._CURVE_RELEASE_NEAR_TARGET_MARGIN_MS), 0.8 * CV.MPH_TO_MS)
+          )
+          if float(curve_target_ms) >= (float(resume_ceiling_ms) - float(near_resume_tolerance_ms)) and (
+            planner_near_resume_clear or curve_specific_mapd_ms is None
+          ):
             self._reset_curve_hold()
             self._curve_recent_clear_until_ms = int(now) + int(self._CURVE_REENTRY_BLOCK_MS)
             curve_target_ms = float(resume_ceiling_ms)

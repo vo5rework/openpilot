@@ -464,7 +464,10 @@ class ACCController:
     self._last_auto_button_time_ms = int(now_ms)
     if int(button) == int(CruiseButtons.CANCEL):
       self.fast_decel_time_ms = int(now_ms)
-    else:
+      return
+
+    # Automated slowdowns should not lower the retained clear-road ceiling.
+    if CruiseButtons.is_accel(int(button)):
       self._update_max_acc_speed_from_button(button=int(button), speed_units=speed_units)
 
   def _consume_recent_manual_raise_clear(
@@ -562,6 +565,7 @@ class ACCController:
           float(self.acc_speed_kph),
           float(current_kph),
           float(self.speed_limit_kph),
+          float(target_kph_seed),
         )
       self._reset_accel_burst()
       self._clear_manual_pending()
@@ -600,6 +604,7 @@ class ACCController:
           float(self.speed_limit_kph),
           float(target_kph_seed),
           float(self._manual_hold_restore_ceiling_kph),
+          float(self._clear_road_ceiling_kph),
         )
         self._manual_hold_restore_ceiling_kph = 0.0
         self._manual_hold_restore_requested = False
