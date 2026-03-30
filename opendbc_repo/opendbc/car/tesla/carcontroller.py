@@ -325,7 +325,7 @@ class CarController(CarControllerBase):
       CarControllerParams.CURVE_ASSIST_ANGLE_BP,
       CarControllerParams.CURVE_ASSIST_GAIN_V,
     ))
-    lag_boost_cap = float(np.interp(
+    assist_extra = float(np.interp(
       desired_mag,
       CarControllerParams.CURVE_ASSIST_ANGLE_BP,
       CarControllerParams.CURVE_ASSIST_EXTRA_DEG_V,
@@ -341,25 +341,14 @@ class CarController(CarControllerBase):
       CarControllerParams.CURVE_ASSIST_MAX_DELTA_V,
     ))
 
-    lag_deg = float(desired_angle_deg - current_angle_deg)
-    lag_boost = 0.0
-    if np.sign(lag_deg) == np.sign(desired_angle_deg) and abs(lag_deg) > 0.10:
-      lag_boost = float(np.clip(
-        lag_deg,
-        -1.0 * lag_boost_cap * assist_speed_gain,
-        lag_boost_cap * assist_speed_gain,
-      ))
+    assisted_angle = (desired_angle_deg * assist_gain) + (np.sign(desired_angle_deg) * assist_extra * assist_speed_gain)
 
-    assisted_angle = (desired_angle_deg * assist_gain) + lag_boost
-
-    # Use the measured wheel angle only to catch up when steering is behind;
-    # avoid a fixed signed inside-bias that can make the car tuck into curves.
+    # Keep the lane-positioning assist as a modest bias around the planner request.
     return float(np.clip(
       assisted_angle,
       desired_angle_deg - max_delta,
       desired_angle_deg + max_delta,
     ))
-
 
   def _body_controls_turn(self, CS) -> int:
     if not bool(getattr(CS, "enableALC", False)):
@@ -509,7 +498,7 @@ class CarController(CarControllerBase):
         steer_guard_deg = float(np.interp(
           float(getattr(CS.out, "vEgoRaw", CS.out.vEgo)),
           [0.0, 10.0, 20.0, 30.0],
-          [36.0, 45.0, 56.0, 66.0],
+          [34.0, 42.0, 52.0, 62.0],
         ))
         # Keep a measured-angle guard, but widen it with speed so the car can
         # build angle earlier into sharper corners instead of washing wide.
