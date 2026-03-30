@@ -114,6 +114,11 @@ class LongController:
   _STRAIGHT_CLEAR_MAPD_MILD_DROP_MS = 6.0 * CV.MPH_TO_MS
   _STRAIGHT_CLEAR_BASE_PERSIST_MS = 160
   _STRAIGHT_CLEAR_HARD_PERSIST_MS = 420
+  _SET_FLOOR_CLEAR_STEER_DEG = 1.15
+  _SET_FLOOR_CLEAR_CURRENT_MARGIN_MS = 3.0 * CV.MPH_TO_MS
+  _SET_FLOOR_CLEAR_REFERENCE_MARGIN_MS = 4.0 * CV.MPH_TO_MS
+  _SET_FLOOR_CLEAR_PLANNER_MARGIN_MS = 1.0 * CV.MPH_TO_MS
+  _SET_FLOOR_CLEAR_PERSIST_MS = 260
 
   def __init__(self) -> None:
     self.acc = ACCController()
@@ -152,6 +157,7 @@ class LongController:
     self._lead_recently_cleared_until_ms: int = 0
     self._lead_present_prev: bool = False
     self._curve_recent_clear_until_ms: int = 0
+    self._set_floor_clear_candidate_since_ms: int = 0
     self._straight_clear_candidate_since_ms: int = 0
     self._activation_ns: int = 0
 
@@ -575,6 +581,7 @@ class LongController:
     self._curve_mapd_release_candidate_since_ms = 0
     self._curve_planner_release_candidate_since_ms = 0
     self._mapd_entry_candidate_since_ms = 0
+    self._set_floor_clear_candidate_since_ms = 0
     self._straight_clear_candidate_since_ms = 0
 
   def _reset_lead_hold(self) -> None:
@@ -718,6 +725,52 @@ class LongController:
     return (int(now_ms) - int(self._straight_clear_candidate_since_ms)) >= int(persist_ms)
 
 
+  def _should_force_curve_clear_from_set_floor(
+    self,
+    *,
+    now_ms: int,
+    reference_ms: float,
+    planner_last_ms: float,
+    curve_target_ms: float,
+    current_set_ms: float,
+    current_angle_deg: float,
+  ) -> bool:
+    if abs(float(current_angle_deg)) > float(self._SET_FLOOR_CLEAR_STEER_DEG):
+      self._set_floor_clear_candidate_since_ms = 0
+      return False
+
+    reference_ms = float(reference_ms)
+    planner_last_ms = float(planner_last_ms)
+    curve_target_ms = float(curve_target_ms)
+    current_set_ms = float(current_set_ms)
+
+    if current_set_ms <= 0.1:
+      self._set_floor_clear_candidate_since_ms = 0
+      return False
+
+    if reference_ms < (current_set_ms + float(self._SET_FLOOR_CLEAR_REFERENCE_MARGIN_MS)):
+      self._set_floor_clear_candidate_since_ms = 0
+      return False
+
+    if curve_target_ms >= (current_set_ms - float(self._SET_FLOOR_CLEAR_CURRENT_MARGIN_MS)):
+      self._set_floor_clear_candidate_since_ms = 0
+      return False
+
+    planner_floor_ms = max(
+      current_set_ms - float(self._SET_FLOOR_CLEAR_PLANNER_MARGIN_MS),
+      curve_target_ms + float(self._SET_FLOOR_CLEAR_CURRENT_MARGIN_MS),
+    )
+    if planner_last_ms < planner_floor_ms:
+      self._set_floor_clear_candidate_since_ms = 0
+      return False
+
+    if int(self._set_floor_clear_candidate_since_ms) == 0:
+      self._set_floor_clear_candidate_since_ms = int(now_ms)
+      return False
+
+    return (int(now_ms) - int(self._set_floor_clear_candidate_since_ms)) >= int(self._SET_FLOOR_CLEAR_PERSIST_MS)
+
+
   def _resolve_no_lead_curve_target(
     self,
     *,
@@ -728,6 +781,7 @@ class LongController:
     planner_near_ms: float,
     planner_preview_ms: float,
     v_ego_ms: float,
+    current_set_ms: float,
     current_angle_deg: float,
   ) -> tuple[float, str]:
     reference_ms = float(reference_ms)
@@ -735,6 +789,7 @@ class LongController:
     planner_near_ms = float(planner_near_ms)
     planner_preview_ms = float(planner_preview_ms)
     v_ego_ms = float(v_ego_ms)
+    current_set_ms = float(current_set_ms)
     current_angle_deg = float(current_angle_deg)
 
     raw_curve_specific_mapd_ms = self._curve_specific_mapd_target_ms(now_ns=now_ns)
@@ -823,6 +878,19 @@ class LongController:
       if float(curve_target_ms) >= float(hold_floor_ms):
         curve_target_ms = float(self.MIN_CRUISE_SPEED_MS)
         curve_state = f"{curve_state}+min_hold"
+
+    if self._should_force_curve_clear_from_set_floor(
+      now_ms=int(now_ms),
+      reference_ms=float(reference_ms),
+      planner_last_ms=float(planner_last_ms),
+      curve_target_ms=float(curve_target_ms),
+      current_set_ms=float(current_set_ms),
+      current_angle_deg=float(current_angle_deg),
+    ):
+      self._reset_curve_hold()
+      self._curve_recent_clear_until_ms = int(now_ms) + int(self._CURVE_REENTRY_BLOCK_MS)
+      curve_target_ms = float(reference_ms)
+      curve_state = "curve_clear(set_floor)"
 
     if self._should_snap_clear_curve_on_straight(
       now_ms=int(now_ms),
@@ -1280,6 +1348,7 @@ class LongController:
               planner_near_ms=float(planner_near_ms),
               planner_preview_ms=float(planner_preview_ms),
               v_ego_ms=float(v_ego_ms),
+              current_set_ms=float(current_set_ms),
               current_angle_deg=float(current_angle_deg),
             )
 
