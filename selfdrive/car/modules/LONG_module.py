@@ -726,11 +726,15 @@ class LongController:
     planner_near_ms: float,
     planner_preview_ms: float,
   ) -> bool:
-    return bool(
-      float(planner_last_ms) >= (float(reference_ms) - float(self._STRAIGHT_CLEAR_PLANNER_LAST_MARGIN_MS))
-      and float(planner_near_ms) >= (float(reference_ms) - float(self._STRAIGHT_CLEAR_PLANNER_NEAR_MARGIN_MS))
-      and float(planner_preview_ms) >= (float(reference_ms) - float(self._STRAIGHT_CLEAR_PLANNER_PREVIEW_MARGIN_MS))
-    )
+    last_clear = float(planner_last_ms) >= (float(reference_ms) - float(self._STRAIGHT_CLEAR_PLANNER_LAST_MARGIN_MS))
+    near_clear = float(planner_near_ms) >= (float(reference_ms) - float(self._STRAIGHT_CLEAR_PLANNER_NEAR_MARGIN_MS))
+    preview_clear = float(planner_preview_ms) >= (float(reference_ms) - float(self._STRAIGHT_CLEAR_PLANNER_PREVIEW_MARGIN_MS))
+
+    # Straight-road resume helper only:
+    # favor near/preview freshness and allow either source to clear resume. This
+    # intentionally ignores planner_last lag after curve exit, while leaving the
+    # separate in-curve release path unchanged.
+    return bool(near_clear or preview_clear)
 
   def _should_snap_clear_curve_on_straight(
     self,
