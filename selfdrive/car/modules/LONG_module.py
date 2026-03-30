@@ -129,6 +129,14 @@ class LongController:
   _RECOVERY_CLEAR_PLANNER_NEAR_MARGIN_MS = 1.6 * CV.MPH_TO_MS
   _RECOVERY_CLEAR_PLANNER_PREVIEW_MARGIN_MS = 2.2 * CV.MPH_TO_MS
   _RECOVERY_CLEAR_PERSIST_MS = 220
+  _CURVE_STALE_TIMEOUT_STEER_DEG = 0.75
+  _CURVE_STALE_TIMEOUT_REFERENCE_MARGIN_MS = 3.0 * CV.MPH_TO_MS
+  _CURVE_STALE_TIMEOUT_CURRENT_MARGIN_MS = 1.0 * CV.MPH_TO_MS
+  _CURVE_STALE_TIMEOUT_TARGET_DELTA_MS = 1.5 * CV.MPH_TO_MS
+  _CURVE_STALE_TIMEOUT_PERSIST_MS = 1400
+  _CURVE_STALE_TIMEOUT_BLOCK_MS = 5000
+  _CURVE_STALE_TIMEOUT_REENTRY_STEER_DEG = 2.0
+  _CURVE_STALE_TIMEOUT_REENTRY_STRONG_DROP_MS = 8.0 * CV.MPH_TO_MS
 
   def __init__(self) -> None:
     self.acc = ACCController()
@@ -170,6 +178,9 @@ class LongController:
     self._set_floor_clear_candidate_since_ms: int = 0
     self._straight_clear_candidate_since_ms: int = 0
     self._recovery_clear_candidate_since_ms: int = 0
+    self._curve_stale_candidate_since_ms: int = 0
+    self._curve_stale_last_target_ms: float = 0.0
+    self._curve_timeout_block_until_ms: int = 0
     self._activation_ns: int = 0
 
   def _clear_plan_and_mapd_state(self) -> None:
@@ -595,6 +606,8 @@ class LongController:
     self._set_floor_clear_candidate_since_ms = 0
     self._recovery_clear_candidate_since_ms = 0
     self._straight_clear_candidate_since_ms = 0
+    self._curve_stale_candidate_since_ms = 0
+    self._curve_stale_last_target_ms = 0.0
 
   def _reset_lead_hold(self) -> None:
     self._lead_hold_until_ms = 0
@@ -844,6 +857,103 @@ class LongController:
     return (int(now_ms) - int(self._recovery_clear_candidate_since_ms)) >= int(self._RECOVERY_CLEAR_PERSIST_MS)
 
 
+
+  def _mapd_dual_source_agreement(self, *, now_ns: int) -> bool:
+    map_curve_ms, vision_curve_ms = self._curve_specific_mapd_sources(now_ns=now_ns)
+    if map_curve_ms is None or vision_curve_ms is None:
+      return False
+    return abs(float(map_curve_ms) - float(vision_curve_ms)) <= float(self._MAPD_DUAL_SOURCE_AGREE_MS)
+
+  def _curve_timeout_block_allows_reentry(
+    self,
+    *,
+    now_ms: int,
+    now_ns: int,
+    reference_ms: float,
+    planner_near_ms: float,
+    planner_preview_ms: float,
+    curve_specific_mapd_ms: Optional[float],
+    current_angle_deg: float,
+  ) -> bool:
+    if int(now_ms) > int(self._curve_timeout_block_until_ms):
+      return True
+
+    if abs(float(current_angle_deg)) >= float(self._CURVE_STALE_TIMEOUT_REENTRY_STEER_DEG):
+      return True
+
+    strong_drop_ms = max(
+      float(self._curve_entry_threshold_ms(float(reference_ms))),
+      float(self._CURVE_STALE_TIMEOUT_REENTRY_STRONG_DROP_MS),
+    )
+
+    planner_strong = (
+      float(planner_preview_ms) <= (float(reference_ms) - float(strong_drop_ms))
+      or float(planner_near_ms) <= (float(reference_ms) - float(0.85 * strong_drop_ms))
+    )
+    if planner_strong:
+      return True
+
+    mapd_strong = (
+      curve_specific_mapd_ms is not None
+      and float(curve_specific_mapd_ms) <= (float(reference_ms) - float(strong_drop_ms))
+      and self._mapd_dual_source_agreement(now_ns=now_ns)
+    )
+    return bool(mapd_strong)
+
+  def _should_timeout_stale_no_lead_curve(
+    self,
+    *,
+    now_ms: int,
+    reference_ms: float,
+    curve_target_ms: float,
+    current_set_ms: float,
+    current_angle_deg: float,
+    lead_present: bool,
+  ) -> bool:
+    if bool(lead_present):
+      self._curve_stale_candidate_since_ms = 0
+      self._curve_stale_last_target_ms = 0.0
+      return False
+
+    if abs(float(current_angle_deg)) > float(self._CURVE_STALE_TIMEOUT_STEER_DEG):
+      self._curve_stale_candidate_since_ms = 0
+      self._curve_stale_last_target_ms = 0.0
+      return False
+
+    if float(current_set_ms) <= 0.1:
+      self._curve_stale_candidate_since_ms = 0
+      self._curve_stale_last_target_ms = 0.0
+      return False
+
+    if float(reference_ms) < (float(current_set_ms) + float(self._CURVE_STALE_TIMEOUT_REFERENCE_MARGIN_MS)):
+      self._curve_stale_candidate_since_ms = 0
+      self._curve_stale_last_target_ms = 0.0
+      return False
+
+    if float(curve_target_ms) >= (float(current_set_ms) - float(self._CURVE_STALE_TIMEOUT_CURRENT_MARGIN_MS)):
+      self._curve_stale_candidate_since_ms = 0
+      self._curve_stale_last_target_ms = 0.0
+      return False
+
+    if float(curve_target_ms) >= (float(reference_ms) - float(self._CURVE_STALE_TIMEOUT_REFERENCE_MARGIN_MS)):
+      self._curve_stale_candidate_since_ms = 0
+      self._curve_stale_last_target_ms = 0.0
+      return False
+
+    if (
+      float(self._curve_stale_last_target_ms) <= 0.0
+      or abs(float(curve_target_ms) - float(self._curve_stale_last_target_ms)) > float(self._CURVE_STALE_TIMEOUT_TARGET_DELTA_MS)
+    ):
+      self._curve_stale_last_target_ms = float(curve_target_ms)
+      self._curve_stale_candidate_since_ms = int(now_ms)
+      return False
+
+    if int(self._curve_stale_candidate_since_ms) == 0:
+      self._curve_stale_candidate_since_ms = int(now_ms)
+      return False
+
+    return (int(now_ms) - int(self._curve_stale_candidate_since_ms)) >= int(self._CURVE_STALE_TIMEOUT_PERSIST_MS)
+
   def _resolve_no_lead_curve_target(
     self,
     *,
@@ -892,6 +1002,18 @@ class LongController:
       current_angle_deg=float(current_angle_deg),
       planner_curve_active=bool(planner_curve_active),
     )
+
+    if not self._curve_timeout_block_allows_reentry(
+      now_ms=int(now_ms),
+      now_ns=now_ns,
+      reference_ms=float(reference_ms),
+      planner_near_ms=float(planner_near_ms),
+      planner_preview_ms=float(planner_preview_ms),
+      curve_specific_mapd_ms=curve_specific_mapd_ms,
+      current_angle_deg=float(current_angle_deg),
+    ):
+      self._reset_curve_hold()
+      return float(reference_ms), "curve_clear(timeout_block)"
     planner_preview_drop_ms = max(
       float(self._curve_entry_threshold_ms(float(reference_ms))),
       float(self._PLANNER_PREVIEW_SHARP_DROP_MS),
@@ -978,6 +1100,20 @@ class LongController:
       self._curve_recent_clear_until_ms = int(now_ms) + int(self._CURVE_REENTRY_BLOCK_MS)
       curve_target_ms = float(reference_ms)
       curve_state = "curve_clear(straight)"
+
+    if self._should_timeout_stale_no_lead_curve(
+      now_ms=int(now_ms),
+      reference_ms=float(reference_ms),
+      curve_target_ms=float(curve_target_ms),
+      current_set_ms=float(current_set_ms),
+      current_angle_deg=float(current_angle_deg),
+      lead_present=bool(self._lead_present),
+    ):
+      self._reset_curve_hold()
+      self._curve_recent_clear_until_ms = int(now_ms) + int(max(self._CURVE_REENTRY_BLOCK_MS, self._CURVE_STALE_TIMEOUT_BLOCK_MS))
+      self._curve_timeout_block_until_ms = int(now_ms) + int(self._CURVE_STALE_TIMEOUT_BLOCK_MS)
+      curve_target_ms = float(reference_ms)
+      curve_state = "curve_clear(timeout)"
 
     near_resume_tolerance_ms = max(
       float(self._CURVE_RELEASE_NEAR_TARGET_MARGIN_MS),
@@ -1314,6 +1450,7 @@ class LongController:
       self._clear_plan_and_mapd_state()
       self._reset_curve_hold()
       self._reset_lead_hold()
+      self._curve_timeout_block_until_ms = 0
       return LongDecision(None, "gated: not enabled/adaptive")
 
     stock_state = str(getattr(CS, "stock_cruise_state", "") or "")
@@ -1332,6 +1469,7 @@ class LongController:
       self._clear_plan_and_mapd_state()
       self._reset_curve_hold()
       self._reset_lead_hold()
+      self._curve_timeout_block_until_ms = 0
       return LongDecision(None, f"gated: stock_state={stock_state or 'UNKNOWN'}")
 
     if not self._last_active:
@@ -1339,6 +1477,7 @@ class LongController:
       self._activation_ns = int(now_ns)
       self._clear_plan_and_mapd_state()
       self._reset_curve_hold()
+      self._curve_timeout_block_until_ms = 0
       self._stable_plan_samples = 0
       self._last_lp_seen_ns = 0
       self._reset_lead_hold()
