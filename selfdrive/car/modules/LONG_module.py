@@ -74,6 +74,9 @@ class LongController:
   _LEAD_CONSTRAIN_CLOSING_VREL_MS = -0.15
   _LEAD_CONSTRAIN_GAP_MIN_M = 22.0
   _LEAD_CONSTRAIN_TIME_GAP_S = 1.7
+  _LEAD_NON_CLOSING_BASE_MARGIN_MS = 1.25 * CV.MPH_TO_MS
+  _LEAD_NON_CLOSING_EGO_MARGIN_MS = 0.75 * CV.MPH_TO_MS
+  _LEAD_VERY_NEAR_TIME_GAP_S = 1.05
   _NO_LEAD_MAPD_CURRENT_GATE_MS = 0.5 * CV.MPH_TO_MS
   _MAPD_ONLY_ENTRY_PERSIST_MS = 180
   _MAPD_ONLY_HIGHWAY_ENTRY_PERSIST_MS = 460
@@ -86,7 +89,7 @@ class LongController:
   _MAPD_ONLY_HIGHWAY_MAX_EXTRA_DROP_WITH_PLANNER_MS = 12.0 * CV.MPH_TO_MS
   _MAPD_ONLY_HIGHWAY_NEAR_STEER_DEG = 2.5
   _LEAD_CLEAR_MAPD_GRACE_MS = 900
-  _LP_HAS_LEAD_DECAY_MS = 1200
+  _LP_HAS_LEAD_DECAY_MS = 350
   _CURVE_REENTRY_BLOCK_MS = 1800
   _CURVE_REENTRY_ALLOW_DROP_MS = 6.0 * CV.MPH_TO_MS
   _CURVE_REENTRY_ALLOW_STEER_DEG = 2.0
@@ -1118,11 +1121,28 @@ class LongController:
 
     lead_speed_ms = max(0.0, float(v_ego_ms) + float(self._lead_vrel))
     lead_slower_than_base = lead_speed_ms < (float(base_target_ms) - 0.25)
+    materially_slower_than_base = lead_speed_ms < (float(base_target_ms) - float(self._LEAD_NON_CLOSING_BASE_MARGIN_MS))
+    materially_slower_than_ego = lead_speed_ms < (float(v_ego_ms) - float(self._LEAD_NON_CLOSING_EGO_MARGIN_MS))
     closing = float(self._lead_vrel) < float(self._LEAD_CONSTRAIN_CLOSING_VREL_MS)
-    near_gap_limit_m = min(80.0, max(float(self._LEAD_CONSTRAIN_GAP_MIN_M), float(v_ego_ms) * float(self._LEAD_CONSTRAIN_TIME_GAP_S)))
-    near_lead = float(self._lead_drel) < float(near_gap_limit_m)
-    return bool(lead_slower_than_base and (closing or near_lead))
 
+    near_gap_limit_m = min(
+      80.0,
+      max(float(self._LEAD_CONSTRAIN_GAP_MIN_M), float(v_ego_ms) * float(self._LEAD_CONSTRAIN_TIME_GAP_S)),
+    )
+    very_near_gap_m = min(45.0, max(12.0, float(v_ego_ms) * float(self._LEAD_VERY_NEAR_TIME_GAP_S)))
+    near_lead = float(self._lead_drel) < float(near_gap_limit_m)
+    very_near_lead = float(self._lead_drel) < float(very_near_gap_m)
+
+    if closing:
+      return bool(lead_slower_than_base and near_lead)
+
+    # On clear road after a turn-off / fade, radar can briefly keep a non-closing
+    # near track alive. Do not let a merely nearby, barely-slower track keep owning
+    # cruise unless it is genuinely very close or meaningfully slower.
+    if very_near_lead:
+      return bool(lead_slower_than_base)
+
+    return bool(near_lead and materially_slower_than_base and materially_slower_than_ego)
 
   def _recent_actual_lead_context(self, *, now_ms: int) -> bool:
     return bool(self._lead_present) or (int(now_ms) <= int(self._lead_recently_cleared_until_ms))
@@ -1154,9 +1174,10 @@ class LongController:
     # After a lead has just disappeared, allow planner hasLead to persist only
     # briefly and only while it is still clearly asking for decel.
     recent_clear_age_ms = max(0, int(self._lead_recently_cleared_until_ms) - int(now_ms))
+    strong_recent_clear_drop = float(planner_ms) < (float(base_target_ms) - (2.0 * CV.MPH_TO_MS))
     return bool(
       recent_clear_age_ms <= int(self._LP_HAS_LEAD_DECAY_MS)
-      and (materially_below_clear or strong_planner_decel)
+      and (strong_planner_decel or strong_recent_clear_drop)
     )
 
   def _planner_drag_reasons(self, *, now_ms: int, base_target_ms: float, planner_ms: float, v_ego_ms: float) -> list[str]:
@@ -1186,7 +1207,7 @@ class LongController:
       reasons.append("lead")
     if lp_lead_constraining:
       reasons.append("lp_hasLead")
-    if float(self._lp_a_target) <= float(self._STRONG_DECEL_ATARGET_MS2):
+    if float(self._lp_a_target) <= float(self._STRONG_DECEL_ATARGET_MS2) and (lead_constraining or lp_lead_constraining):
       reasons.append("aTarget")
     if materially_below_clear:
       reasons.append("planner_low")
