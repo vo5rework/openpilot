@@ -122,6 +122,13 @@ class LongController:
   _SET_FLOOR_CLEAR_REFERENCE_MARGIN_MS = 4.0 * CV.MPH_TO_MS
   _SET_FLOOR_CLEAR_PLANNER_MARGIN_MS = 1.0 * CV.MPH_TO_MS
   _SET_FLOOR_CLEAR_PERSIST_MS = 260
+  _RECOVERY_CLEAR_STEER_DEG = 1.15
+  _RECOVERY_CLEAR_REFERENCE_MARGIN_MS = 2.5 * CV.MPH_TO_MS
+  _RECOVERY_CLEAR_CURRENT_MARGIN_MS = 0.3 * CV.MPH_TO_MS
+  _RECOVERY_CLEAR_PLANNER_LAST_MARGIN_MS = 2.0 * CV.MPH_TO_MS
+  _RECOVERY_CLEAR_PLANNER_NEAR_MARGIN_MS = 1.6 * CV.MPH_TO_MS
+  _RECOVERY_CLEAR_PLANNER_PREVIEW_MARGIN_MS = 2.2 * CV.MPH_TO_MS
+  _RECOVERY_CLEAR_PERSIST_MS = 220
 
   def __init__(self) -> None:
     self.acc = ACCController()
@@ -162,6 +169,7 @@ class LongController:
     self._curve_recent_clear_until_ms: int = 0
     self._set_floor_clear_candidate_since_ms: int = 0
     self._straight_clear_candidate_since_ms: int = 0
+    self._recovery_clear_candidate_since_ms: int = 0
     self._activation_ns: int = 0
 
   def _clear_plan_and_mapd_state(self) -> None:
@@ -585,6 +593,7 @@ class LongController:
     self._curve_planner_release_candidate_since_ms = 0
     self._mapd_entry_candidate_since_ms = 0
     self._set_floor_clear_candidate_since_ms = 0
+    self._recovery_clear_candidate_since_ms = 0
     self._straight_clear_candidate_since_ms = 0
 
   def _reset_lead_hold(self) -> None:
@@ -772,6 +781,67 @@ class LongController:
       return False
 
     return (int(now_ms) - int(self._set_floor_clear_candidate_since_ms)) >= int(self._SET_FLOOR_CLEAR_PERSIST_MS)
+
+
+
+  def _should_force_reference_recovery(
+    self,
+    *,
+    now_ms: int,
+    reference_ms: float,
+    desired_ms: float,
+    current_set_ms: float,
+    planner_last_ms: float,
+    planner_near_ms: float,
+    planner_preview_ms: float,
+    v_ego_ms: float,
+    current_angle_deg: float,
+  ) -> bool:
+    if abs(float(current_angle_deg)) > float(self._RECOVERY_CLEAR_STEER_DEG):
+      self._recovery_clear_candidate_since_ms = 0
+      return False
+
+    reference_ms = float(reference_ms)
+    desired_ms = float(desired_ms)
+    current_set_ms = float(current_set_ms)
+    planner_last_ms = float(planner_last_ms)
+    planner_near_ms = float(planner_near_ms)
+    planner_preview_ms = float(planner_preview_ms)
+    v_ego_ms = float(v_ego_ms)
+
+    if current_set_ms <= 0.1:
+      self._recovery_clear_candidate_since_ms = 0
+      return False
+
+    if reference_ms < (current_set_ms + float(self._RECOVERY_CLEAR_REFERENCE_MARGIN_MS)):
+      self._recovery_clear_candidate_since_ms = 0
+      return False
+
+    if desired_ms >= (current_set_ms - float(self._RECOVERY_CLEAR_CURRENT_MARGIN_MS)):
+      self._recovery_clear_candidate_since_ms = 0
+      return False
+
+    if self._lead_is_constraining(base_target_ms=float(reference_ms), v_ego_ms=float(v_ego_ms)):
+      self._recovery_clear_candidate_since_ms = 0
+      return False
+
+    if planner_last_ms < (current_set_ms - float(self._RECOVERY_CLEAR_PLANNER_LAST_MARGIN_MS)):
+      self._recovery_clear_candidate_since_ms = 0
+      return False
+
+    if planner_near_ms < (current_set_ms - float(self._RECOVERY_CLEAR_PLANNER_NEAR_MARGIN_MS)):
+      self._recovery_clear_candidate_since_ms = 0
+      return False
+
+    if planner_preview_ms < (current_set_ms - float(self._RECOVERY_CLEAR_PLANNER_PREVIEW_MARGIN_MS)):
+      self._recovery_clear_candidate_since_ms = 0
+      return False
+
+    if int(self._recovery_clear_candidate_since_ms) == 0:
+      self._recovery_clear_candidate_since_ms = int(now_ms)
+      return False
+
+    return (int(now_ms) - int(self._recovery_clear_candidate_since_ms)) >= int(self._RECOVERY_CLEAR_PERSIST_MS)
 
 
   def _resolve_no_lead_curve_target(
@@ -1298,6 +1368,7 @@ class LongController:
     planner_last_ms = float(self._lp_target_last_ms) if (lp_fresh and self._lp_target_last_ms is not None) else float(current_set_ms)
     planner_near_ms = float(self._lp_target_near_ms) if (lp_fresh and self._lp_target_near_ms is not None) else float(planner_last_ms)
     planner_preview_ms = float(self._lp_target_preview_ms) if (lp_fresh and self._lp_target_preview_ms is not None) else float(planner_near_ms)
+    active_reference_ms = float(current_set_ms)
     desired_ms = float(planner_last_ms)
     src = "lp_last" if lp_fresh else "hold"
 
@@ -1318,6 +1389,7 @@ class LongController:
 
     if set_speed_limit_active and speed_limit_target_ms is not None:
       base_target_ms = float(speed_limit_target_ms)
+      active_reference_ms = float(base_target_ms)
       desired_ms = float(base_target_ms)
       src = f"speed_limit_target[{ceiling_src}]"
 
@@ -1389,6 +1461,7 @@ class LongController:
         self._reset_curve_hold()
     else:
       resume_ceiling_ms = self._resume_ceiling_ms(current_set_ms=float(current_set_ms), v_ego_ms=float(v_ego_ms))
+      active_reference_ms = float(resume_ceiling_ms)
       desired_ms = float(resume_ceiling_ms)
       src = "hold+ceiling"
 
@@ -1567,6 +1640,23 @@ class LongController:
         lead_speed_ms = max(0.0, float(v_ego_ms) + float(self._lead_vrel))
         desired_ms = min(float(desired_ms), max(float(self.MIN_CRUISE_SPEED_MS), float(lead_speed_ms)))
         src = f"{src}+stale_lead"
+
+    if self._should_force_reference_recovery(
+      now_ms=int(now),
+      reference_ms=float(active_reference_ms),
+      desired_ms=float(desired_ms),
+      current_set_ms=float(current_set_ms),
+      planner_last_ms=float(planner_last_ms),
+      planner_near_ms=float(planner_near_ms),
+      planner_preview_ms=float(planner_preview_ms),
+      v_ego_ms=float(v_ego_ms),
+      current_angle_deg=float(getattr(cs_out, "steeringAngleDeg", 0.0) or 0.0),
+    ):
+      self._reset_curve_hold()
+      self._reset_lead_hold()
+      self._curve_recent_clear_until_ms = int(now) + int(self._CURVE_REENTRY_BLOCK_MS)
+      desired_ms = float(active_reference_ms)
+      src = f"{src}+recovery_clear"
 
     no_lead_curve_context = (not self._lead_present) and (not self._lp_has_lead)
     if self._should_hold_min_cruise_for_curve(
