@@ -77,10 +77,6 @@ class LongController:
   _LEAD_NON_CLOSING_BASE_MARGIN_MS = 1.25 * CV.MPH_TO_MS
   _LEAD_NON_CLOSING_EGO_MARGIN_MS = 0.75 * CV.MPH_TO_MS
   _LEAD_VERY_NEAR_TIME_GAP_S = 1.05
-  _LEAD_TRACK_STABLE_MS = 320
-  _LEAD_TRACK_STABLE_BYPASS_DREL_M = 28.0
-  _LEAD_TRACK_STABLE_BYPASS_CLOSING_VREL_MS = -0.6
-  _LEAD_OWNER_MAX_YREL_M = 2.2
   _NO_LEAD_MAPD_CURRENT_GATE_MS = 0.5 * CV.MPH_TO_MS
   _MAPD_ONLY_ENTRY_PERSIST_MS = 180
   _MAPD_ONLY_HIGHWAY_ENTRY_PERSIST_MS = 460
@@ -162,12 +158,8 @@ class LongController:
     self._lead_present: bool = False
     self._lead_drel: float = 0.0
     self._lead_vrel: float = 0.0
-    self._lead_yrel: float = 0.0
     self._lead_radar: bool = False
-    self._lead_model_prob: float = 0.0
-    self._lead_track_id: int = -1
-    self._lead_track_stable_since_ms: int = 0
-    self._lead_owner_present: bool = False
+    self._lead_radar_track_id: int = -1
     self._mapd_suggested_ms: Optional[float] = None
     self._mapd_map_curve_ms: Optional[float] = None
     self._mapd_vision_curve_ms: Optional[float] = None
@@ -190,7 +182,6 @@ class LongController:
     self._lead_hold_until_ms: int = 0
     self._lead_recently_cleared_until_ms: int = 0
     self._lead_present_prev: bool = False
-    self._lead_owner_present_prev: bool = False
     self._curve_recent_clear_until_ms: int = 0
     self._set_floor_clear_candidate_since_ms: int = 0
     self._straight_clear_candidate_since_ms: int = 0
@@ -631,27 +622,11 @@ class LongController:
   def _reset_lead_hold(self) -> None:
     self._lead_hold_until_ms = 0
 
-  def _lead_owner_candidate_now(self, *, now_ms: int, v_ego_ms: float) -> bool:
-    if (not self._lead_present) or float(self._lead_drel) <= 0.0:
-      return False
-    if (not self._lead_radar) or int(self._lead_track_id) < 0:
-      return False
-
-    if float(self._lead_drel) > 18.0 and abs(float(self._lead_yrel)) > float(self._LEAD_OWNER_MAX_YREL_M):
-      return False
-
-    stable_enough = (
-      int(self._lead_track_stable_since_ms) > 0
-      and (int(now_ms) - int(self._lead_track_stable_since_ms)) >= int(self._LEAD_TRACK_STABLE_MS)
-    )
-    urgent_or_near = (
-      float(self._lead_drel) <= float(self._LEAD_TRACK_STABLE_BYPASS_DREL_M)
-      or float(self._lead_vrel) <= float(self._LEAD_TRACK_STABLE_BYPASS_CLOSING_VREL_MS)
-    )
-    return bool(stable_enough or urgent_or_near)
+  def _lead_owner_present(self) -> bool:
+    return bool(self._lead_present and self._lead_radar and int(self._lead_radar_track_id) >= 0)
 
   def _lead_is_opening_clear(self, *, base_target_ms: float, v_ego_ms: float) -> bool:
-    if (not self._lead_owner_present) or float(self._lead_drel) <= 0.0:
+    if (not self._lead_owner_present()) or float(self._lead_drel) <= 0.0:
       return False
 
     opening_gap_m = max(float(self._LEAD_OPENING_GAP_MIN_M), float(v_ego_ms) * float(self._LEAD_OPENING_TIME_GAP_S))
@@ -671,9 +646,6 @@ class LongController:
       self._lead_hold_until_ms = 0
       return False
     if float(planner_ms) <= 0.1:
-      return False
-    if not self._recent_actual_lead_context(now_ms=int(now_ms)):
-      self._lead_hold_until_ms = 0
       return False
     if self._lead_is_opening_clear(base_target_ms=float(base_target_ms), v_ego_ms=float(v_ego_ms)):
       self._lead_hold_until_ms = 0
@@ -914,7 +886,7 @@ class LongController:
 
 
   def _lead_is_immediately_constraining(self, *, base_target_ms: float, v_ego_ms: float) -> bool:
-    if (not self._lead_owner_present) or float(self._lead_drel) <= 0.0:
+    if (not self._lead_owner_present()) or float(self._lead_drel) <= 0.0:
       return False
 
     lead_speed_ms = max(0.0, float(v_ego_ms) + float(self._lead_vrel))
@@ -1231,7 +1203,7 @@ class LongController:
       curve_target_ms=float(curve_target_ms),
       current_set_ms=float(current_set_ms),
       current_angle_deg=float(current_angle_deg),
-      lead_present=bool(self._lead_owner_present),
+      lead_present=bool(self._lead_owner_present()),
     ):
       self._reset_curve_hold()
       self._curve_recent_clear_until_ms = int(now_ms) + int(max(self._CURVE_REENTRY_BLOCK_MS, self._CURVE_STALE_TIMEOUT_BLOCK_MS))
@@ -1353,9 +1325,8 @@ class LongController:
 
     return float(desired_ms), "curve_hold"
 
-  def _poll_plan_and_lead(self, *, now_ns: int, v_ego_ms: float) -> None:
-    now_ms = int(now_ns // 1_000_000)
-    prev_lead_present = bool(self._lead_owner_present_prev)
+  def _poll_plan_and_lead(self, *, now_ns: int) -> None:
+    prev_lead_present = bool(self._lead_present_prev)
     try:
       self._sm.update(0)
     except Exception:
@@ -1378,17 +1349,11 @@ class LongController:
       pass
 
     try:
-      prev_track_id = int(self._lead_track_id)
-      prev_radar_backed = bool(self._lead_radar)
-
       self._lead_present = False
       self._lead_drel = 0.0
       self._lead_vrel = 0.0
-      self._lead_yrel = 0.0
       self._lead_radar = False
-      self._lead_model_prob = 0.0
-      self._lead_track_id = -1
-
+      self._lead_radar_track_id = -1
       if bool(self._sm.valid.get("radarState", False)):
         rs = self._sm["radarState"]
         lead_one = getattr(rs, "leadOne", None)
@@ -1399,33 +1364,15 @@ class LongController:
             self._lead_present = True
             self._lead_drel = d_rel
             self._lead_vrel = v_rel
-            self._lead_yrel = float(getattr(lead_one, "yRel", 0.0) or 0.0)
             self._lead_radar = bool(getattr(lead_one, "radar", False))
-            self._lead_model_prob = float(getattr(lead_one, "modelProb", 0.0) or 0.0)
-            try:
-              self._lead_track_id = int(getattr(lead_one, "radarTrackId", -1))
-            except Exception:
-              self._lead_track_id = -1
-
-      if self._lead_present and self._lead_radar and int(self._lead_track_id) >= 0:
-        if prev_radar_backed and int(prev_track_id) == int(self._lead_track_id):
-          if int(self._lead_track_stable_since_ms) <= 0:
-            self._lead_track_stable_since_ms = int(now_ms)
-        else:
-          self._lead_track_stable_since_ms = int(now_ms)
-      else:
-        self._lead_track_stable_since_ms = 0
+            self._lead_radar_track_id = int(getattr(lead_one, "radarTrackId", -1) or -1)
     except Exception:
       pass
 
-    self._lead_owner_present = self._lead_owner_candidate_now(
-      now_ms=int(now_ms),
-      v_ego_ms=float(v_ego_ms),
-    )
-    if prev_lead_present and (not bool(self._lead_owner_present)):
-      self._lead_recently_cleared_until_ms = int(now_ms) + int(self._LEAD_CLEAR_MAPD_GRACE_MS)
-    self._lead_present_prev = bool(self._lead_present)
-    self._lead_owner_present_prev = bool(self._lead_owner_present)
+    lead_owner_present = self._lead_owner_present()
+    if prev_lead_present and (not bool(lead_owner_present)):
+      self._lead_recently_cleared_until_ms = int(now_ns // 1_000_000) + int(self._LEAD_CLEAR_MAPD_GRACE_MS)
+    self._lead_present_prev = bool(lead_owner_present)
 
     try:
       if bool(self._sm.valid.get("mapdOut", False)):
@@ -1474,7 +1421,7 @@ class LongController:
     return None, False, "none"
 
   def _lead_is_constraining(self, *, base_target_ms: float, v_ego_ms: float) -> bool:
-    if (not self._lead_owner_present) or float(self._lead_drel) <= 0.0:
+    if (not self._lead_owner_present()) or float(self._lead_drel) <= 0.0:
       return False
     if self._lead_is_opening_clear(base_target_ms=float(base_target_ms), v_ego_ms=float(v_ego_ms)):
       return False
@@ -1505,7 +1452,7 @@ class LongController:
     return bool(near_lead and materially_slower_than_base and materially_slower_than_ego)
 
   def _recent_actual_lead_context(self, *, now_ms: int) -> bool:
-    return bool(self._lead_owner_present) or (int(now_ms) <= int(self._lead_recently_cleared_until_ms))
+    return bool(self._lead_owner_present()) or (int(now_ms) <= int(self._lead_recently_cleared_until_ms))
 
   def _planner_lp_has_credible_lead(
     self,
@@ -1515,32 +1462,15 @@ class LongController:
     planner_ms: float,
     v_ego_ms: float,
   ) -> bool:
-    if not bool(self._lp_has_lead):
-      return False
-    if (int(now_ms) <= int(self._weak_planner_block_until_ms)) and (not self._lead_is_immediately_constraining(base_target_ms=float(base_target_ms), v_ego_ms=float(v_ego_ms))):
-      return False
-    if not self._recent_actual_lead_context(now_ms=int(now_ms)):
-      return False
+    """
+    Do not let longitudinalPlan.hasLead become an independent cruise-set owner.
 
-    materially_below_base = float(planner_ms) < (float(base_target_ms) - float(self._PLANNER_DRAG_MARGIN_MS))
-    materially_below_ego = float(planner_ms) < (float(v_ego_ms) - float(self._PLANNER_BELOW_EGO_MARGIN_MS))
-    materially_below_clear = materially_below_base and materially_below_ego
-    strong_planner_decel = float(self._lp_a_target) <= float(self._STRONG_DECEL_ATARGET_MS2)
-
-    if bool(self._lead_owner_present):
-      return bool(materially_below_clear or strong_planner_decel or self._lead_is_constraining(
-        base_target_ms=float(base_target_ms),
-        v_ego_ms=float(v_ego_ms),
-      ))
-
-    # After a lead has just disappeared, allow planner hasLead to persist only
-    # briefly and only while it is still clearly asking for decel.
-    recent_clear_age_ms = max(0, int(self._lead_recently_cleared_until_ms) - int(now_ms))
-    strong_recent_clear_drop = float(planner_ms) < (float(base_target_ms) - (2.0 * CV.MPH_TO_MS))
-    return bool(
-      recent_clear_age_ms <= int(self._LP_HAS_LEAD_DECAY_MS)
-      and (strong_planner_decel or strong_recent_clear_drop)
-    )
+    In xnor logs, the repeated stuck-at-40 / stuck-at-20 cases were re-entering
+    through planner[lp_hasLead+planner_low] after the real radar lead or bend
+    context had already gone away. Actual radar-backed leads still suppress
+    through _lead_is_constraining and short lead_hold persistence.
+    """
+    return False
 
   def _planner_owner_should_suppress(
     self,
@@ -1566,12 +1496,7 @@ class LongController:
     )
     strong_planner_decel = float(self._lp_a_target) <= float(self._STRONG_DECEL_ATARGET_MS2)
     planner_has_lead_context = ("lead" in drag_reasons) or ("lp_hasLead" in drag_reasons)
-    return bool(
-      self._recent_actual_lead_context(now_ms=_mono_ms())
-      and planner_has_lead_context
-      and strong_planner_drop
-      and strong_planner_decel
-    )
+    return bool(planner_has_lead_context and strong_planner_drop and strong_planner_decel)
 
   def _planner_drag_reasons(self, *, now_ms: int, base_target_ms: float, planner_ms: float, v_ego_ms: float) -> list[str]:
     if float(planner_ms) <= 0.1:
@@ -1684,7 +1609,7 @@ class LongController:
       self._reset_lead_hold()
     self._last_active = True
 
-    self._poll_plan_and_lead(now_ns=now_ns, v_ego_ms=float(v_ego_ms))
+    self._poll_plan_and_lead(now_ns=now_ns)
     lp_fresh = (
       (self._lp_target_last_ms is not None)
       and (int(self._lp_last_ns) > 0)
@@ -1715,7 +1640,7 @@ class LongController:
     startup_warmup = bool(self._enabled_since_ms and ((int(now) - int(self._enabled_since_ms)) < 1800))
     startup_invalid_clear = (
       startup_warmup
-      and (not self._lead_owner_present)
+      and (not self._lead_owner_present())
       and (
         (not lp_fresh)
         or (int(self._stable_plan_samples) < 2)
@@ -1760,7 +1685,7 @@ class LongController:
           desired_ms = min(float(base_target_ms), float(planner_last_ms))
           src = f"{src}+planner[lead_hold]"
           self._reset_curve_hold()
-        elif (not self._lead_owner_present) and (not self._planner_lp_has_credible_lead(
+        elif (not self._lead_owner_present()) and (not self._planner_lp_has_credible_lead(
           now_ms=int(now),
           base_target_ms=float(base_target_ms),
           planner_ms=float(planner_last_ms),
@@ -1837,7 +1762,7 @@ class LongController:
           desired_ms = float(planner_last_ms)
           src = "lp_last[lead_hold]"
           self._reset_curve_hold()
-        elif (not self._lead_owner_present) and (not self._planner_lp_has_credible_lead(
+        elif (not self._lead_owner_present()) and (not self._planner_lp_has_credible_lead(
           now_ms=int(now),
           base_target_ms=float(resume_ceiling_ms),
           planner_ms=float(planner_last_ms),
@@ -1986,7 +1911,7 @@ class LongController:
           desired_ms = float(resume_ceiling_ms)
           src = "hold+ceiling"
 
-      if (not lp_fresh) and self._lead_owner_present and (self._lead_drel < 80.0) and (self._lead_vrel < -0.5):
+      if (not lp_fresh) and self._lead_owner_present() and (self._lead_drel < 80.0) and (self._lead_vrel < -0.5):
         lead_speed_ms = max(0.0, float(v_ego_ms) + float(self._lead_vrel))
         desired_ms = min(float(desired_ms), max(float(self.MIN_CRUISE_SPEED_MS), float(lead_speed_ms)))
         src = f"{src}+stale_lead"
@@ -2003,7 +1928,10 @@ class LongController:
       self._reset_curve_hold()
       self._reset_lead_hold()
       self._curve_recent_clear_until_ms = int(now) + int(self._CURVE_REENTRY_BLOCK_MS)
+      self._curve_timeout_block_until_ms = int(now) + int(self._CURVE_STALE_TIMEOUT_BLOCK_MS)
       self._weak_planner_block_until_ms = int(now) + int(self._WEAK_OWNER_REENTRY_BLOCK_MS)
+      self._curve_stale_candidate_since_ms = 0
+      self._curve_stale_last_target_ms = 0.0
       desired_ms = float(active_reference_ms)
       src = f"{src}+owner_timeout_clear"
 
@@ -2021,12 +1949,15 @@ class LongController:
       self._reset_curve_hold()
       self._reset_lead_hold()
       self._curve_recent_clear_until_ms = int(now) + int(self._CURVE_REENTRY_BLOCK_MS)
+      self._curve_timeout_block_until_ms = int(now) + int(self._CURVE_STALE_TIMEOUT_BLOCK_MS)
       self._weak_planner_block_until_ms = int(now) + int(self._WEAK_OWNER_REENTRY_BLOCK_MS)
       self._weak_owner_candidate_since_ms = 0
+      self._curve_stale_candidate_since_ms = 0
+      self._curve_stale_last_target_ms = 0.0
       desired_ms = float(active_reference_ms)
       src = f"{src}+recovery_clear"
 
-    no_lead_curve_context = (not self._lead_owner_present) and (not self._lp_has_lead)
+    no_lead_curve_context = (not self._lead_owner_present())
     if self._should_hold_min_cruise_for_curve(
       now_ns=now_ns,
       desired_ms=float(desired_ms),
