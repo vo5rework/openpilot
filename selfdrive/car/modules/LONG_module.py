@@ -86,6 +86,7 @@ class LongController:
   _MAPD_ONLY_HIGHWAY_MAX_EXTRA_DROP_WITH_PLANNER_MS = 12.0 * CV.MPH_TO_MS
   _MAPD_ONLY_HIGHWAY_NEAR_STEER_DEG = 2.5
   _LEAD_CLEAR_MAPD_GRACE_MS = 900
+  _LP_HAS_LEAD_DECAY_MS = 1200
   _CURVE_REENTRY_BLOCK_MS = 1800
   _CURVE_REENTRY_ALLOW_DROP_MS = 6.0 * CV.MPH_TO_MS
   _CURVE_REENTRY_ALLOW_STEER_DEG = 2.0
@@ -1054,7 +1055,43 @@ class LongController:
     near_lead = float(self._lead_drel) < float(near_gap_limit_m)
     return bool(lead_slower_than_base and (closing or near_lead))
 
-  def _planner_drag_reasons(self, *, base_target_ms: float, planner_ms: float, v_ego_ms: float) -> list[str]:
+
+  def _recent_actual_lead_context(self, *, now_ms: int) -> bool:
+    return bool(self._lead_present) or (int(now_ms) <= int(self._lead_recently_cleared_until_ms))
+
+  def _planner_lp_has_credible_lead(
+    self,
+    *,
+    now_ms: int,
+    base_target_ms: float,
+    planner_ms: float,
+    v_ego_ms: float,
+  ) -> bool:
+    if not bool(self._lp_has_lead):
+      return False
+    if not self._recent_actual_lead_context(now_ms=int(now_ms)):
+      return False
+
+    materially_below_base = float(planner_ms) < (float(base_target_ms) - float(self._PLANNER_DRAG_MARGIN_MS))
+    materially_below_ego = float(planner_ms) < (float(v_ego_ms) - float(self._PLANNER_BELOW_EGO_MARGIN_MS))
+    materially_below_clear = materially_below_base and materially_below_ego
+    strong_planner_decel = float(self._lp_a_target) <= float(self._STRONG_DECEL_ATARGET_MS2)
+
+    if bool(self._lead_present):
+      return bool(materially_below_clear or strong_planner_decel or self._lead_is_constraining(
+        base_target_ms=float(base_target_ms),
+        v_ego_ms=float(v_ego_ms),
+      ))
+
+    # After a lead has just disappeared, allow planner hasLead to persist only
+    # briefly and only while it is still clearly asking for decel.
+    recent_clear_age_ms = max(0, int(self._lead_recently_cleared_until_ms) - int(now_ms))
+    return bool(
+      recent_clear_age_ms <= int(self._LP_HAS_LEAD_DECAY_MS)
+      and (materially_below_clear or strong_planner_decel)
+    )
+
+  def _planner_drag_reasons(self, *, now_ms: int, base_target_ms: float, planner_ms: float, v_ego_ms: float) -> list[str]:
     if float(planner_ms) <= 0.1:
       return []
 
@@ -1069,10 +1106,11 @@ class LongController:
       base_target_ms=float(base_target_ms),
       v_ego_ms=float(v_ego_ms),
     )
-    lp_lead_constraining = bool(self._lp_has_lead) and (not lead_opening_clear) and (
-      lead_constraining
-      or materially_below_clear
-      or (float(self._lp_a_target) <= float(self._STRONG_DECEL_ATARGET_MS2))
+    lp_lead_constraining = (not lead_opening_clear) and self._planner_lp_has_credible_lead(
+      now_ms=int(now_ms),
+      base_target_ms=float(base_target_ms),
+      planner_ms=float(planner_ms),
+      v_ego_ms=float(v_ego_ms),
     )
 
     reasons: list[str] = []
@@ -1196,6 +1234,7 @@ class LongController:
 
       if lp_fresh and self._lp_target_last_ms is not None:
         drag_reasons = self._planner_drag_reasons(
+          now_ms=int(now),
           base_target_ms=float(base_target_ms),
           planner_ms=float(planner_last_ms),
           v_ego_ms=float(v_ego_ms),
@@ -1215,7 +1254,12 @@ class LongController:
           desired_ms = min(float(base_target_ms), float(planner_last_ms))
           src = f"{src}+planner[lead_hold]"
           self._reset_curve_hold()
-        elif (not self._lead_present) and (not self._lp_has_lead):
+        elif (not self._lead_present) and (not self._planner_lp_has_credible_lead(
+          now_ms=int(now),
+          base_target_ms=float(base_target_ms),
+          planner_ms=float(planner_last_ms),
+          v_ego_ms=float(v_ego_ms),
+        )):
           self._reset_lead_hold()
           if int(self._stable_plan_samples) < 2:
             self._reset_curve_hold()
@@ -1260,6 +1304,7 @@ class LongController:
 
       if lp_fresh:
         drag_reasons = self._planner_drag_reasons(
+          now_ms=int(now),
           base_target_ms=float(resume_ceiling_ms),
           planner_ms=float(planner_last_ms),
           v_ego_ms=float(v_ego_ms),
@@ -1279,7 +1324,12 @@ class LongController:
           desired_ms = float(planner_last_ms)
           src = "lp_last[lead_hold]"
           self._reset_curve_hold()
-        elif (not self._lead_present) and (not self._lp_has_lead):
+        elif (not self._lead_present) and (not self._planner_lp_has_credible_lead(
+          now_ms=int(now),
+          base_target_ms=float(resume_ceiling_ms),
+          planner_ms=float(planner_last_ms),
+          v_ego_ms=float(v_ego_ms),
+        )):
           self._reset_lead_hold()
           if int(self._stable_plan_samples) < 2:
             self._reset_curve_hold()
