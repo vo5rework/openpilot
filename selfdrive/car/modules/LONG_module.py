@@ -129,6 +129,10 @@ class LongController:
   _RECOVERY_CLEAR_PLANNER_NEAR_MARGIN_MS = 1.6 * CV.MPH_TO_MS
   _RECOVERY_CLEAR_PLANNER_PREVIEW_MARGIN_MS = 2.2 * CV.MPH_TO_MS
   _RECOVERY_CLEAR_PERSIST_MS = 220
+  _WEAK_OWNER_CLEAR_REFERENCE_MARGIN_MS = 2.0 * CV.MPH_TO_MS
+  _WEAK_OWNER_CLEAR_CURRENT_MARGIN_MS = 0.5 * CV.MPH_TO_MS
+  _WEAK_OWNER_CLEAR_PERSIST_MS = 1400
+  _WEAK_OWNER_REENTRY_BLOCK_MS = 6000
   _CURVE_STALE_TIMEOUT_STEER_DEG = 0.75
   _CURVE_STALE_TIMEOUT_REFERENCE_MARGIN_MS = 3.0 * CV.MPH_TO_MS
   _CURVE_STALE_TIMEOUT_CURRENT_MARGIN_MS = 1.0 * CV.MPH_TO_MS
@@ -181,6 +185,8 @@ class LongController:
     self._curve_stale_candidate_since_ms: int = 0
     self._curve_stale_last_target_ms: float = 0.0
     self._curve_timeout_block_until_ms: int = 0
+    self._weak_owner_candidate_since_ms: int = 0
+    self._weak_planner_block_until_ms: int = 0
     self._activation_ns: int = 0
 
   def _clear_plan_and_mapd_state(self) -> None:
@@ -628,6 +634,9 @@ class LongController:
     if int(self._lead_hold_until_ms) <= 0 or int(now_ms) > int(self._lead_hold_until_ms):
       self._lead_hold_until_ms = 0
       return False
+    if (int(now_ms) <= int(self._weak_planner_block_until_ms)) and (not self._lead_is_immediately_constraining(base_target_ms=float(base_target_ms), v_ego_ms=float(v_ego_ms))):
+      self._lead_hold_until_ms = 0
+      return False
     if float(planner_ms) <= 0.1:
       return False
     if self._lead_is_opening_clear(base_target_ms=float(base_target_ms), v_ego_ms=float(v_ego_ms)):
@@ -857,6 +866,76 @@ class LongController:
     return (int(now_ms) - int(self._recovery_clear_candidate_since_ms)) >= int(self._RECOVERY_CLEAR_PERSIST_MS)
 
 
+
+
+  def _lead_is_immediately_constraining(self, *, base_target_ms: float, v_ego_ms: float) -> bool:
+    if (not self._lead_present) or float(self._lead_drel) <= 0.0:
+      return False
+
+    lead_speed_ms = max(0.0, float(v_ego_ms) + float(self._lead_vrel))
+    closing = float(self._lead_vrel) < float(self._LEAD_CONSTRAIN_CLOSING_VREL_MS)
+
+    near_gap_limit_m = min(
+      80.0,
+      max(float(self._LEAD_CONSTRAIN_GAP_MIN_M), float(v_ego_ms) * float(self._LEAD_CONSTRAIN_TIME_GAP_S)),
+    )
+    very_near_gap_m = min(45.0, max(12.0, float(v_ego_ms) * float(self._LEAD_VERY_NEAR_TIME_GAP_S)))
+    near_lead = float(self._lead_drel) < float(near_gap_limit_m)
+    very_near_lead = float(self._lead_drel) < float(very_near_gap_m)
+
+    materially_slower_than_base = lead_speed_ms < (float(base_target_ms) - float(self._LEAD_NON_CLOSING_BASE_MARGIN_MS))
+    materially_slower_than_ego = lead_speed_ms < (float(v_ego_ms) - float(self._LEAD_NON_CLOSING_EGO_MARGIN_MS))
+
+    if closing:
+      return bool(near_lead and (lead_speed_ms < (float(base_target_ms) - 0.25)))
+
+    return bool(very_near_lead or (near_lead and materially_slower_than_base and materially_slower_than_ego))
+
+  def _should_force_weak_owner_release(
+    self,
+    *,
+    now_ms: int,
+    src: str,
+    reference_ms: float,
+    desired_ms: float,
+    current_set_ms: float,
+    v_ego_ms: float,
+    current_angle_deg: float,
+  ) -> bool:
+    weak_owner_src = (
+      ("planner[" in str(src))
+      or ("lead_hold" in str(src))
+      or ("curve_hold" in str(src))
+    )
+    if not weak_owner_src:
+      self._weak_owner_candidate_since_ms = 0
+      return False
+
+    if abs(float(current_angle_deg)) > float(self._RECOVERY_CLEAR_STEER_DEG):
+      self._weak_owner_candidate_since_ms = 0
+      return False
+
+    if float(current_set_ms) <= 0.1:
+      self._weak_owner_candidate_since_ms = 0
+      return False
+
+    if float(reference_ms) < (float(current_set_ms) + float(self._WEAK_OWNER_CLEAR_REFERENCE_MARGIN_MS)):
+      self._weak_owner_candidate_since_ms = 0
+      return False
+
+    if float(desired_ms) >= (float(current_set_ms) - float(self._WEAK_OWNER_CLEAR_CURRENT_MARGIN_MS)):
+      self._weak_owner_candidate_since_ms = 0
+      return False
+
+    if self._lead_is_immediately_constraining(base_target_ms=float(reference_ms), v_ego_ms=float(v_ego_ms)):
+      self._weak_owner_candidate_since_ms = 0
+      return False
+
+    if int(self._weak_owner_candidate_since_ms) == 0:
+      self._weak_owner_candidate_since_ms = int(now_ms)
+      return False
+
+    return (int(now_ms) - int(self._weak_owner_candidate_since_ms)) >= int(self._WEAK_OWNER_CLEAR_PERSIST_MS)
 
   def _mapd_dual_source_agreement(self, *, now_ns: int) -> bool:
     map_curve_ms, vision_curve_ms = self._curve_specific_mapd_sources(now_ns=now_ns)
@@ -1363,6 +1442,8 @@ class LongController:
   ) -> bool:
     if not bool(self._lp_has_lead):
       return False
+    if (int(now_ms) <= int(self._weak_planner_block_until_ms)) and (not self._lead_is_immediately_constraining(base_target_ms=float(base_target_ms), v_ego_ms=float(v_ego_ms))):
+      return False
     if not self._recent_actual_lead_context(now_ms=int(now_ms)):
       return False
 
@@ -1401,12 +1482,20 @@ class LongController:
       base_target_ms=float(base_target_ms),
       v_ego_ms=float(v_ego_ms),
     )
-    lp_lead_constraining = (not lead_opening_clear) and self._planner_lp_has_credible_lead(
-      now_ms=int(now_ms),
-      base_target_ms=float(base_target_ms),
-      planner_ms=float(planner_ms),
-      v_ego_ms=float(v_ego_ms),
+    planner_owner_blocked = (
+      int(now_ms) <= int(self._weak_planner_block_until_ms)
+      and (not self._lead_is_immediately_constraining(base_target_ms=float(base_target_ms), v_ego_ms=float(v_ego_ms)))
     )
+    if planner_owner_blocked:
+      lead_constraining = False
+      lp_lead_constraining = False
+    else:
+      lp_lead_constraining = (not lead_opening_clear) and self._planner_lp_has_credible_lead(
+        now_ms=int(now_ms),
+        base_target_ms=float(base_target_ms),
+        planner_ms=float(planner_ms),
+        v_ego_ms=float(v_ego_ms),
+      )
 
     reasons: list[str] = []
     if lead_constraining:
@@ -1451,6 +1540,8 @@ class LongController:
       self._reset_curve_hold()
       self._reset_lead_hold()
       self._curve_timeout_block_until_ms = 0
+      self._weak_planner_block_until_ms = 0
+      self._weak_owner_candidate_since_ms = 0
       return LongDecision(None, "gated: not enabled/adaptive")
 
     stock_state = str(getattr(CS, "stock_cruise_state", "") or "")
@@ -1470,6 +1561,8 @@ class LongController:
       self._reset_curve_hold()
       self._reset_lead_hold()
       self._curve_timeout_block_until_ms = 0
+      self._weak_planner_block_until_ms = 0
+      self._weak_owner_candidate_since_ms = 0
       return LongDecision(None, f"gated: stock_state={stock_state or 'UNKNOWN'}")
 
     if not self._last_active:
@@ -1478,6 +1571,8 @@ class LongController:
       self._clear_plan_and_mapd_state()
       self._reset_curve_hold()
       self._curve_timeout_block_until_ms = 0
+      self._weak_planner_block_until_ms = 0
+      self._weak_owner_candidate_since_ms = 0
       self._stable_plan_samples = 0
       self._last_lp_seen_ns = 0
       self._reset_lead_hold()
@@ -1780,6 +1875,22 @@ class LongController:
         desired_ms = min(float(desired_ms), max(float(self.MIN_CRUISE_SPEED_MS), float(lead_speed_ms)))
         src = f"{src}+stale_lead"
 
+    if self._should_force_weak_owner_release(
+      now_ms=int(now),
+      src=str(src),
+      reference_ms=float(active_reference_ms),
+      desired_ms=float(desired_ms),
+      current_set_ms=float(current_set_ms),
+      v_ego_ms=float(v_ego_ms),
+      current_angle_deg=float(getattr(cs_out, "steeringAngleDeg", 0.0) or 0.0),
+    ):
+      self._reset_curve_hold()
+      self._reset_lead_hold()
+      self._curve_recent_clear_until_ms = int(now) + int(self._CURVE_REENTRY_BLOCK_MS)
+      self._weak_planner_block_until_ms = int(now) + int(self._WEAK_OWNER_REENTRY_BLOCK_MS)
+      desired_ms = float(active_reference_ms)
+      src = f"{src}+owner_timeout_clear"
+
     if self._should_force_reference_recovery(
       now_ms=int(now),
       reference_ms=float(active_reference_ms),
@@ -1794,6 +1905,8 @@ class LongController:
       self._reset_curve_hold()
       self._reset_lead_hold()
       self._curve_recent_clear_until_ms = int(now) + int(self._CURVE_REENTRY_BLOCK_MS)
+      self._weak_planner_block_until_ms = int(now) + int(self._WEAK_OWNER_REENTRY_BLOCK_MS)
+      self._weak_owner_candidate_since_ms = 0
       desired_ms = float(active_reference_ms)
       src = f"{src}+recovery_clear"
 

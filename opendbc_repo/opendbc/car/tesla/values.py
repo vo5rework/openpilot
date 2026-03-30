@@ -198,12 +198,12 @@ class CarControllerParams:
   # High curvature: progressively give the requested path more authority so the
   # car turns in earlier and holds the inside of the lane better.
   CURVE_ASSIST_ANGLE_BP = [0.0, 4.0, 10.0, 18.0]
-  CURVE_ASSIST_GAIN_V = [1.00, 1.01, 1.03, 1.05]
-  CURVE_ASSIST_EXTRA_DEG_V = [0.0, 0.05, 0.30, 0.70]
+  CURVE_ASSIST_GAIN_V = [1.00, 1.005, 1.015, 1.025]
+  CURVE_ASSIST_EXTRA_DEG_V = [0.0, 0.03, 0.18, 0.40]
   CURVE_ASSIST_SPEED_BP = [0.0, 8.0, 15.0, 25.0, 35.0]
-  CURVE_ASSIST_SPEED_GAIN_V = [0.0, 0.35, 0.65, 0.85, 0.95]
+  CURVE_ASSIST_SPEED_GAIN_V = [0.0, 0.25, 0.45, 0.60, 0.70]
   CURVE_ASSIST_MAX_DELTA_BP = [0.0, 10.0, 20.0, 30.0]
-  CURVE_ASSIST_MAX_DELTA_V = [0.4, 0.8, 1.5, 2.5]
+  CURVE_ASSIST_MAX_DELTA_V = [0.3, 0.6, 1.0, 1.8]
 
   STEER_STEP = 2  # Angle command is sent at 50 Hz
   ACCEL_MAX = 2.0    # m/s^2
