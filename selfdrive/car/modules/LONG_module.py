@@ -1661,12 +1661,12 @@ class LongController:
       if lp_fresh and self._lp_target_last_ms is not None:
         drag_reasons = self._planner_drag_reasons(
           now_ms=int(now),
-          base_target_ms=float(base_target_ms),
+          base_target_ms=float(resume_ceiling_ms),
           planner_ms=float(planner_last_ms),
           v_ego_ms=float(v_ego_ms),
         )
         lead_owned = self._planner_owner_should_suppress(
-          base_target_ms=float(base_target_ms),
+          base_target_ms=float(resume_ceiling_ms),
           planner_ms=float(planner_last_ms),
           v_ego_ms=float(v_ego_ms),
           drag_reasons=drag_reasons,
@@ -1678,7 +1678,7 @@ class LongController:
           self._reset_curve_hold()
         elif self._lead_hold_active_now(
           now_ms=int(now),
-          base_target_ms=float(base_target_ms),
+          base_target_ms=float(resume_ceiling_ms),
           planner_ms=float(planner_last_ms),
           v_ego_ms=float(v_ego_ms),
         ):
@@ -1687,7 +1687,7 @@ class LongController:
           self._reset_curve_hold()
         elif (not self._lead_owner_present()) and (not self._planner_lp_has_credible_lead(
           now_ms=int(now),
-          base_target_ms=float(base_target_ms),
+          base_target_ms=float(resume_ceiling_ms),
           planner_ms=float(planner_last_ms),
           v_ego_ms=float(v_ego_ms),
         )):
@@ -1743,7 +1743,7 @@ class LongController:
           v_ego_ms=float(v_ego_ms),
         )
         lead_owned = self._planner_owner_should_suppress(
-          base_target_ms=float(base_target_ms),
+          base_target_ms=float(resume_ceiling_ms),
           planner_ms=float(planner_last_ms),
           v_ego_ms=float(v_ego_ms),
           drag_reasons=drag_reasons,
