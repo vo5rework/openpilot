@@ -133,6 +133,8 @@ class LongController:
   _WEAK_OWNER_CLEAR_CURRENT_MARGIN_MS = 0.5 * CV.MPH_TO_MS
   _WEAK_OWNER_CLEAR_PERSIST_MS = 1400
   _WEAK_OWNER_REENTRY_BLOCK_MS = 6000
+  _PLANNER_OWNER_STRONG_DROP_MS = 2.5 * CV.MPH_TO_MS
+  _PLANNER_OWNER_EGO_DROP_MS = 0.8 * CV.MPH_TO_MS
   _CURVE_STALE_TIMEOUT_STEER_DEG = 0.75
   _CURVE_STALE_TIMEOUT_REFERENCE_MARGIN_MS = 3.0 * CV.MPH_TO_MS
   _CURVE_STALE_TIMEOUT_CURRENT_MARGIN_MS = 1.0 * CV.MPH_TO_MS
@@ -634,7 +636,8 @@ class LongController:
     if int(self._lead_hold_until_ms) <= 0 or int(now_ms) > int(self._lead_hold_until_ms):
       self._lead_hold_until_ms = 0
       return False
-    if (int(now_ms) <= int(self._weak_planner_block_until_ms)) and (not self._lead_is_immediately_constraining(base_target_ms=float(base_target_ms), v_ego_ms=float(v_ego_ms))):
+    immediate_lead = self._lead_is_immediately_constraining(base_target_ms=float(base_target_ms), v_ego_ms=float(v_ego_ms))
+    if (int(now_ms) <= int(self._weak_planner_block_until_ms)) and (not immediate_lead):
       self._lead_hold_until_ms = 0
       return False
     if float(planner_ms) <= 0.1:
@@ -642,6 +645,15 @@ class LongController:
     if self._lead_is_opening_clear(base_target_ms=float(base_target_ms), v_ego_ms=float(v_ego_ms)):
       self._lead_hold_until_ms = 0
       return False
+    if not immediate_lead:
+      strong_drop = (
+        float(planner_ms) < (float(base_target_ms) - float(self._PLANNER_OWNER_STRONG_DROP_MS))
+        and float(planner_ms) < (float(v_ego_ms) - float(self._PLANNER_OWNER_EGO_DROP_MS))
+      )
+      strong_planner_decel = float(self._lp_a_target) <= float(self._STRONG_DECEL_ATARGET_MS2)
+      if not (strong_drop and strong_planner_decel):
+        self._lead_hold_until_ms = 0
+        return False
     return float(planner_ms) < (float(base_target_ms) - float(self._LEAD_HOLD_RELEASE_MARGIN_MS))
 
   def _curve_initial_preview_drop_ms(self, *, delta_ms: float, hard_entry: bool) -> float:
@@ -1467,6 +1479,32 @@ class LongController:
       and (strong_planner_decel or strong_recent_clear_drop)
     )
 
+  def _planner_owner_should_suppress(
+    self,
+    *,
+    base_target_ms: float,
+    planner_ms: float,
+    v_ego_ms: float,
+    drag_reasons: list[str],
+  ) -> bool:
+    if not drag_reasons:
+      return False
+
+    immediate_lead = self._lead_is_immediately_constraining(
+      base_target_ms=float(base_target_ms),
+      v_ego_ms=float(v_ego_ms),
+    )
+    if immediate_lead:
+      return True
+
+    strong_planner_drop = (
+      float(planner_ms) < (float(base_target_ms) - float(self._PLANNER_OWNER_STRONG_DROP_MS))
+      and float(planner_ms) < (float(v_ego_ms) - float(self._PLANNER_OWNER_EGO_DROP_MS))
+    )
+    strong_planner_decel = float(self._lp_a_target) <= float(self._STRONG_DECEL_ATARGET_MS2)
+    planner_has_lead_context = ("lead" in drag_reasons) or ("lp_hasLead" in drag_reasons)
+    return bool(planner_has_lead_context and strong_planner_drop and strong_planner_decel)
+
   def _planner_drag_reasons(self, *, now_ms: int, base_target_ms: float, planner_ms: float, v_ego_ms: float) -> list[str]:
     if float(planner_ms) <= 0.1:
       return []
@@ -1634,7 +1672,12 @@ class LongController:
           planner_ms=float(planner_last_ms),
           v_ego_ms=float(v_ego_ms),
         )
-        lead_owned = ("lead" in drag_reasons) or ("lp_hasLead" in drag_reasons)
+        lead_owned = self._planner_owner_should_suppress(
+          base_target_ms=float(base_target_ms),
+          planner_ms=float(planner_last_ms),
+          v_ego_ms=float(v_ego_ms),
+          drag_reasons=drag_reasons,
+        )
         if lead_owned:
           desired_ms = min(float(base_target_ms), float(planner_last_ms))
           src = f"{src}+planner[{'+'.join(drag_reasons)}]"
@@ -1687,7 +1730,7 @@ class LongController:
         else:
           self._reset_curve_hold()
           self._reset_lead_hold()
-      elif self._lead_present and (self._lead_drel < 80.0) and (self._lead_vrel < -0.5):
+      elif self._lead_is_immediately_constraining(base_target_ms=float(base_target_ms), v_ego_ms=float(v_ego_ms)) and (self._lead_vrel < -0.75):
         lead_speed_ms = max(0.0, float(v_ego_ms) + float(self._lead_vrel))
         desired_ms = min(float(base_target_ms), max(float(self.MIN_CRUISE_SPEED_MS), float(lead_speed_ms)))
         src = f"{src}+stale_lead"
@@ -1706,7 +1749,12 @@ class LongController:
           planner_ms=float(planner_last_ms),
           v_ego_ms=float(v_ego_ms),
         )
-        lead_owned = ("lead" in drag_reasons) or ("lp_hasLead" in drag_reasons)
+        lead_owned = self._planner_owner_should_suppress(
+          base_target_ms=float(base_target_ms),
+          planner_ms=float(planner_last_ms),
+          v_ego_ms=float(v_ego_ms),
+          drag_reasons=drag_reasons,
+        )
         if lead_owned:
           desired_ms = float(planner_last_ms)
           src = "lp_last"
