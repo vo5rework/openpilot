@@ -151,6 +151,15 @@ class LongController:
   _NO_LEAD_CRUISE_PROFILE_BLOCK_REFERENCE_GAP_MS = 4.0 * CV.MPH_TO_MS
   _NO_LEAD_CRUISE_PROFILE_TRACK_SET_MARGIN_MS = 1.5 * CV.MPH_TO_MS
   _NO_LEAD_FLAT_BLOCK_MAX_SPEED_MS = 50.0 * CV.MPH_TO_MS
+  _NO_LEAD_SET_TRACK_BLOCK_STEER_DEG = 1.35
+  _NO_LEAD_SET_TRACK_BLOCK_REFERENCE_GAP_MS = 6.0 * CV.MPH_TO_MS
+  _NO_LEAD_SET_TRACK_MARGIN_MS = 2.0 * CV.MPH_TO_MS
+  _NO_LEAD_SET_TRACK_MAX_SPEED_MS = 45.0 * CV.MPH_TO_MS
+  _QUEUE_AHEAD_MAX_SPEED_MS = 45.0 * CV.MPH_TO_MS
+  _QUEUE_AHEAD_VREL_MS = -1.2
+  _QUEUE_AHEAD_LEAD_SPEED_MS = 12.0 * CV.MPH_TO_MS
+  _QUEUE_AHEAD_PLANNER_DROP_MS = 1.0 * CV.MPH_TO_MS
+  _QUEUE_AHEAD_ATARGET_MS2 = -0.35
 
   def __init__(self) -> None:
     self.acc = ACCController()
@@ -778,7 +787,10 @@ class LongController:
     planner_preview_ms: float,
     current_angle_deg: float,
   ) -> bool:
-    if max(float(reference_ms), float(current_set_ms), float(v_ego_ms)) > float(self._NO_LEAD_FLAT_BLOCK_MAX_SPEED_MS):
+    # This guard is meant for low/mid-speed stale no-lead recovery. Key it off the
+    # live set/ego speeds rather than the posted-limit target, otherwise a 50 mph
+    # road can evade the block even while the car is wrongly pinned in the 20s/30s.
+    if max(float(current_set_ms), float(v_ego_ms)) > float(self._NO_LEAD_FLAT_BLOCK_MAX_SPEED_MS):
       return False
     if abs(float(current_angle_deg)) > float(self._NO_LEAD_FLAT_BLOCK_STEER_DEG):
       return False
@@ -789,6 +801,62 @@ class LongController:
       planner_near_ms=float(planner_near_ms),
       planner_preview_ms=float(planner_preview_ms),
     )
+
+  def _should_block_set_tracking_no_lead_curve_profile(
+    self,
+    *,
+    reference_ms: float,
+    current_set_ms: float,
+    v_ego_ms: float,
+    planner_last_ms: float,
+    planner_near_ms: float,
+    planner_preview_ms: float,
+    current_angle_deg: float,
+    curve_specific_mapd_ms: Optional[float],
+  ) -> bool:
+    if max(float(current_set_ms), float(v_ego_ms)) > float(self._NO_LEAD_SET_TRACK_MAX_SPEED_MS):
+      return False
+    if abs(float(current_angle_deg)) > float(self._NO_LEAD_SET_TRACK_BLOCK_STEER_DEG):
+      return False
+    if float(reference_ms) < (float(current_set_ms) + float(self._NO_LEAD_SET_TRACK_BLOCK_REFERENCE_GAP_MS)):
+      return False
+    if (
+      curve_specific_mapd_ms is not None
+      and float(curve_specific_mapd_ms) < (float(reference_ms) - float(self._CURVE_RELEASE_NEAR_TARGET_MARGIN_MS))
+    ):
+      return False
+
+    track_margin_ms = float(self._NO_LEAD_SET_TRACK_MARGIN_MS)
+    return bool(
+      float(planner_near_ms) >= (float(current_set_ms) - float(track_margin_ms))
+      and float(planner_last_ms) >= (float(current_set_ms) - float(1.5 * track_margin_ms))
+      and float(planner_preview_ms) >= (float(current_set_ms) - float(2.0 * track_margin_ms))
+    )
+
+  def _queue_ahead_assist_active(self, *, base_target_ms: float, v_ego_ms: float) -> bool:
+    if not self._lead_present:
+      return False
+
+    if float(v_ego_ms) > float(self._QUEUE_AHEAD_MAX_SPEED_MS):
+      return False
+
+    if self._curve_hold_active:
+      return False
+
+    lead_speed_ms = max(0.0, float(v_ego_ms) + float(self._lead_vrel))
+    close_enough = float(self._lead_drel) <= max(20.0, float(v_ego_ms) * 2.0)
+    slow_or_stopping = (
+      float(self._lead_vrel) <= float(self._QUEUE_AHEAD_VREL_MS)
+      or lead_speed_ms <= float(self._QUEUE_AHEAD_LEAD_SPEED_MS)
+    )
+    planner_confirms_decel = (
+      float(self._lp_a_target) <= float(self._QUEUE_AHEAD_ATARGET_MS2)
+      or (
+        self._lp_target_near_ms is not None
+        and float(self._lp_target_near_ms) < (float(base_target_ms) - float(self._QUEUE_AHEAD_PLANNER_DROP_MS))
+      )
+    )
+    return bool(close_enough and slow_or_stopping and planner_confirms_decel)
 
   def _should_block_no_lead_cruise_profile_curve(
     self,
@@ -1170,6 +1238,20 @@ class LongController:
       return float(reference_ms), "curve_clear(flat_profile)"
 
     raw_curve_specific_mapd_ms = self._curve_specific_mapd_target_ms(now_ns=now_ns)
+
+    if self._should_block_set_tracking_no_lead_curve_profile(
+      reference_ms=float(reference_ms),
+      current_set_ms=float(current_set_ms),
+      v_ego_ms=float(v_ego_ms),
+      planner_last_ms=float(planner_last_ms),
+      planner_near_ms=float(planner_near_ms),
+      planner_preview_ms=float(planner_preview_ms),
+      current_angle_deg=float(current_angle_deg),
+      curve_specific_mapd_ms=raw_curve_specific_mapd_ms,
+    ):
+      self._reset_curve_hold()
+      self._arm_curve_reentry_block(now_ms=int(now_ms))
+      return float(reference_ms), "curve_clear(set_tracking)"
 
     if self._should_block_no_lead_cruise_profile_curve(
       reference_ms=float(reference_ms),
@@ -1557,6 +1639,8 @@ class LongController:
       return False
     if self._lead_is_opening_clear(base_target_ms=float(base_target_ms), v_ego_ms=float(v_ego_ms)):
       return False
+    if self._queue_ahead_assist_active(base_target_ms=float(base_target_ms), v_ego_ms=float(v_ego_ms)):
+      return True
 
     lead_speed_ms = max(0.0, float(v_ego_ms) + float(self._lead_vrel))
     lead_slower_than_base = lead_speed_ms < (float(base_target_ms) - 0.25)
