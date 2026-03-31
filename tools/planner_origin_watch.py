@@ -48,6 +48,25 @@ def _safe_bool(value: Any) -> bool:
     return False
 
 
+
+
+def _enum_or_str(value: Any) -> Any:
+  if isinstance(value, (bool, int, float, str)) or value is None:
+    return value
+  try:
+    return int(value)
+  except Exception:
+    pass
+  try:
+    return str(value)
+  except Exception:
+    return repr(value)
+
+
+def _json_default(value: Any) -> Any:
+  return _enum_or_str(value)
+
+
 def _take_numeric(seq: Any, limit: int) -> list[float]:
   out: list[float] = []
   if not seq:
@@ -101,7 +120,7 @@ def _plan_summary(lp: Any) -> dict[str, Any]:
     "fcw",
   ):
     try:
-      out[name] = getattr(lp, name)
+      out[name] = _enum_or_str(getattr(lp, name))
     except Exception:
       pass
 
@@ -126,7 +145,7 @@ def _lead_summary(lead: Any) -> dict[str, Any]:
   }
   for name in ("radarTrackId", "source"):
     try:
-      out[name] = getattr(lead, name)
+      out[name] = _enum_or_str(getattr(lead, name))
     except Exception:
       pass
   return out
@@ -172,10 +191,15 @@ def _controls_state_summary(cs: Any) -> dict[str, Any]:
       value = getattr(cs, name)
     except Exception:
       continue
-    if isinstance(value, (bool, int, str)):
+    if isinstance(value, (bool, int, float, str)):
       out[name] = value
     else:
-      out[name] = _safe_float(value, 0.0)
+      try:
+        out[name] = _safe_float(value, 0.0)
+        if out[name] == 0.0:
+          out[name] = _enum_or_str(value)
+      except Exception:
+        out[name] = _enum_or_str(value)
   return out
 
 
@@ -197,10 +221,15 @@ def _mapd_summary(mo: Any) -> dict[str, Any]:
       value = getattr(mo, name)
     except Exception:
       continue
-    if isinstance(value, str):
+    if isinstance(value, (bool, int, float, str)):
       out[name] = value
     else:
-      out[name] = _safe_float(value, 0.0)
+      try:
+        out[name] = _safe_float(value, 0.0)
+        if out[name] == 0.0:
+          out[name] = _enum_or_str(value)
+      except Exception:
+        out[name] = _enum_or_str(value)
   return out
 
 
@@ -293,7 +322,7 @@ def main() -> int:
       "jsonl_path": str(jsonl_path),
       "txt_path": str(txt_path),
     }
-    out_f.write(json.dumps(header, separators=(",", ":")) + "\n")
+    out_f.write(json.dumps(header, separators=(",", ":"), default=_json_default) + "\n")
     out_f.flush()
 
     with txt_path.open("a", encoding="utf-8") as txt_f:
@@ -351,7 +380,7 @@ def main() -> int:
       except Exception as e:
         record["mapdOut_error"] = str(e)
 
-      out_f.write(json.dumps(record, separators=(",", ":")) + "\n")
+      out_f.write(json.dumps(record, separators=(",", ":"), default=_json_default) + "\n")
       out_f.flush()
       sample_count += 1
 

@@ -147,6 +147,9 @@ class LongController:
   _NO_LEAD_FLAT_PROFILE_DELTA_MS = 1.0 * CV.MPH_TO_MS
   _NO_LEAD_FLAT_BLOCK_STEER_DEG = 1.35
   _NO_LEAD_FLAT_BLOCK_REFERENCE_GAP_MS = 4.0 * CV.MPH_TO_MS
+  _NO_LEAD_CRUISE_PROFILE_BLOCK_STEER_DEG = 1.35
+  _NO_LEAD_CRUISE_PROFILE_BLOCK_REFERENCE_GAP_MS = 4.0 * CV.MPH_TO_MS
+  _NO_LEAD_CRUISE_PROFILE_TRACK_SET_MARGIN_MS = 1.5 * CV.MPH_TO_MS
   _NO_LEAD_FLAT_BLOCK_MAX_SPEED_MS = 50.0 * CV.MPH_TO_MS
 
   def __init__(self) -> None:
@@ -159,6 +162,7 @@ class LongController:
     self._lp_last_ns: int = 0
     self._lp_has_lead: bool = False
     self._lp_a_target: float = 0.0
+    self._lp_source: str = ""
 
     self._lead_present: bool = False
     self._lead_drel: float = 0.0
@@ -344,9 +348,9 @@ class LongController:
 
   def _mapd_curve_active_target_ms(self, *, now_ns: int) -> Optional[float]:
     curve_specific_ms = self._curve_specific_mapd_target_ms(now_ns=now_ns)
-    if curve_specific_ms is not None:
-      return float(curve_specific_ms)
-    return self._mapd_curve_target_ms(now_ns=now_ns)
+    if curve_specific_ms is None:
+      return None
+    return float(curve_specific_ms)
 
 
   def _mapd_entry_target_ms(
@@ -786,6 +790,38 @@ class LongController:
       planner_preview_ms=float(planner_preview_ms),
     )
 
+  def _should_block_no_lead_cruise_profile_curve(
+    self,
+    *,
+    reference_ms: float,
+    current_set_ms: float,
+    planner_last_ms: float,
+    planner_near_ms: float,
+    planner_preview_ms: float,
+    current_angle_deg: float,
+    curve_specific_mapd_ms: Optional[float],
+  ) -> bool:
+    if str(getattr(self, "_lp_source", "") or "") not in ("cruise", "e2e"):
+      return False
+    if abs(float(current_angle_deg)) > float(self._NO_LEAD_CRUISE_PROFILE_BLOCK_STEER_DEG):
+      return False
+    if float(reference_ms) < (float(current_set_ms) + float(self._NO_LEAD_CRUISE_PROFILE_BLOCK_REFERENCE_GAP_MS)):
+      return False
+
+    release_margin_ms = float(self._CURVE_RELEASE_NEAR_TARGET_MARGIN_MS)
+    if (
+      curve_specific_mapd_ms is not None
+      and float(curve_specific_mapd_ms) < (float(reference_ms) - float(release_margin_ms))
+    ):
+      return False
+
+    track_margin_ms = float(self._NO_LEAD_CRUISE_PROFILE_TRACK_SET_MARGIN_MS)
+    return bool(
+      float(planner_last_ms) >= (float(current_set_ms) - float(track_margin_ms))
+      and float(planner_near_ms) >= (float(current_set_ms) - float(track_margin_ms))
+      and float(planner_preview_ms) >= (float(current_set_ms) - float(track_margin_ms))
+    )
+
   def _should_snap_clear_curve_on_straight(
     self,
     *,
@@ -1134,6 +1170,20 @@ class LongController:
       return float(reference_ms), "curve_clear(flat_profile)"
 
     raw_curve_specific_mapd_ms = self._curve_specific_mapd_target_ms(now_ns=now_ns)
+
+    if self._should_block_no_lead_cruise_profile_curve(
+      reference_ms=float(reference_ms),
+      current_set_ms=float(current_set_ms),
+      planner_last_ms=float(planner_last_ms),
+      planner_near_ms=float(planner_near_ms),
+      planner_preview_ms=float(planner_preview_ms),
+      current_angle_deg=float(current_angle_deg),
+      curve_specific_mapd_ms=raw_curve_specific_mapd_ms,
+    ):
+      self._reset_curve_hold()
+      self._arm_curve_reentry_block(now_ms=int(now_ms))
+      return float(reference_ms), "curve_clear(cruise_profile)"
+
     planner_curve_active = self._planner_curve_entry_allowed(
       reference_ms=float(reference_ms),
       planner_near_ms=float(planner_near_ms),
@@ -1428,6 +1478,10 @@ class LongController:
         self._lp_last_ns = int(lp_mono_ns)
         self._lp_has_lead = bool(getattr(lp, "hasLead", False))
         self._lp_a_target = float(getattr(lp, "aTarget", 0.0) or 0.0)
+        try:
+          self._lp_source = str(getattr(lp, "longitudinalPlanSource", "") or "")
+        except Exception:
+          self._lp_source = ""
     except Exception:
       pass
 
@@ -1724,6 +1778,7 @@ class LongController:
       self._last_lp_seen_ns = 0
       self._lp_has_lead = False
       self._lp_a_target = 0.0
+      self._lp_source = ""
       self._lp_target_last_ms = None
       self._lp_target_near_ms = None
       self._lp_target_preview_ms = None
