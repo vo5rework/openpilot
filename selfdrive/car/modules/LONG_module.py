@@ -143,6 +143,11 @@ class LongController:
   _CURVE_STALE_TIMEOUT_BLOCK_MS = 5000
   _CURVE_STALE_TIMEOUT_REENTRY_STEER_DEG = 2.0
   _CURVE_STALE_TIMEOUT_REENTRY_STRONG_DROP_MS = 8.0 * CV.MPH_TO_MS
+  _NO_LEAD_STARTUP_MIN_STABLE_SAMPLES = 12
+  _NO_LEAD_FLAT_PROFILE_DELTA_MS = 1.0 * CV.MPH_TO_MS
+  _NO_LEAD_FLAT_BLOCK_STEER_DEG = 1.35
+  _NO_LEAD_FLAT_BLOCK_REFERENCE_GAP_MS = 4.0 * CV.MPH_TO_MS
+  _NO_LEAD_FLAT_BLOCK_MAX_SPEED_MS = 50.0 * CV.MPH_TO_MS
 
   def __init__(self) -> None:
     self.acc = ACCController()
@@ -164,7 +169,6 @@ class LongController:
     self._mapd_last_ns: int = 0
 
     self._last_info_log_ms: int = 0
-    self._last_sync_diag_log_ms: int = 0
     self._enabled_since_ms: int = 0
     self._last_active: bool = False
     self._last_lp_seen_ns: int = 0
@@ -211,13 +215,6 @@ class LongController:
     if now - int(self._last_info_log_ms) < 1000:
       return
     self._last_info_log_ms = int(now)
-    cloudlog.info(msg)
-
-  def _rate_sync_diag_log(self, msg: str) -> None:
-    now = _mono_ms()
-    if now - int(self._last_sync_diag_log_ms) < 1000:
-      return
-    self._last_sync_diag_log_ms = int(now)
     cloudlog.info(msg)
 
   @staticmethod
@@ -744,6 +741,44 @@ class LongController:
     # separate in-curve release path unchanged.
     return bool(near_clear or preview_clear)
 
+
+  def _planner_curve_profile_flat(
+    self,
+    *,
+    planner_last_ms: float,
+    planner_near_ms: float,
+    planner_preview_ms: float,
+  ) -> bool:
+    flat_delta_ms = float(self._NO_LEAD_FLAT_PROFILE_DELTA_MS)
+    return bool(
+      abs(float(planner_last_ms) - float(planner_near_ms)) <= flat_delta_ms
+      and abs(float(planner_near_ms) - float(planner_preview_ms)) <= flat_delta_ms
+      and abs(float(planner_last_ms) - float(planner_preview_ms)) <= flat_delta_ms
+    )
+
+  def _should_block_flat_no_lead_curve_profile(
+    self,
+    *,
+    reference_ms: float,
+    current_set_ms: float,
+    v_ego_ms: float,
+    planner_last_ms: float,
+    planner_near_ms: float,
+    planner_preview_ms: float,
+    current_angle_deg: float,
+  ) -> bool:
+    if max(float(reference_ms), float(current_set_ms), float(v_ego_ms)) > float(self._NO_LEAD_FLAT_BLOCK_MAX_SPEED_MS):
+      return False
+    if abs(float(current_angle_deg)) > float(self._NO_LEAD_FLAT_BLOCK_STEER_DEG):
+      return False
+    if float(reference_ms) < (float(current_set_ms) + float(self._NO_LEAD_FLAT_BLOCK_REFERENCE_GAP_MS)):
+      return False
+    return self._planner_curve_profile_flat(
+      planner_last_ms=float(planner_last_ms),
+      planner_near_ms=float(planner_near_ms),
+      planner_preview_ms=float(planner_preview_ms),
+    )
+
   def _should_snap_clear_curve_on_straight(
     self,
     *,
@@ -1077,6 +1112,18 @@ class LongController:
     v_ego_ms = float(v_ego_ms)
     current_set_ms = float(current_set_ms)
     current_angle_deg = float(current_angle_deg)
+
+    if self._should_block_flat_no_lead_curve_profile(
+      reference_ms=float(reference_ms),
+      current_set_ms=float(current_set_ms),
+      v_ego_ms=float(v_ego_ms),
+      planner_last_ms=float(planner_last_ms),
+      planner_near_ms=float(planner_near_ms),
+      planner_preview_ms=float(planner_preview_ms),
+      current_angle_deg=float(current_angle_deg),
+    ):
+      self._reset_curve_hold()
+      return float(reference_ms), "curve_clear(flat_profile)"
 
     raw_curve_specific_mapd_ms = self._curve_specific_mapd_target_ms(now_ns=now_ns)
     planner_curve_active = self._planner_curve_entry_allowed(
@@ -1670,7 +1717,7 @@ class LongController:
       and (not self._lead_present)
       and (
         (not lp_fresh)
-        or (int(self._stable_plan_samples) < 2)
+        or (int(self._stable_plan_samples) < int(self._NO_LEAD_STARTUP_MIN_STABLE_SAMPLES))
         or (float(planner_last_ms) <= 0.1)
         or (
           float(v_ego_ms) > float(self.MIN_CRUISE_SPEED_MS)
@@ -1719,7 +1766,7 @@ class LongController:
           v_ego_ms=float(v_ego_ms),
         )):
           self._reset_lead_hold()
-          if int(self._stable_plan_samples) < 2:
+          if int(self._stable_plan_samples) < int(self._NO_LEAD_STARTUP_MIN_STABLE_SAMPLES):
             self._reset_curve_hold()
             desired_ms = float(base_target_ms)
             src = f"{src}+startup_hold"
@@ -1796,7 +1843,7 @@ class LongController:
           v_ego_ms=float(v_ego_ms),
         )):
           self._reset_lead_hold()
-          if int(self._stable_plan_samples) < 2:
+          if int(self._stable_plan_samples) < int(self._NO_LEAD_STARTUP_MIN_STABLE_SAMPLES):
             self._reset_curve_hold()
             desired_ms = float(resume_ceiling_ms)
             src = "hold+ceiling+startup_hold"
@@ -1902,45 +1949,14 @@ class LongController:
       set_speed_limit_active=bool(set_speed_limit_active),
     )
 
-    kph_to_u = CV.KPH_TO_MPH if speed_units == "MPH" else 1.0
-    speed_limit_diag_u = (
-      float(speed_limit_target_ms) * CV.MS_TO_MPH
-      if (speed_units == "MPH" and speed_limit_target_ms is not None)
-      else (float(speed_limit_target_ms) * CV.MS_TO_KPH if speed_limit_target_ms is not None else 0.0)
-    )
-    lead_vrel_u = float(self._lead_vrel) * CV.MS_TO_MPH if speed_units == "MPH" else float(self._lead_vrel) * CV.MS_TO_KPH
-    diag_tail = (
-      f" set={float(current_set_ms) * kph_to_u * CV.MS_TO_KPH:.1f}"
-      f" ref={float(active_reference_ms) * kph_to_u * CV.MS_TO_KPH:.1f}"
-      f" des={float(desired_ms) * kph_to_u * CV.MS_TO_KPH:.1f}"
-      f" sl={speed_limit_diag_u:.1f}"
-      f" sl_active={int(bool(set_speed_limit_active))}"
-      f" ceiling={ceiling_src}"
-      f" p_last={float(planner_last_ms) * kph_to_u * CV.MS_TO_KPH:.1f}"
-      f" p_near={float(planner_near_ms) * kph_to_u * CV.MS_TO_KPH:.1f}"
-      f" p_prev={float(planner_preview_ms) * kph_to_u * CV.MS_TO_KPH:.1f}"
-      f" lead={int(bool(self._lead_present))}"
-      f" dRel={float(self._lead_drel):.1f}"
-      f" vRel={lead_vrel_u:.1f}"
-      f" lp_hasLead={int(bool(self._lp_has_lead))}"
-      f" aT={float(self._lp_a_target):.2f}"
-      f" mapd={((float(self._mapd_curve_active_target_ms(now_ns=now_ns)) * kph_to_u * CV.MS_TO_KPH) if self._mapd_curve_active_target_ms(now_ns=now_ns) is not None else 0.0):.1f}"
-      f" stable={int(self._stable_plan_samples)}"
-    )
-
     if decision.button is None or int(decision.button) == int(CruiseButtons.IDLE):
-      idle_msg = (
-        f"[XNOR_CRUISE_IDLE] src={src} uom={speed_units} "
-        f"cur={decision.current_kph * kph_to_u:.1f} est={decision.est_kph * kph_to_u:.1f} "
-        f"reason={decision.reason}{diag_tail}"
-      )
-      self._rate_sync_diag_log(idle_msg)
       return LongDecision(None, f"{decision.reason} src={src}")
 
+    kph_to_u = CV.KPH_TO_MPH if speed_units == "MPH" else 1.0
     msg = (
       f"[XNOR_CRUISE_SYNC] src={src} uom={speed_units} "
       f"tgt={decision.target_kph * kph_to_u:.1f} cur={decision.current_kph * kph_to_u:.1f} "
-      f"est={decision.est_kph * kph_to_u:.1f} btn={int(decision.button)} reason={decision.reason}{diag_tail}"
+      f"est={decision.est_kph * kph_to_u:.1f} btn={int(decision.button)} reason={decision.reason}"
     )
     self._rate_log(msg)
     return LongDecision(int(decision.button), msg)
