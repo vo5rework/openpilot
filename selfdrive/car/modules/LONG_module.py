@@ -164,6 +164,7 @@ class LongController:
     self._mapd_last_ns: int = 0
 
     self._last_info_log_ms: int = 0
+    self._last_sync_diag_log_ms: int = 0
     self._enabled_since_ms: int = 0
     self._last_active: bool = False
     self._last_lp_seen_ns: int = 0
@@ -210,6 +211,13 @@ class LongController:
     if now - int(self._last_info_log_ms) < 1000:
       return
     self._last_info_log_ms = int(now)
+    cloudlog.info(msg)
+
+  def _rate_sync_diag_log(self, msg: str) -> None:
+    now = _mono_ms()
+    if now - int(self._last_sync_diag_log_ms) < 1000:
+      return
+    self._last_sync_diag_log_ms = int(now)
     cloudlog.info(msg)
 
   @staticmethod
@@ -1894,14 +1902,45 @@ class LongController:
       set_speed_limit_active=bool(set_speed_limit_active),
     )
 
+    kph_to_u = CV.KPH_TO_MPH if speed_units == "MPH" else 1.0
+    speed_limit_diag_u = (
+      float(speed_limit_target_ms) * CV.MS_TO_MPH
+      if (speed_units == "MPH" and speed_limit_target_ms is not None)
+      else (float(speed_limit_target_ms) * CV.MS_TO_KPH if speed_limit_target_ms is not None else 0.0)
+    )
+    lead_vrel_u = float(self._lead_vrel) * CV.MS_TO_MPH if speed_units == "MPH" else float(self._lead_vrel) * CV.MS_TO_KPH
+    diag_tail = (
+      f" set={float(current_set_ms) * kph_to_u * CV.MS_TO_KPH:.1f}"
+      f" ref={float(active_reference_ms) * kph_to_u * CV.MS_TO_KPH:.1f}"
+      f" des={float(desired_ms) * kph_to_u * CV.MS_TO_KPH:.1f}"
+      f" sl={speed_limit_diag_u:.1f}"
+      f" sl_active={int(bool(set_speed_limit_active))}"
+      f" ceiling={ceiling_src}"
+      f" p_last={float(planner_last_ms) * kph_to_u * CV.MS_TO_KPH:.1f}"
+      f" p_near={float(planner_near_ms) * kph_to_u * CV.MS_TO_KPH:.1f}"
+      f" p_prev={float(planner_preview_ms) * kph_to_u * CV.MS_TO_KPH:.1f}"
+      f" lead={int(bool(self._lead_present))}"
+      f" dRel={float(self._lead_drel):.1f}"
+      f" vRel={lead_vrel_u:.1f}"
+      f" lp_hasLead={int(bool(self._lp_has_lead))}"
+      f" aT={float(self._lp_a_target):.2f}"
+      f" mapd={((float(self._mapd_curve_active_target_ms(now_ns=now_ns)) * kph_to_u * CV.MS_TO_KPH) if self._mapd_curve_active_target_ms(now_ns=now_ns) is not None else 0.0):.1f}"
+      f" stable={int(self._stable_plan_samples)}"
+    )
+
     if decision.button is None or int(decision.button) == int(CruiseButtons.IDLE):
+      idle_msg = (
+        f"[XNOR_CRUISE_IDLE] src={src} uom={speed_units} "
+        f"cur={decision.current_kph * kph_to_u:.1f} est={decision.est_kph * kph_to_u:.1f} "
+        f"reason={decision.reason}{diag_tail}"
+      )
+      self._rate_sync_diag_log(idle_msg)
       return LongDecision(None, f"{decision.reason} src={src}")
 
-    kph_to_u = CV.KPH_TO_MPH if speed_units == "MPH" else 1.0
     msg = (
       f"[XNOR_CRUISE_SYNC] src={src} uom={speed_units} "
       f"tgt={decision.target_kph * kph_to_u:.1f} cur={decision.current_kph * kph_to_u:.1f} "
-      f"est={decision.est_kph * kph_to_u:.1f} btn={int(decision.button)} reason={decision.reason}"
+      f"est={decision.est_kph * kph_to_u:.1f} btn={int(decision.button)} reason={decision.reason}{diag_tail}"
     )
     self._rate_log(msg)
     return LongDecision(int(decision.button), msg)
