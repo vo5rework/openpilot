@@ -160,6 +160,12 @@ class LongController:
   _QUEUE_AHEAD_LEAD_SPEED_MS = 12.0 * CV.MPH_TO_MS
   _QUEUE_AHEAD_PLANNER_DROP_MS = 1.0 * CV.MPH_TO_MS
   _QUEUE_AHEAD_ATARGET_MS2 = -0.35
+  _HIGH_SPEED_PLANNER_OWNER_SPEED_MS = 55.0 * CV.MPH_TO_MS
+  _HIGH_SPEED_PLANNER_OWNER_DROP_MS = 4.0 * CV.MPH_TO_MS
+  _HIGH_SPEED_CURVE_CLEAR_SPEED_MS = 60.0 * CV.MPH_TO_MS
+  _HIGH_SPEED_CURVE_CLEAR_STEER_DEG = 1.6
+  _HIGH_SPEED_CURVE_CLEAR_TARGET_MARGIN_MS = 4.0 * CV.MPH_TO_MS
+  _HIGH_SPEED_CURVE_CLEAR_PLANNER_MARGIN_MS = 3.0 * CV.MPH_TO_MS
 
   def __init__(self) -> None:
     self.acc = ACCController()
@@ -671,8 +677,12 @@ class LongController:
       self._lead_hold_until_ms = 0
       return False
     if not immediate_lead:
+      required_drop_ms = self._planner_owner_drop_required_ms(
+        base_target_ms=float(base_target_ms),
+        v_ego_ms=float(v_ego_ms),
+      )
       strong_drop = (
-        float(planner_ms) < (float(base_target_ms) - float(self._PLANNER_OWNER_STRONG_DROP_MS))
+        float(planner_ms) < (float(base_target_ms) - float(required_drop_ms))
         and float(planner_ms) < (float(v_ego_ms) - float(self._PLANNER_OWNER_EGO_DROP_MS))
       )
       strong_planner_decel = float(self._lp_a_target) <= float(self._STRONG_DECEL_ATARGET_MS2)
@@ -857,6 +867,37 @@ class LongController:
       )
     )
     return bool(close_enough and slow_or_stopping and planner_confirms_decel)
+
+  def _planner_owner_drop_required_ms(self, *, base_target_ms: float, v_ego_ms: float) -> float:
+    required_ms = float(self._PLANNER_OWNER_STRONG_DROP_MS)
+    if max(float(base_target_ms), float(v_ego_ms)) >= float(self._HIGH_SPEED_PLANNER_OWNER_SPEED_MS):
+      required_ms = max(required_ms, float(self._HIGH_SPEED_PLANNER_OWNER_DROP_MS))
+    return float(required_ms)
+
+  def _should_clear_high_speed_curve_nibble(
+    self,
+    *,
+    reference_ms: float,
+    curve_target_ms: float,
+    planner_near_ms: float,
+    v_ego_ms: float,
+    current_angle_deg: float,
+    curve_specific_mapd_ms: Optional[float],
+  ) -> bool:
+    if max(float(reference_ms), float(v_ego_ms)) < float(self._HIGH_SPEED_CURVE_CLEAR_SPEED_MS):
+      return False
+    if abs(float(current_angle_deg)) > float(self._HIGH_SPEED_CURVE_CLEAR_STEER_DEG):
+      return False
+    if float(curve_target_ms) < (float(reference_ms) - float(self._HIGH_SPEED_CURVE_CLEAR_TARGET_MARGIN_MS)):
+      return False
+    if float(planner_near_ms) < (float(reference_ms) - float(self._HIGH_SPEED_CURVE_CLEAR_PLANNER_MARGIN_MS)):
+      return False
+    if (
+      curve_specific_mapd_ms is not None
+      and float(curve_specific_mapd_ms) < (float(reference_ms) - float(self._HIGH_SPEED_CURVE_CLEAR_TARGET_MARGIN_MS))
+    ):
+      return False
+    return True
 
   def _should_block_no_lead_cruise_profile_curve(
     self,
@@ -1442,6 +1483,20 @@ class LongController:
       curve_target_ms = float(reference_ms)
       curve_state = "curve_clear(snap)"
 
+    if self._should_clear_high_speed_curve_nibble(
+      reference_ms=float(reference_ms),
+      curve_target_ms=float(curve_target_ms),
+      planner_near_ms=float(planner_near_ms),
+      v_ego_ms=float(v_ego_ms),
+      current_angle_deg=float(current_angle_deg),
+      curve_specific_mapd_ms=curve_specific_mapd_ms,
+    ):
+      self._reset_curve_hold()
+      self._curve_recent_clear_until_ms = int(now_ms) + int(max(self._CURVE_REENTRY_BLOCK_MS, self._CURVE_STALE_TIMEOUT_BLOCK_MS))
+      self._curve_timeout_block_until_ms = int(now_ms) + int(self._CURVE_STALE_TIMEOUT_BLOCK_MS)
+      curve_target_ms = float(reference_ms)
+      curve_state = "curve_clear(highway_nibble)"
+
     return float(curve_target_ms), str(curve_state)
 
   def _stabilize_no_lead_curve_target(self, *, now_ms: int, raw_target_ms: float, reference_ms: float) -> tuple[float, str]:
@@ -1729,8 +1784,12 @@ class LongController:
     if not bool(self._lead_present):
       return False
 
+    required_drop_ms = self._planner_owner_drop_required_ms(
+      base_target_ms=float(base_target_ms),
+      v_ego_ms=float(v_ego_ms),
+    )
     strong_planner_drop = (
-      float(planner_ms) < (float(base_target_ms) - float(self._PLANNER_OWNER_STRONG_DROP_MS))
+      float(planner_ms) < (float(base_target_ms) - float(required_drop_ms))
       and float(planner_ms) < (float(v_ego_ms) - float(self._PLANNER_OWNER_EGO_DROP_MS))
     )
     strong_planner_decel = float(self._lp_a_target) <= float(self._STRONG_DECEL_ATARGET_MS2)
