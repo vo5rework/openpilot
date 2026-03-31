@@ -1694,7 +1694,7 @@ class LongController:
       )
       self._weak_planner_block_until_ms = max(
         int(self._weak_planner_block_until_ms),
-        now_ms + min(int(self._POST_LEAD_CLEAR_CURVE_BLOCK_MS), int(self._WEAK_PLANNER_BLOCK_MS)),
+        now_ms + min(int(self._POST_LEAD_CLEAR_CURVE_BLOCK_MS), int(self._WEAK_OWNER_REENTRY_BLOCK_MS)),
       )
     self._lead_present_prev = bool(self._lead_present)
 
