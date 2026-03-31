@@ -166,6 +166,9 @@ class LongController:
   _HIGH_SPEED_CURVE_CLEAR_STEER_DEG = 1.6
   _HIGH_SPEED_CURVE_CLEAR_TARGET_MARGIN_MS = 4.0 * CV.MPH_TO_MS
   _HIGH_SPEED_CURVE_CLEAR_PLANNER_MARGIN_MS = 3.0 * CV.MPH_TO_MS
+  _POST_LEAD_CLEAR_CURVE_BLOCK_MS = 2800
+  _POST_LEAD_CLEAR_CURVE_BLOCK_STEER_DEG = 3.5
+  _POST_LEAD_CLEAR_PLANNER_ONLY_MIN_GAP_MS = 3.0 * CV.MPH_TO_MS
 
   def __init__(self) -> None:
     self.acc = ACCController()
@@ -213,6 +216,7 @@ class LongController:
     self._curve_timeout_block_until_ms: int = 0
     self._weak_owner_candidate_since_ms: int = 0
     self._weak_planner_block_until_ms: int = 0
+    self._post_lead_clear_curve_block_until_ms: int = 0
     self._activation_ns: int = 0
 
   def _clear_plan_and_mapd_state(self) -> None:
@@ -677,6 +681,9 @@ class LongController:
       self._lead_hold_until_ms = 0
       return False
     if not immediate_lead:
+      if not bool(self._lead_present):
+        self._lead_hold_until_ms = 0
+        return False
       required_drop_ms = self._planner_owner_drop_required_ms(
         base_target_ms=float(base_target_ms),
         v_ego_ms=float(v_ego_ms),
@@ -686,7 +693,13 @@ class LongController:
         and float(planner_ms) < (float(v_ego_ms) - float(self._PLANNER_OWNER_EGO_DROP_MS))
       )
       strong_planner_decel = float(self._lp_a_target) <= float(self._STRONG_DECEL_ATARGET_MS2)
-      if not (strong_drop and strong_planner_decel):
+      if not (
+        (strong_drop and strong_planner_decel)
+        or self._queue_ahead_assist_active(
+          base_target_ms=float(base_target_ms),
+          v_ego_ms=float(v_ego_ms),
+        )
+      ):
         self._lead_hold_until_ms = 0
         return False
     return float(planner_ms) < (float(base_target_ms) - float(self._LEAD_HOLD_RELEASE_MARGIN_MS))
@@ -842,6 +855,28 @@ class LongController:
       and float(planner_last_ms) >= (float(current_set_ms) - float(1.5 * track_margin_ms))
       and float(planner_preview_ms) >= (float(current_set_ms) - float(2.0 * track_margin_ms))
     )
+
+  def _should_block_post_lead_clear_planner_curve(
+    self,
+    *,
+    now_ms: int,
+    reference_ms: float,
+    current_set_ms: float,
+    current_angle_deg: float,
+    curve_specific_mapd_ms: Optional[float],
+  ) -> bool:
+    if int(now_ms) > int(self._post_lead_clear_curve_block_until_ms):
+      return False
+    if curve_specific_mapd_ms is not None:
+      return False
+    if abs(float(current_angle_deg)) > float(self._POST_LEAD_CLEAR_CURVE_BLOCK_STEER_DEG):
+      return False
+    return bool(
+      float(reference_ms) >= (
+        float(current_set_ms) + float(self._POST_LEAD_CLEAR_PLANNER_ONLY_MIN_GAP_MS)
+      )
+    )
+
 
   def _queue_ahead_assist_active(self, *, base_target_ms: float, v_ego_ms: float) -> bool:
     if not self._lead_present:
@@ -1280,6 +1315,17 @@ class LongController:
 
     raw_curve_specific_mapd_ms = self._curve_specific_mapd_target_ms(now_ns=now_ns)
 
+    if self._should_block_post_lead_clear_planner_curve(
+      now_ms=int(now_ms),
+      reference_ms=float(reference_ms),
+      current_set_ms=float(current_set_ms),
+      current_angle_deg=float(current_angle_deg),
+      curve_specific_mapd_ms=raw_curve_specific_mapd_ms,
+    ):
+      self._reset_curve_hold()
+      self._arm_curve_reentry_block(now_ms=int(now_ms))
+      return float(reference_ms), "curve_clear(post_lead_clear)"
+
     if self._should_block_set_tracking_no_lead_curve_profile(
       reference_ms=float(reference_ms),
       current_set_ms=float(current_set_ms),
@@ -1640,7 +1686,16 @@ class LongController:
       pass
 
     if prev_lead_present and (not bool(self._lead_present)):
-      self._lead_recently_cleared_until_ms = int(now_ns // 1_000_000) + int(self._LEAD_CLEAR_MAPD_GRACE_MS)
+      now_ms = int(now_ns // 1_000_000)
+      self._lead_recently_cleared_until_ms = now_ms + int(self._LEAD_CLEAR_MAPD_GRACE_MS)
+      self._post_lead_clear_curve_block_until_ms = max(
+        int(self._post_lead_clear_curve_block_until_ms),
+        now_ms + int(self._POST_LEAD_CLEAR_CURVE_BLOCK_MS),
+      )
+      self._weak_planner_block_until_ms = max(
+        int(self._weak_planner_block_until_ms),
+        now_ms + min(int(self._POST_LEAD_CLEAR_CURVE_BLOCK_MS), int(self._WEAK_PLANNER_BLOCK_MS)),
+      )
     self._lead_present_prev = bool(self._lead_present)
 
     try:
@@ -1745,19 +1800,20 @@ class LongController:
     materially_below_clear = materially_below_base and materially_below_ego
     strong_planner_decel = float(self._lp_a_target) <= float(self._STRONG_DECEL_ATARGET_MS2)
 
-    if bool(self._lead_present):
-      return bool(materially_below_clear or strong_planner_decel or self._lead_is_constraining(
+    if not bool(self._lead_present):
+      return False
+
+    return bool(
+      materially_below_clear
+      or strong_planner_decel
+      or self._lead_is_constraining(
         base_target_ms=float(base_target_ms),
         v_ego_ms=float(v_ego_ms),
-      ))
-
-    # After a lead has just disappeared, allow planner hasLead to persist only
-    # briefly and only while it is still clearly asking for decel.
-    recent_clear_age_ms = max(0, int(self._lead_recently_cleared_until_ms) - int(now_ms))
-    strong_recent_clear_drop = float(planner_ms) < (float(base_target_ms) - (2.0 * CV.MPH_TO_MS))
-    return bool(
-      recent_clear_age_ms <= int(self._LP_HAS_LEAD_DECAY_MS)
-      and (strong_planner_decel or strong_recent_clear_drop)
+      )
+      or self._queue_ahead_assist_active(
+        base_target_ms=float(base_target_ms),
+        v_ego_ms=float(v_ego_ms),
+      )
     )
 
   def _planner_owner_should_suppress(
@@ -1778,10 +1834,32 @@ class LongController:
     if immediate_lead:
       return True
 
+    queue_ahead = self._queue_ahead_assist_active(
+      base_target_ms=float(base_target_ms),
+      v_ego_ms=float(v_ego_ms),
+    )
+    if queue_ahead and bool(self._lead_present):
+      required_drop_ms = max(
+        1.5 * CV.MPH_TO_MS,
+        0.55 * float(self._planner_owner_drop_required_ms(
+          base_target_ms=float(base_target_ms),
+          v_ego_ms=float(v_ego_ms),
+        )),
+      )
+      strong_planner_drop = float(planner_ms) < (float(base_target_ms) - float(required_drop_ms))
+      return bool(strong_planner_drop or (float(self._lp_a_target) <= float(self._QUEUE_AHEAD_ATARGET_MS2)))
+
     # Let stock Tesla ACC handle normal lead following. Only allow planner to
     # pull the cruise set when there is a real current lead and planner is
     # asking for a clearly stronger decel than the active ceiling.
     if not bool(self._lead_present):
+      return False
+
+    near_gap_limit_m = min(
+      80.0,
+      max(float(self._LEAD_CONSTRAIN_GAP_MIN_M), float(v_ego_ms) * float(self._LEAD_CONSTRAIN_TIME_GAP_S)),
+    )
+    if float(self._lead_drel) > float(near_gap_limit_m) and float(self._lead_vrel) > -0.5:
       return False
 
     required_drop_ms = self._planner_owner_drop_required_ms(

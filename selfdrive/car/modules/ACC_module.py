@@ -71,6 +71,8 @@ class ACCController:
   _MANUAL_CONFIRM_WINDOW_MS = 1500
   _MANUAL_PENDING_TIMEOUT_MS = 1800
   _MANUAL_LATCH_SUPPRESS_AFTER_AUTO_DECEL_MS = 2600
+  _HIGH_SPEED_GENTLE_ACCEL_KPH = 96.0
+  _HIGH_SPEED_FULL_STEP_GAP_KPH = 10.0
 
 
   def __init__(self) -> None:
@@ -357,7 +359,18 @@ class ACCController:
   def _reset_accel_burst(self) -> None:
     self._accel_burst_steps_remaining = 0
 
-  def _prime_accel_burst(self, *, speed_offset_kph: float, available_speed_kph: float, full_kph: float) -> None:
+  def _prime_accel_burst(
+    self,
+    *,
+    current_kph: float,
+    speed_offset_kph: float,
+    available_speed_kph: float,
+    full_kph: float,
+  ) -> None:
+    if float(current_kph) >= float(self._HIGH_SPEED_GENTLE_ACCEL_KPH):
+      self._accel_burst_steps_remaining = 0
+      return
+
     if float(available_speed_kph) < max(0.60 * float(full_kph), 2.0):
       self._accel_burst_steps_remaining = 0
       return
@@ -374,6 +387,7 @@ class ACCController:
     *,
     now_ms: int,
     speed_units: str,
+    current_kph: float,
     speed_offset_kph: float,
     available_speed_kph: float,
     lead: LeadInfo,
@@ -389,6 +403,7 @@ class ACCController:
       self._reset_accel_burst()
     elif int(self._accel_burst_steps_remaining) <= 0:
       self._prime_accel_burst(
+        current_kph=float(current_kph),
         speed_offset_kph=float(speed_offset_kph),
         available_speed_kph=float(available_speed_kph),
         full_kph=float(full_kph),
@@ -398,6 +413,11 @@ class ACCController:
       full_ready = self._no_automated_action_for(now_ms=now_ms, milliseconds=self._AUTO_COOLDOWN_ACCEL_FULL_MS)
       full_gap_threshold_kph = max(0.80 * float(full_kph), single_threshold_kph)
       if (
+        float(current_kph) >= float(self._HIGH_SPEED_GENTLE_ACCEL_KPH)
+        or float(speed_offset_kph) < float(self._HIGH_SPEED_FULL_STEP_GAP_KPH)
+      ):
+        self._reset_accel_burst()
+      elif (
         full_ready
         and float(speed_offset_kph) >= float(full_gap_threshold_kph)
         and float(available_speed_kph) >= float(full_available_threshold_kph)
@@ -711,6 +731,7 @@ class ACCController:
       button = self._choose_accel_button(
         now_ms=now_ms,
         speed_units=speed_units,
+        current_kph=float(current_kph),
         speed_offset_kph=float(speed_offset_kph),
         available_speed_kph=float(available_speed_kph),
         lead=lead,
