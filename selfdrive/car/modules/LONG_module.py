@@ -1176,7 +1176,7 @@ class LongController:
       float(self._curve_entry_threshold_ms(float(reference_ms))),
       float(self._PLANNER_PREVIEW_SHARP_DROP_MS),
     )
-    planner_preview_active = (
+    planner_preview_entry_active = (
       float(planner_preview_ms) <= (float(reference_ms) - float(planner_preview_drop_ms))
       and (
         bool(planner_curve_active)
@@ -1188,6 +1188,24 @@ class LongController:
         )
       )
     )
+
+    # planner_preview is entry-only for no-lead curve ownership. Once a curve hold
+    # is active, preview must not keep owning the target on its own.
+    planner_preview_active = bool(planner_preview_entry_active) and (not self._curve_hold_active)
+
+    # On a straight after a bend, do not let a recovered planner_near plus a still-low
+    # planner_preview keep mapd/preview ownership alive. That combination is the stale
+    # no-lead path that can hold the set speed down until another owner wakes it up.
+    preview_only_mapd_support_on_straight = (
+      curve_specific_mapd_ms is not None
+      and bool(planner_preview_entry_active)
+      and (not bool(planner_curve_active))
+      and abs(float(current_angle_deg)) <= float(self._STRAIGHT_CLEAR_STEER_DEG)
+      and float(planner_near_ms) >= (float(reference_ms) - float(self._STRAIGHT_CLEAR_PLANNER_NEAR_MARGIN_MS))
+    )
+    if preview_only_mapd_support_on_straight:
+      planner_preview_active = False
+      curve_specific_mapd_ms = None
 
     curve_candidates_ms: list[float] = []
     curve_owner_parts: list[str] = []
