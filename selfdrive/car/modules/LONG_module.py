@@ -625,6 +625,13 @@ class LongController:
   def _reset_lead_hold(self) -> None:
     self._lead_hold_until_ms = 0
 
+  def _arm_curve_reentry_block(self, *, now_ms: int, weak_owner_block: bool = False) -> None:
+    block_ms = max(int(self._CURVE_REENTRY_BLOCK_MS), int(self._CURVE_STALE_TIMEOUT_BLOCK_MS))
+    self._curve_recent_clear_until_ms = int(now_ms) + int(block_ms)
+    self._curve_timeout_block_until_ms = int(now_ms) + int(block_ms)
+    if weak_owner_block:
+      self._weak_planner_block_until_ms = int(now_ms) + int(self._WEAK_OWNER_REENTRY_BLOCK_MS)
+
   def _lead_is_opening_clear(self, *, base_target_ms: float, v_ego_ms: float) -> bool:
     if (not self._lead_present) or float(self._lead_drel) <= 0.0:
       return False
@@ -1123,6 +1130,7 @@ class LongController:
       current_angle_deg=float(current_angle_deg),
     ):
       self._reset_curve_hold()
+      self._arm_curve_reentry_block(now_ms=int(now_ms))
       return float(reference_ms), "curve_clear(flat_profile)"
 
     raw_curve_specific_mapd_ms = self._curve_specific_mapd_target_ms(now_ns=now_ns)
@@ -1897,8 +1905,7 @@ class LongController:
     ):
       self._reset_curve_hold()
       self._reset_lead_hold()
-      self._curve_recent_clear_until_ms = int(now) + int(self._CURVE_REENTRY_BLOCK_MS)
-      self._weak_planner_block_until_ms = int(now) + int(self._WEAK_OWNER_REENTRY_BLOCK_MS)
+      self._arm_curve_reentry_block(now_ms=int(now), weak_owner_block=True)
       desired_ms = float(active_reference_ms)
       src = f"{src}+owner_timeout_clear"
 
@@ -1915,8 +1922,7 @@ class LongController:
     ):
       self._reset_curve_hold()
       self._reset_lead_hold()
-      self._curve_recent_clear_until_ms = int(now) + int(self._CURVE_REENTRY_BLOCK_MS)
-      self._weak_planner_block_until_ms = int(now) + int(self._WEAK_OWNER_REENTRY_BLOCK_MS)
+      self._arm_curve_reentry_block(now_ms=int(now), weak_owner_block=True)
       self._weak_owner_candidate_since_ms = 0
       desired_ms = float(active_reference_ms)
       src = f"{src}+recovery_clear"
