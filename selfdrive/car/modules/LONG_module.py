@@ -264,10 +264,13 @@ class LongController:
 
 
   def _mapd_curve_active_target_ms(self, *, now_ns: int) -> Optional[float]:
+    # Only curve-specific mapd sources are allowed to own active no-lead curve
+    # slowdown. Generic suggestedSpeed repeatedly re-opened curve_hold[mapd] on
+    # straight 30/40 roads and held the set at ~26/30 mph in the watcher logs.
     curve_specific_ms = self._curve_specific_mapd_target_ms(now_ns=now_ns)
     if curve_specific_ms is not None:
       return float(curve_specific_ms)
-    return self._mapd_curve_target_ms(now_ns=now_ns)
+    return None
 
 
   def _mapd_entry_target_ms(
