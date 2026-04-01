@@ -728,12 +728,13 @@ class LongController:
         vision_curve_ms = float(getattr(mo, "visionCurveSpeed", 0.0) or 0.0)
         mono_ns = int(self._sm.logMonoTime.get("mapdOut", 0) or 0)
         if mono_ns > 0:
-          if math.isfinite(suggested_ms) and suggested_ms > 0.1:
-            self._mapd_suggested_ms = suggested_ms
-          if math.isfinite(map_curve_ms) and map_curve_ms > 0.1:
-            self._mapd_map_curve_ms = map_curve_ms
-          if math.isfinite(vision_curve_ms) and vision_curve_ms > 0.1:
-            self._mapd_vision_curve_ms = vision_curve_ms
+          # Fresh mapd packets must overwrite the cached values even when the
+          # current fields are zero. Otherwise a stale earlier curve speed can
+          # survive into clear-road motorway segments and keep reopening
+          # curve_hold[mapd] after mapd has already stopped publishing a curve.
+          self._mapd_suggested_ms = suggested_ms if (math.isfinite(suggested_ms) and suggested_ms > 0.1) else None
+          self._mapd_map_curve_ms = map_curve_ms if (math.isfinite(map_curve_ms) and map_curve_ms > 0.1) else None
+          self._mapd_vision_curve_ms = vision_curve_ms if (math.isfinite(vision_curve_ms) and vision_curve_ms > 0.1) else None
           self._mapd_last_ns = mono_ns
     except Exception:
       pass
