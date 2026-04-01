@@ -97,6 +97,12 @@ class LongController:
   _MAPD_LOW_SPEED_PLANNER_HINT_DROP_MS = 0.4 * CV.MPH_TO_MS
   _MAPD_LOW_SPEED_STEER_HINT_DEG = 0.35
   _SHARP_CURVE_FAST_ENTRY_DROP_MS = 6.0 * CV.MPH_TO_MS
+  _LP_QUEUE_FALLBACK_MAX_SPEED_MS = 45.0 * CV.MPH_TO_MS
+  _LP_QUEUE_FALLBACK_DROP_MS = 1.0 * CV.MPH_TO_MS
+  _LP_QUEUE_FALLBACK_EGO_MARGIN_MS = 0.5 * CV.MPH_TO_MS
+  _LP_QUEUE_FALLBACK_ATARGET_MS2 = -0.25
+  _MAPD_STRAIGHT_ONLY_ENTRY_DROP_MS = 4.0 * CV.MPH_TO_MS
+  _MAPD_STRAIGHT_ONLY_STEER_DEG = 1.0
 
   def __init__(self) -> None:
     self.acc = ACCController()
@@ -298,6 +304,15 @@ class LongController:
       return None
 
     if (not bool(planner_curve_active)) and float(curve_specific_ms) >= (reference_ms - mapd_only_min_drop_ms):
+      self._mapd_entry_candidate_since_ms = 0
+      return None
+
+    if (
+      (not bool(planner_curve_active))
+      and current_angle_deg <= float(self._MAPD_STRAIGHT_ONLY_STEER_DEG)
+      and planner_near_ms >= (reference_ms - float(self._PLANNER_CURVE_ENTRY_MARGIN_MS))
+      and float(curve_specific_ms) >= (reference_ms - float(self._MAPD_STRAIGHT_ONLY_ENTRY_DROP_MS))
+    ):
       self._mapd_entry_candidate_since_ms = 0
       return None
 
@@ -534,6 +549,17 @@ class LongController:
     if self._lead_is_opening_clear(base_target_ms=float(base_target_ms), v_ego_ms=float(v_ego_ms)):
       self._lead_hold_until_ms = 0
       return False
+
+    fallback_active = self._lp_queue_fallback_active(
+      now_ms=int(now_ms),
+      base_target_ms=float(base_target_ms),
+      planner_ms=float(planner_ms),
+      v_ego_ms=float(v_ego_ms),
+    )
+    if (not self._lead_present) and (not fallback_active):
+      self._lead_hold_until_ms = 0
+      return False
+
     return float(planner_ms) < (float(base_target_ms) - float(self._LEAD_HOLD_RELEASE_MARGIN_MS))
 
   def _stabilize_no_lead_curve_target(self, *, now_ms: int, raw_target_ms: float, reference_ms: float) -> tuple[float, str]:
@@ -725,6 +751,23 @@ class LongController:
     near_lead = float(self._lead_drel) < float(near_gap_limit_m)
     return bool(lead_slower_than_base and (closing or near_lead))
 
+  def _lp_queue_fallback_active(self, *, now_ms: int, base_target_ms: float, planner_ms: float, v_ego_ms: float) -> bool:
+    if bool(self._lead_present):
+      return False
+    if not bool(self._lp_has_lead):
+      return False
+    if int(now_ms) > int(self._lead_recently_cleared_until_ms):
+      return False
+    if float(v_ego_ms) > float(self._LP_QUEUE_FALLBACK_MAX_SPEED_MS):
+      return False
+    if float(planner_ms) <= 0.1:
+      return False
+
+    materially_below_base = float(planner_ms) < (float(base_target_ms) - float(self._LP_QUEUE_FALLBACK_DROP_MS))
+    materially_below_ego = float(planner_ms) < (float(v_ego_ms) - float(self._LP_QUEUE_FALLBACK_EGO_MARGIN_MS))
+    planner_decel = float(self._lp_a_target) <= float(self._LP_QUEUE_FALLBACK_ATARGET_MS2)
+    return bool(materially_below_base and materially_below_ego and planner_decel)
+
   def _planner_drag_reasons(self, *, now_ms: int, base_target_ms: float, planner_ms: float, v_ego_ms: float) -> list[str]:
     if float(planner_ms) <= 0.1:
       return []
@@ -736,25 +779,21 @@ class LongController:
       base_target_ms=float(base_target_ms),
       v_ego_ms=float(v_ego_ms),
     )
-    lead_opening_clear = self._lead_is_opening_clear(
+    queue_fallback_active = self._lp_queue_fallback_active(
+      now_ms=int(now_ms),
       base_target_ms=float(base_target_ms),
+      planner_ms=float(planner_ms),
       v_ego_ms=float(v_ego_ms),
-    )
-    lead_context_active = self._lead_context_active_now(now_ms=int(now_ms))
-    lp_lead_constraining = bool(self._lp_has_lead) and bool(lead_context_active) and (not lead_opening_clear) and (
-      lead_constraining
-      or materially_below_clear
-      or (float(self._lp_a_target) <= float(self._STRONG_DECEL_ATARGET_MS2))
     )
 
     reasons: list[str] = []
     if lead_constraining:
       reasons.append("lead")
-    if lp_lead_constraining:
+    if queue_fallback_active:
       reasons.append("lp_hasLead")
-    if float(self._lp_a_target) <= float(self._STRONG_DECEL_ATARGET_MS2):
+    if float(self._lp_a_target) <= float(self._STRONG_DECEL_ATARGET_MS2) and (lead_constraining or queue_fallback_active):
       reasons.append("aTarget")
-    if materially_below_clear:
+    if materially_below_clear and (lead_constraining or queue_fallback_active):
       reasons.append("planner_low")
     return reasons
 
