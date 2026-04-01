@@ -486,13 +486,24 @@ class LongController:
       low_speed
       and float(curve_specific_ms) <= (reference_ms - float(self._MAPD_LOW_SPEED_SHARP_DROP_MS))
       and (
-        dual_source_agreement
-        or planner_near_ms <= (reference_ms - float(self._MAPD_LOW_SPEED_PLANNER_HINT_DROP_MS))
+        planner_near_ms <= (reference_ms - float(self._MAPD_LOW_SPEED_PLANNER_HINT_DROP_MS))
         or planner_preview_supports_drop
         or current_angle_deg >= float(self._MAPD_LOW_SPEED_STEER_HINT_DEG)
-        or float(curve_specific_ms) <= (reference_ms - float(self._SHARP_CURVE_FAST_ENTRY_DROP_MS))
+        or (dual_source_agreement and current_angle_deg >= float(self._CURVE_REENTRY_ALLOW_STEER_DEG))
       )
     )
+
+    low_speed_mapd_only_straight = (
+      low_speed
+      and near_straight
+      and (not bool(planner_curve_active))
+      and (not planner_supports_meaningful_drop)
+      and (not planner_preview_supports_drop)
+      and current_angle_deg < float(self._MAPD_LOW_SPEED_STEER_HINT_DEG)
+    )
+    if low_speed_mapd_only_straight:
+      self._mapd_entry_candidate_since_ms = 0
+      return None
 
     if low_speed_sharp_entry:
       self._mapd_entry_candidate_since_ms = 0
@@ -702,45 +713,42 @@ class LongController:
     if int(self._lead_hold_until_ms) <= 0 or int(now_ms) > int(self._lead_hold_until_ms):
       self._lead_hold_until_ms = 0
       return False
-    immediate_lead = self._lead_is_immediately_constraining(base_target_ms=float(base_target_ms), v_ego_ms=float(v_ego_ms))
-    if (int(now_ms) <= int(self._weak_planner_block_until_ms)) and (not immediate_lead):
-      self._lead_hold_until_ms = 0
-      return False
+
     if float(planner_ms) <= 0.1:
+      self._lead_hold_until_ms = 0
       return False
     if self._lead_is_opening_clear(base_target_ms=float(base_target_ms), v_ego_ms=float(v_ego_ms)):
       self._lead_hold_until_ms = 0
       return False
-    if not immediate_lead:
-      queue_ahead = self._queue_ahead_assist_active(
-        now_ms=int(now_ms),
-        base_target_ms=float(base_target_ms),
-        v_ego_ms=float(v_ego_ms),
-      )
-      recent_context = self._recent_actual_lead_context(now_ms=int(now_ms))
-      planner_vision_context = (
-        bool(self._lp_has_lead)
-        and str(getattr(self, "_lp_source", "") or "") not in ("", "cruise", "e2e")
-      )
-      if not bool(self._lead_present):
-        if not recent_context or not (planner_vision_context or queue_ahead):
-          self._lead_hold_until_ms = 0
-          return False
-      required_drop_ms = self._planner_owner_drop_required_ms(
-        base_target_ms=float(base_target_ms),
-        v_ego_ms=float(v_ego_ms),
-      )
-      strong_drop = (
-        float(planner_ms) < (float(base_target_ms) - float(required_drop_ms))
-        and float(planner_ms) < (float(v_ego_ms) - float(self._PLANNER_OWNER_EGO_DROP_MS))
-      )
-      strong_planner_decel = float(self._lp_a_target) <= float(self._STRONG_DECEL_ATARGET_MS2)
-      if not (
-        (strong_drop and strong_planner_decel)
-        or queue_ahead
-      ):
-        self._lead_hold_until_ms = 0
-        return False
+
+    immediate_lead = self._lead_is_immediately_constraining(base_target_ms=float(base_target_ms), v_ego_ms=float(v_ego_ms))
+    queue_ahead = self._queue_ahead_assist_active(
+      now_ms=int(now_ms),
+      base_target_ms=float(base_target_ms),
+      v_ego_ms=float(v_ego_ms),
+    )
+
+    if (int(now_ms) <= int(self._weak_planner_block_until_ms)) and (not immediate_lead) and (not queue_ahead):
+      self._lead_hold_until_ms = 0
+      return False
+    if not immediate_lead and not queue_ahead:
+      self._lead_hold_until_ms = 0
+      return False
+
+    required_drop_ms = self._planner_owner_drop_required_ms(
+      base_target_ms=float(base_target_ms),
+      v_ego_ms=float(v_ego_ms),
+    )
+    strong_drop = (
+      float(planner_ms) < (float(base_target_ms) - float(required_drop_ms))
+      and float(planner_ms) < (float(v_ego_ms) - float(self._PLANNER_OWNER_EGO_DROP_MS))
+    )
+    strong_planner_decel = float(self._lp_a_target) <= float(self._STRONG_DECEL_ATARGET_MS2)
+
+    if not immediate_lead and not ((strong_drop and strong_planner_decel) or queue_ahead):
+      self._lead_hold_until_ms = 0
+      return False
+
     return float(planner_ms) < (float(base_target_ms) - float(self._LEAD_HOLD_RELEASE_MARGIN_MS))
 
   def _curve_initial_preview_drop_ms(self, *, delta_ms: float, hard_entry: bool) -> float:
@@ -920,12 +928,7 @@ class LongController:
 
   def _queue_ahead_assist_active(self, *, now_ms: int, base_target_ms: float, v_ego_ms: float) -> bool:
     recent_lead_context = self._recent_actual_lead_context(now_ms=int(now_ms))
-    planner_vision_context = (
-      bool(self._lp_has_lead)
-      and str(getattr(self, "_lp_source", "") or "") not in ("", "cruise", "e2e")
-    )
-    if not recent_lead_context and not planner_vision_context:
-      return False
+    planner_vision_context = bool(self._lp_has_lead)
 
     if float(v_ego_ms) > float(self._QUEUE_AHEAD_MAX_SPEED_MS):
       return False
@@ -952,12 +955,15 @@ class LongController:
       )
       return bool(close_enough and slow_or_stopping)
 
-    if not planner_vision_context or self._lp_target_near_ms is None:
+    if (not recent_lead_context) and (not planner_vision_context):
+      return False
+    if self._lp_target_near_ms is None:
       return False
 
     extra_drop_ms = max(2.5 * CV.MPH_TO_MS, float(self._QUEUE_AHEAD_PLANNER_DROP_MS))
     return bool(
-      float(self._lp_a_target) <= min(float(self._QUEUE_AHEAD_ATARGET_MS2), -0.45)
+      planner_vision_context
+      and float(self._lp_a_target) <= min(float(self._QUEUE_AHEAD_ATARGET_MS2), -0.55)
       and float(self._lp_target_near_ms) < (float(base_target_ms) - float(extra_drop_ms))
     )
 
@@ -970,58 +976,22 @@ class LongController:
     planner_ms: float,
     v_ego_ms: float,
   ) -> bool:
-    recent_context = self._recent_actual_lead_context(now_ms=int(now_ms))
     queue_ahead = self._queue_ahead_assist_active(
       now_ms=int(now_ms),
       base_target_ms=float(base_target_ms),
       v_ego_ms=float(v_ego_ms),
     )
-    planner_vision_context = (
-      bool(self._lp_has_lead)
-      and str(getattr(self, "_lp_source", "") or "") not in ("", "cruise", "e2e")
-      and float(planner_ms) < (float(base_target_ms) - float(self._LEAD_FOLLOW_SOFT_DROP_MS))
-    )
-
-    if not bool(self._lead_present) and not recent_context and not queue_ahead and not planner_vision_context:
-      self._lead_follow_hysteresis_until_ms = 0
-      return False
 
     if self._lead_is_opening_clear(base_target_ms=float(base_target_ms), v_ego_ms=float(v_ego_ms)):
       self._lead_follow_hysteresis_until_ms = 0
       return False
 
-    near_gap_limit_m = min(
-      80.0,
-      max(float(self._LEAD_CONSTRAIN_GAP_MIN_M), float(v_ego_ms) * float(self._LEAD_CONSTRAIN_TIME_GAP_S)),
-    )
-    soft_drop = (
-      float(planner_ms) < (float(base_target_ms) - float(self._LEAD_FOLLOW_SOFT_DROP_MS))
-      and float(planner_ms) < (float(v_ego_ms) - float(self._LEAD_FOLLOW_SOFT_EGO_DROP_MS))
-    )
-
-    near_gap_ok = True
-    if bool(self._lead_present):
-      near_gap_ok = float(self._lead_drel) < (1.20 * float(near_gap_limit_m))
-
-    fallback_candidate = (not bool(self._lead_present)) and recent_context and (queue_ahead or planner_vision_context)
-    candidate = bool(
-      near_gap_ok
-      and (
-        soft_drop
-        or bool(self._lp_has_lead)
-        or (bool(self._lead_present) and float(self._lead_vrel) < 0.20)
-        or queue_ahead
-        or fallback_candidate
-      )
-    )
-    if candidate:
+    if queue_ahead:
       self._lead_follow_hysteresis_until_ms = int(now_ms) + int(self._LEAD_FOLLOW_HYSTERESIS_MS)
       return True
 
-    if int(now_ms) > int(self._lead_follow_hysteresis_until_ms):
-      return False
-
-    return float(planner_ms) < (float(base_target_ms) - float(self._LEAD_HOLD_RELEASE_MARGIN_MS))
+    self._lead_follow_hysteresis_until_ms = 0
+    return False
 
   def _planner_owner_drop_required_ms(self, *, base_target_ms: float, v_ego_ms: float) -> float:
     required_ms = float(self._PLANNER_OWNER_STRONG_DROP_MS)
@@ -1910,32 +1880,25 @@ class LongController:
   ) -> bool:
     if not bool(self._lp_has_lead):
       return False
+
+    queue_ahead = self._queue_ahead_assist_active(
+      now_ms=int(now_ms),
+      base_target_ms=float(base_target_ms),
+      v_ego_ms=float(v_ego_ms),
+    )
+    if queue_ahead:
+      return True
+
+    if not bool(self._lead_present):
+      return False
     if (int(now_ms) <= int(self._weak_planner_block_until_ms)) and (not self._lead_is_immediately_constraining(base_target_ms=float(base_target_ms), v_ego_ms=float(v_ego_ms))):
       return False
     if not self._recent_actual_lead_context(now_ms=int(now_ms)):
       return False
 
-    materially_below_base = float(planner_ms) < (float(base_target_ms) - float(self._PLANNER_DRAG_MARGIN_MS))
-    materially_below_ego = float(planner_ms) < (float(v_ego_ms) - float(self._PLANNER_BELOW_EGO_MARGIN_MS))
-    materially_below_clear = materially_below_base and materially_below_ego
-    strong_planner_decel = float(self._lp_a_target) <= float(self._STRONG_DECEL_ATARGET_MS2)
-
-    if not bool(self._lead_present):
-      return False
-
-    return bool(
-      materially_below_clear
-      or strong_planner_decel
-      or self._lead_is_constraining(
-        now_ms=int(now_ms),
-        base_target_ms=float(base_target_ms),
-        v_ego_ms=float(v_ego_ms),
-      )
-      or self._queue_ahead_assist_active(
-        now_ms=int(now_ms),
-        base_target_ms=float(base_target_ms),
-        v_ego_ms=float(v_ego_ms),
-      )
+    return self._lead_is_immediately_constraining(
+      base_target_ms=float(base_target_ms),
+      v_ego_ms=float(v_ego_ms),
     )
 
   def _planner_owner_should_suppress(
@@ -1950,52 +1913,23 @@ class LongController:
     if not drag_reasons:
       return False
 
-    immediate_lead = self._lead_is_immediately_constraining(
-      base_target_ms=float(base_target_ms),
-      v_ego_ms=float(v_ego_ms),
-    )
-    if immediate_lead:
-      return True
-
     queue_ahead = self._queue_ahead_assist_active(
       now_ms=int(now_ms),
       base_target_ms=float(base_target_ms),
       v_ego_ms=float(v_ego_ms),
     )
-    if queue_ahead and bool(self._lead_present):
-      required_drop_ms = max(
-        1.5 * CV.MPH_TO_MS,
-        0.55 * float(self._planner_owner_drop_required_ms(
-          base_target_ms=float(base_target_ms),
-          v_ego_ms=float(v_ego_ms),
-        )),
-      )
-      strong_planner_drop = float(planner_ms) < (float(base_target_ms) - float(required_drop_ms))
-      return bool(strong_planner_drop or (float(self._lp_a_target) <= float(self._QUEUE_AHEAD_ATARGET_MS2)))
-
-    # Let stock Tesla ACC handle normal lead following. Only allow planner to
-    # pull the cruise set when there is a real current lead and planner is
-    # asking for a clearly stronger decel than the active ceiling.
-    if not bool(self._lead_present):
+    if not queue_ahead:
       return False
 
-    near_gap_limit_m = min(
-      80.0,
-      max(float(self._LEAD_CONSTRAIN_GAP_MIN_M), float(v_ego_ms) * float(self._LEAD_CONSTRAIN_TIME_GAP_S)),
+    required_drop_ms = max(
+      1.5 * CV.MPH_TO_MS,
+      0.55 * float(self._planner_owner_drop_required_ms(
+        base_target_ms=float(base_target_ms),
+        v_ego_ms=float(v_ego_ms),
+      )),
     )
-    if float(self._lead_drel) > float(near_gap_limit_m) and float(self._lead_vrel) > -0.5:
-      return False
-
-    required_drop_ms = self._planner_owner_drop_required_ms(
-      base_target_ms=float(base_target_ms),
-      v_ego_ms=float(v_ego_ms),
-    )
-    strong_planner_drop = (
-      float(planner_ms) < (float(base_target_ms) - float(required_drop_ms))
-      and float(planner_ms) < (float(v_ego_ms) - float(self._PLANNER_OWNER_EGO_DROP_MS))
-    )
-    strong_planner_decel = float(self._lp_a_target) <= float(self._STRONG_DECEL_ATARGET_MS2)
-    return bool(("lead" in drag_reasons) and strong_planner_drop and strong_planner_decel)
+    strong_planner_drop = float(planner_ms) < (float(base_target_ms) - float(required_drop_ms))
+    return bool(strong_planner_drop or (float(self._lp_a_target) <= float(self._QUEUE_AHEAD_ATARGET_MS2)))
 
   def _planner_drag_reasons(self, *, now_ms: int, base_target_ms: float, planner_ms: float, v_ego_ms: float) -> list[str]:
     if float(planner_ms) <= 0.1:
