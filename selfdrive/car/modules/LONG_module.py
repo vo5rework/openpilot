@@ -169,6 +169,10 @@ class LongController:
   _POST_LEAD_CLEAR_CURVE_BLOCK_MS = 2800
   _POST_LEAD_CLEAR_CURVE_BLOCK_STEER_DEG = 3.5
   _POST_LEAD_CLEAR_PLANNER_ONLY_MIN_GAP_MS = 3.0 * CV.MPH_TO_MS
+  _LEAD_FOLLOW_HYSTERESIS_MS = 900
+  _LEAD_FOLLOW_SOFT_DROP_MS = 0.9 * CV.MPH_TO_MS
+  _LEAD_FOLLOW_SOFT_EGO_DROP_MS = 0.45 * CV.MPH_TO_MS
+  _QUEUE_AHEAD_RECENT_LEAD_CONTEXT_MS = 900
 
   def __init__(self) -> None:
     self.acc = ACCController()
@@ -217,6 +221,7 @@ class LongController:
     self._weak_owner_candidate_since_ms: int = 0
     self._weak_planner_block_until_ms: int = 0
     self._post_lead_clear_curve_block_until_ms: int = 0
+    self._lead_follow_hysteresis_until_ms: int = 0
     self._activation_ns: int = 0
 
   def _clear_plan_and_mapd_state(self) -> None:
@@ -232,6 +237,31 @@ class LongController:
     self._mapd_last_ns = 0
     self._last_lp_seen_ns = 0
     self._stable_plan_samples = 0
+
+
+  def _note_acc_disabled(
+    self,
+    *,
+    now_ms: int,
+    current_set_speed_ms: float,
+    desired_speed_ms: float,
+    v_ego_ms: float,
+    speed_limit_target_ms: Optional[float],
+    set_speed_limit_active: bool,
+  ) -> None:
+    note_disabled = getattr(self.acc, "note_disabled", None)
+    if callable(note_disabled):
+      try:
+        note_disabled(
+          now_ms=int(now_ms),
+          current_set_speed_ms=float(current_set_speed_ms),
+          desired_speed_ms=float(desired_speed_ms),
+          v_ego_ms=float(v_ego_ms),
+          speed_limit_target_ms=speed_limit_target_ms,
+          set_speed_limit_active=bool(set_speed_limit_active),
+        )
+      except Exception:
+        pass
 
   def _rate_log(self, msg: str) -> None:
     now = _mono_ms()
@@ -696,6 +726,7 @@ class LongController:
       if not (
         (strong_drop and strong_planner_decel)
         or self._queue_ahead_assist_active(
+          now_ms=int(now_ms),
           base_target_ms=float(base_target_ms),
           v_ego_ms=float(v_ego_ms),
         )
@@ -878,8 +909,14 @@ class LongController:
     )
 
 
-  def _queue_ahead_assist_active(self, *, base_target_ms: float, v_ego_ms: float) -> bool:
-    if not self._lead_present:
+  def _queue_ahead_assist_active(self, *, now_ms: int, base_target_ms: float, v_ego_ms: float) -> bool:
+    recent_lead_context = bool(self._lead_present) or (
+      int(now_ms) <= min(
+        int(self._lead_recently_cleared_until_ms),
+        int(now_ms) + int(self._QUEUE_AHEAD_RECENT_LEAD_CONTEXT_MS),
+      )
+    )
+    if not recent_lead_context:
       return False
 
     if float(v_ego_ms) > float(self._QUEUE_AHEAD_MAX_SPEED_MS):
@@ -888,12 +925,6 @@ class LongController:
     if self._curve_hold_active:
       return False
 
-    lead_speed_ms = max(0.0, float(v_ego_ms) + float(self._lead_vrel))
-    close_enough = float(self._lead_drel) <= max(20.0, float(v_ego_ms) * 2.0)
-    slow_or_stopping = (
-      float(self._lead_vrel) <= float(self._QUEUE_AHEAD_VREL_MS)
-      or lead_speed_ms <= float(self._QUEUE_AHEAD_LEAD_SPEED_MS)
-    )
     planner_confirms_decel = (
       float(self._lp_a_target) <= float(self._QUEUE_AHEAD_ATARGET_MS2)
       or (
@@ -901,7 +932,75 @@ class LongController:
         and float(self._lp_target_near_ms) < (float(base_target_ms) - float(self._QUEUE_AHEAD_PLANNER_DROP_MS))
       )
     )
-    return bool(close_enough and slow_or_stopping and planner_confirms_decel)
+    if not planner_confirms_decel:
+      return False
+
+    if bool(self._lead_present):
+      lead_speed_ms = max(0.0, float(v_ego_ms) + float(self._lead_vrel))
+      close_enough = float(self._lead_drel) <= max(20.0, float(v_ego_ms) * 2.0)
+      slow_or_stopping = (
+        float(self._lead_vrel) <= float(self._QUEUE_AHEAD_VREL_MS)
+        or lead_speed_ms <= float(self._QUEUE_AHEAD_LEAD_SPEED_MS)
+      )
+      return bool(close_enough and slow_or_stopping)
+
+    if not bool(self._lp_has_lead):
+      return False
+
+    if str(getattr(self, "_lp_source", "") or "") in ("cruise", "e2e"):
+      return False
+
+    return self._lp_target_near_ms is not None and (
+      float(self._lp_target_near_ms) < (float(base_target_ms) - float(self._QUEUE_AHEAD_PLANNER_DROP_MS))
+    )
+
+
+  def _lead_follow_soft_owner_active_now(
+    self,
+    *,
+    now_ms: int,
+    base_target_ms: float,
+    planner_ms: float,
+    v_ego_ms: float,
+  ) -> bool:
+    if not bool(self._lead_present):
+      self._lead_follow_hysteresis_until_ms = 0
+      return False
+
+    if self._lead_is_opening_clear(base_target_ms=float(base_target_ms), v_ego_ms=float(v_ego_ms)):
+      self._lead_follow_hysteresis_until_ms = 0
+      return False
+
+    near_gap_limit_m = min(
+      80.0,
+      max(float(self._LEAD_CONSTRAIN_GAP_MIN_M), float(v_ego_ms) * float(self._LEAD_CONSTRAIN_TIME_GAP_S)),
+    )
+    soft_drop = (
+      float(planner_ms) < (float(base_target_ms) - float(self._LEAD_FOLLOW_SOFT_DROP_MS))
+      and float(planner_ms) < (float(v_ego_ms) - float(self._LEAD_FOLLOW_SOFT_EGO_DROP_MS))
+    )
+    candidate = bool(
+      float(self._lead_drel) < (1.15 * float(near_gap_limit_m))
+      and (
+        soft_drop
+        or bool(self._lp_has_lead)
+        or float(self._lead_vrel) < 0.20
+        or self._queue_ahead_assist_active(
+          now_ms=int(now_ms),
+          base_target_ms=float(base_target_ms),
+          v_ego_ms=float(v_ego_ms),
+        )
+      )
+    )
+    if candidate:
+      self._lead_follow_hysteresis_until_ms = int(now_ms) + int(self._LEAD_FOLLOW_HYSTERESIS_MS)
+      return True
+
+    if int(now_ms) > int(self._lead_follow_hysteresis_until_ms):
+      return False
+
+    return float(planner_ms) < (float(base_target_ms) - float(self._LEAD_HOLD_RELEASE_MARGIN_MS))
+
 
   def _planner_owner_drop_required_ms(self, *, base_target_ms: float, v_ego_ms: float) -> float:
     required_ms = float(self._PLANNER_OWNER_STRONG_DROP_MS)
@@ -1744,12 +1843,12 @@ class LongController:
       return float(speed_limit_target_ms), True, "carstate_speed_limit_target"
     return None, False, "none"
 
-  def _lead_is_constraining(self, *, base_target_ms: float, v_ego_ms: float) -> bool:
+  def _lead_is_constraining(self, *, now_ms: int = 0, base_target_ms: float, v_ego_ms: float) -> bool:
     if (not self._lead_present) or float(self._lead_drel) <= 0.0:
       return False
     if self._lead_is_opening_clear(base_target_ms=float(base_target_ms), v_ego_ms=float(v_ego_ms)):
       return False
-    if self._queue_ahead_assist_active(base_target_ms=float(base_target_ms), v_ego_ms=float(v_ego_ms)):
+    if int(now_ms) > 0 and self._queue_ahead_assist_active(now_ms=int(now_ms), base_target_ms=float(base_target_ms), v_ego_ms=float(v_ego_ms)):
       return True
 
     lead_speed_ms = max(0.0, float(v_ego_ms) + float(self._lead_vrel))
@@ -1807,10 +1906,12 @@ class LongController:
       materially_below_clear
       or strong_planner_decel
       or self._lead_is_constraining(
+        now_ms=int(now_ms),
         base_target_ms=float(base_target_ms),
         v_ego_ms=float(v_ego_ms),
       )
       or self._queue_ahead_assist_active(
+        now_ms=int(now_ms),
         base_target_ms=float(base_target_ms),
         v_ego_ms=float(v_ego_ms),
       )
@@ -1819,6 +1920,7 @@ class LongController:
   def _planner_owner_should_suppress(
     self,
     *,
+    now_ms: int,
     base_target_ms: float,
     planner_ms: float,
     v_ego_ms: float,
@@ -1835,6 +1937,7 @@ class LongController:
       return True
 
     queue_ahead = self._queue_ahead_assist_active(
+      now_ms=int(now_ms),
       base_target_ms=float(base_target_ms),
       v_ego_ms=float(v_ego_ms),
     )
@@ -1881,6 +1984,7 @@ class LongController:
     materially_below_ego = float(planner_ms) < (float(v_ego_ms) - float(self._PLANNER_BELOW_EGO_MARGIN_MS))
     materially_below_clear = materially_below_base and materially_below_ego
     lead_constraining = self._lead_is_constraining(
+      now_ms=int(now_ms),
       base_target_ms=float(base_target_ms),
       v_ego_ms=float(v_ego_ms),
     )
@@ -1931,7 +2035,7 @@ class LongController:
 
     controller_enabled = bool(enabled) and bool(getattr(CS, "enable_adaptive_cruise", False) or getattr(CS, "enableACC", False))
     if not controller_enabled:
-      self.acc.note_disabled(
+      self._note_acc_disabled(
         now_ms=now,
         current_set_speed_ms=float(current_set_ms),
         desired_speed_ms=float(current_set_ms),
@@ -1945,14 +2049,16 @@ class LongController:
       self._clear_plan_and_mapd_state()
       self._reset_curve_hold()
       self._reset_lead_hold()
+      self._lead_follow_hysteresis_until_ms = 0
       self._curve_timeout_block_until_ms = 0
       self._weak_planner_block_until_ms = 0
       self._weak_owner_candidate_since_ms = 0
+      self._lead_follow_hysteresis_until_ms = 0
       return LongDecision(None, "gated: not enabled/adaptive")
 
     stock_state = str(getattr(CS, "stock_cruise_state", "") or "")
     if stock_state not in ("ENABLED", "OVERRIDE", "STANDSTILL", "STANDBY"):
-      self.acc.note_disabled(
+      self._note_acc_disabled(
         now_ms=now,
         current_set_speed_ms=float(current_set_ms),
         desired_speed_ms=float(current_set_ms),
@@ -1969,6 +2075,7 @@ class LongController:
       self._curve_timeout_block_until_ms = 0
       self._weak_planner_block_until_ms = 0
       self._weak_owner_candidate_since_ms = 0
+      self._lead_follow_hysteresis_until_ms = 0
       return LongDecision(None, f"gated: stock_state={stock_state or 'UNKNOWN'}")
 
     if not self._last_active:
@@ -1979,6 +2086,7 @@ class LongController:
       self._curve_timeout_block_until_ms = 0
       self._weak_planner_block_until_ms = 0
       self._weak_owner_candidate_since_ms = 0
+      self._lead_follow_hysteresis_until_ms = 0
       self._stable_plan_samples = 0
       self._last_lp_seen_ns = 0
       self._reset_lead_hold()
@@ -2042,6 +2150,7 @@ class LongController:
           v_ego_ms=float(v_ego_ms),
         )
         lead_owned = self._planner_owner_should_suppress(
+          now_ms=int(now),
           base_target_ms=float(base_target_ms),
           planner_ms=float(planner_last_ms),
           v_ego_ms=float(v_ego_ms),
@@ -2051,6 +2160,16 @@ class LongController:
           desired_ms = min(float(base_target_ms), float(planner_last_ms))
           src = f"{src}+planner[{'+'.join(drag_reasons)}]"
           self._lead_hold_until_ms = int(now) + int(self._LEAD_HOLD_PERSIST_MS)
+          self._lead_follow_hysteresis_until_ms = int(now) + int(self._LEAD_FOLLOW_HYSTERESIS_MS)
+          self._reset_curve_hold()
+        elif self._lead_follow_soft_owner_active_now(
+          now_ms=int(now),
+          base_target_ms=float(base_target_ms),
+          planner_ms=float(planner_last_ms),
+          v_ego_ms=float(v_ego_ms),
+        ):
+          desired_ms = min(float(base_target_ms), float(planner_last_ms))
+          src = f"{src}+planner[lead_soft]"
           self._reset_curve_hold()
         elif self._lead_hold_active_now(
           now_ms=int(now),
@@ -2119,6 +2238,7 @@ class LongController:
           v_ego_ms=float(v_ego_ms),
         )
         lead_owned = self._planner_owner_should_suppress(
+          now_ms=int(now),
           base_target_ms=float(resume_ceiling_ms),
           planner_ms=float(planner_last_ms),
           v_ego_ms=float(v_ego_ms),
@@ -2128,6 +2248,16 @@ class LongController:
           desired_ms = float(planner_last_ms)
           src = "lp_last"
           self._lead_hold_until_ms = int(now) + int(self._LEAD_HOLD_PERSIST_MS)
+          self._lead_follow_hysteresis_until_ms = int(now) + int(self._LEAD_FOLLOW_HYSTERESIS_MS)
+          self._reset_curve_hold()
+        elif self._lead_follow_soft_owner_active_now(
+          now_ms=int(now),
+          base_target_ms=float(resume_ceiling_ms),
+          planner_ms=float(planner_last_ms),
+          v_ego_ms=float(v_ego_ms),
+        ):
+          desired_ms = float(planner_last_ms)
+          src = "lp_last[lead_soft]"
           self._reset_curve_hold()
         elif self._lead_hold_active_now(
           now_ms=int(now),
