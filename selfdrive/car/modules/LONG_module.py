@@ -105,6 +105,10 @@ class LongController:
   _LP_QUEUE_FALLBACK_ATARGET_MS2 = -0.25
   _MAPD_STRAIGHT_ONLY_ENTRY_DROP_MS = 4.0 * CV.MPH_TO_MS
   _MAPD_STRAIGHT_ONLY_STEER_DEG = 1.0
+  _LEAD_PRESENT_RECOVERY_ALLOW_MS = 0.6 * CV.MPH_TO_MS
+  _LEAD_PRESENT_UP_GUARD_ATARGET_MS2 = 0.35
+  _LEAD_NIBBLE_HOLD_MS = 1.2 * CV.MPH_TO_MS
+  _LEAD_NIBBLE_RELEASE_ATARGET_MS2 = -0.35
 
   def __init__(self) -> None:
     self.acc = ACCController()
@@ -261,9 +265,9 @@ class LongController:
 
   def _mapd_curve_active_target_ms(self, *, now_ns: int) -> Optional[float]:
     curve_specific_ms = self._curve_specific_mapd_target_ms(now_ns=now_ns)
-    if curve_specific_ms is not None:
-      return float(curve_specific_ms)
-    return self._mapd_curve_target_ms(now_ns=now_ns)
+    if curve_specific_ms is None:
+      return None
+    return float(curve_specific_ms)
 
 
   def _mapd_entry_target_ms(
@@ -579,6 +583,44 @@ class LongController:
 
     return float(planner_ms) < (float(base_target_ms) - float(self._LEAD_HOLD_RELEASE_MARGIN_MS))
 
+
+  def _lead_present_up_guard_active(
+    self,
+    *,
+    base_target_ms: float,
+    planner_ms: float,
+    current_set_ms: float,
+    v_ego_ms: float,
+  ) -> bool:
+    if (not self._lead_present) or float(current_set_ms) <= 0.1:
+      return False
+    if abs(float(self._lead_yrel)) >= float(self._LEAD_OFFLANE_YREL_M):
+      return False
+    if self._lead_is_opening_clear(base_target_ms=float(base_target_ms), v_ego_ms=float(v_ego_ms)):
+      return False
+    if float(planner_ms) > (float(current_set_ms) + float(self._LEAD_PRESENT_RECOVERY_ALLOW_MS)):
+      return False
+    if float(self._lp_a_target) > float(self._LEAD_PRESENT_UP_GUARD_ATARGET_MS2):
+      return False
+    return True
+
+  def _lead_nibble_hold_active(
+    self,
+    *,
+    planner_ms: float,
+    current_set_ms: float,
+  ) -> bool:
+    if (not self._lead_present) or float(current_set_ms) <= 0.1 or float(planner_ms) <= 0.1:
+      return False
+    if abs(float(self._lead_yrel)) >= float(self._LEAD_OFFLANE_YREL_M):
+      return False
+    nibble_delta_ms = float(current_set_ms) - float(planner_ms)
+    if nibble_delta_ms <= 0.0 or nibble_delta_ms > float(self._LEAD_NIBBLE_HOLD_MS):
+      return False
+    if float(self._lp_a_target) <= float(self._LEAD_NIBBLE_RELEASE_ATARGET_MS2):
+      return False
+    return float(self._lead_vrel) > float(self._LEAD_CONSTRAIN_CLOSING_VREL_MS)
+
   def _stabilize_no_lead_curve_target(self, *, now_ms: int, raw_target_ms: float, reference_ms: float) -> tuple[float, str]:
     raw_target_ms = float(raw_target_ms)
     reference_ms = float(reference_ms)
@@ -836,6 +878,14 @@ class LongController:
       self._enabled_since_ms = 0
       self._stable_plan_samples = 0
       self._last_lp_seen_ns = 0
+      self._lp_target_last_ms = None
+      self._lp_target_near_ms = None
+      self._lp_has_lead = False
+      self._lp_a_target = 0.0
+      self._lp_source = ""
+      self._lead_recently_cleared_until_ms = 0
+      self._curve_recent_clear_until_ms = 0
+      self._lead_present_prev = False
       self._reset_curve_hold()
       self._reset_lead_hold()
       return LongDecision(None, "gated: not enabled/adaptive")
@@ -843,6 +893,14 @@ class LongController:
     stock_state = str(getattr(CS, "stock_cruise_state", "") or "")
     if stock_state not in ("ENABLED", "OVERRIDE", "STANDSTILL", "STANDBY"):
       self._last_active = False
+      self._lp_target_last_ms = None
+      self._lp_target_near_ms = None
+      self._lp_has_lead = False
+      self._lp_a_target = 0.0
+      self._lp_source = ""
+      self._lead_recently_cleared_until_ms = 0
+      self._curve_recent_clear_until_ms = 0
+      self._lead_present_prev = False
       self._reset_curve_hold()
       self._reset_lead_hold()
       return LongDecision(None, f"gated: stock_state={stock_state or 'UNKNOWN'}")
@@ -851,6 +909,10 @@ class LongController:
       self._enabled_since_ms = int(now)
       self._stable_plan_samples = 0
       self._last_lp_seen_ns = 0
+      self._lead_recently_cleared_until_ms = 0
+      self._curve_recent_clear_until_ms = 0
+      self._lead_present_prev = False
+      self._reset_curve_hold()
       self._reset_lead_hold()
     self._last_active = True
 
@@ -927,6 +989,12 @@ class LongController:
         if lead_owned:
           desired_ms = min(float(base_target_ms), float(planner_last_ms))
           src = f"{src}+planner[{'+'.join(drag_reasons)}]"
+          if self._lead_nibble_hold_active(
+            planner_ms=float(desired_ms),
+            current_set_ms=float(current_set_ms),
+          ):
+            desired_ms = max(float(desired_ms), float(current_set_ms))
+            src = f"{src}+nibble_hold"
           self._lead_hold_until_ms = int(now) + int(self._LEAD_HOLD_PERSIST_MS)
           self._reset_curve_hold()
         elif self._lead_hold_active_now(
@@ -937,6 +1005,12 @@ class LongController:
         ):
           desired_ms = min(float(base_target_ms), float(planner_last_ms))
           src = f"{src}+planner[lead_hold]"
+          if self._lead_nibble_hold_active(
+            planner_ms=float(desired_ms),
+            current_set_ms=float(current_set_ms),
+          ):
+            desired_ms = max(float(desired_ms), float(current_set_ms))
+            src = f"{src}+nibble_hold"
           self._reset_curve_hold()
         elif (not self._lead_present) and (not self._lp_has_lead):
           self._reset_lead_hold()
@@ -987,6 +1061,14 @@ class LongController:
           if float(desired_ms) > (float(lead_hold_cap_ms) + (0.25 * CV.MPH_TO_MS)):
             desired_ms = float(lead_hold_cap_ms)
             src = f"{src}+lead_present_hold"
+          elif self._lead_present_up_guard_active(
+            base_target_ms=float(base_target_ms),
+            planner_ms=float(planner_last_ms),
+            current_set_ms=float(current_set_ms),
+            v_ego_ms=float(v_ego_ms),
+          ) and float(desired_ms) > (float(current_set_ms) + (0.25 * CV.MPH_TO_MS)):
+            desired_ms = float(current_set_ms)
+            src = f"{src}+lead_present_guard"
       elif self._lead_present and (self._lead_drel < 80.0) and (self._lead_vrel < -0.5):
         lead_speed_ms = max(0.0, float(v_ego_ms) + float(self._lead_vrel))
         desired_ms = min(float(base_target_ms), max(float(self.MIN_CRUISE_SPEED_MS), float(lead_speed_ms)))
@@ -1017,6 +1099,12 @@ class LongController:
         if lead_owned:
           desired_ms = float(planner_last_ms)
           src = "lp_last"
+          if self._lead_nibble_hold_active(
+            planner_ms=float(desired_ms),
+            current_set_ms=float(current_set_ms),
+          ):
+            desired_ms = max(float(desired_ms), float(current_set_ms))
+            src = "lp_last[nibble_hold]"
           self._lead_hold_until_ms = int(now) + int(self._LEAD_HOLD_PERSIST_MS)
           self._reset_curve_hold()
         elif self._lead_hold_active_now(
@@ -1027,6 +1115,12 @@ class LongController:
         ):
           desired_ms = float(planner_last_ms)
           src = "lp_last[lead_hold]"
+          if self._lead_nibble_hold_active(
+            planner_ms=float(desired_ms),
+            current_set_ms=float(current_set_ms),
+          ):
+            desired_ms = max(float(desired_ms), float(current_set_ms))
+            src = "lp_last[lead_hold+nibble_hold]"
           self._reset_curve_hold()
         elif (not self._lead_present) and (not self._lp_has_lead):
           self._reset_lead_hold()
