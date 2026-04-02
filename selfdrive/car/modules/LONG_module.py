@@ -1256,11 +1256,11 @@ class LongController:
           if (
             self._lead_present
             and self._lead_is_opening_clear(
-              base_target_ms=float(resume_ceiling_ms),
+              base_target_ms=float(base_target_ms),
               v_ego_ms=float(v_ego_ms),
             )
           ):
-            desired_ms = float(resume_ceiling_ms)
+            desired_ms = min(float(resume_ceiling_ms), float(base_target_ms))
             src = "hold+ceiling+lead_opening"
           else:
             desired_ms = float(current_set_ms if current_set_ms > 0.1 else resume_ceiling_ms)
