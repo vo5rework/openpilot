@@ -19,12 +19,12 @@ XNOR architecture adaptations retained:
 from __future__ import annotations
 
 import math
+import os
 import time
 from dataclasses import dataclass
 from typing import Optional
 
 from cereal import messaging
-from openpilot.common.params import Params
 from openpilot.common.swaglog import cloudlog
 from opendbc.car.common.conversions import Conversions as CV
 from opendbc.car.tesla.values import CruiseButtons
@@ -44,8 +44,16 @@ class LongDecision:
 
 class LongController:
   MIN_CRUISE_SPEED_MS = 17.1 * CV.MPH_TO_MS
-  _ROADWORKS_CAP_PARAM = "XNORRoadworksSpeedCapKph"
-  _ROADWORKS_PRESET_PARAM = "XNORRoadworksSpeedCapPresetKph"
+  _ROADWORKS_CAP_FILE = "/data/xnor_roadworks_speed_cap_kph.txt"
+  _LEAD_FAR_QUEUE_MAX_DIST_M = 140.0
+  _LEAD_FAR_QUEUE_MIN_CLOSING_VREL_MS = -2.2
+  _LEAD_FAR_QUEUE_MAX_TTC_S = 7.0
+  _LEAD_FAR_QUEUE_MAX_LEAD_SPEED_MS = 12.0 * CV.MPH_TO_MS
+  _LEAD_FAR_QUEUE_MIN_BASE_DELTA_MS = 2.0 * CV.MPH_TO_MS
+  _LEAD_NIBBLE_HOLD_MAX_DROP_MS = 1.2 * CV.MPH_TO_MS
+  _LEAD_NIBBLE_HOLD_MIN_DREL_M = 28.0
+  _LEAD_NIBBLE_HOLD_MIN_VREL_MS = -0.8
+  _LEAD_NIBBLE_HOLD_MAX_ATARGET_MS2 = -0.22
   _LP_FRESH_NS = 1_500_000_000
   _PLANNER_DRAG_MARGIN_MS = 0.25
   _PLANNER_BELOW_EGO_MARGIN_MS = 0.05
@@ -115,7 +123,6 @@ class LongController:
 
   def __init__(self) -> None:
     self.acc = ACCController()
-    self._params = Params()
     self._sm = messaging.SubMaster(["longitudinalPlan", "radarState", "mapdOut"])
 
     self._lp_target_last_ms: Optional[float] = None
@@ -773,15 +780,16 @@ class LongController:
 
   def _roadworks_cap_ms(self) -> Optional[float]:
     try:
-      raw = self._params.get(self._ROADWORKS_CAP_PARAM, encoding="utf-8")
-    except Exception:
+      with open(self._ROADWORKS_CAP_FILE, "r", encoding="utf-8") as f:
+        raw = str(f.read()).strip()
+    except OSError:
       return None
 
     if not raw:
       return None
 
     try:
-      kph = float(str(raw).strip())
+      kph = float(raw)
     except Exception:
       return None
 
@@ -790,22 +798,6 @@ class LongController:
 
     return float(kph) * CV.KPH_TO_MS
 
-
-  def _roadworks_preset_cap_kph(self) -> float:
-    try:
-      raw = self._params.get(self._ROADWORKS_PRESET_PARAM, encoding="utf-8")
-    except Exception:
-      raw = None
-
-    if raw:
-      try:
-        kph = float(str(raw).strip())
-        if math.isfinite(kph) and kph > 0.1:
-          return float(kph)
-      except Exception:
-        pass
-
-    return float(50.0 * CV.MPH_TO_KPH)
 
   def _lead_is_constraining(self, *, base_target_ms: float, v_ego_ms: float) -> bool:
     if (not self._lead_present) or float(self._lead_drel) <= 0.0:
@@ -822,6 +814,54 @@ class LongController:
     near_lead = float(self._lead_drel) < float(near_gap_limit_m)
     non_opening_near = near_lead and float(self._lead_vrel) <= float(self._LEAD_OPENING_VREL_MS)
     return bool(lead_slower_than_base and (closing or non_opening_near))
+
+  def _lead_far_queue_approach_active(self, *, base_target_ms: float, v_ego_ms: float) -> bool:
+    if (not self._lead_present) or float(self._lead_drel) <= 0.0:
+      return False
+    if abs(float(self._lead_yrel)) >= float(self._LEAD_OFFLANE_YREL_M):
+      return False
+    if self._lead_is_opening_clear(base_target_ms=float(base_target_ms), v_ego_ms=float(v_ego_ms)):
+      return False
+
+    lead_speed_ms = max(0.0, float(v_ego_ms) + float(self._lead_vrel))
+    if lead_speed_ms >= (float(base_target_ms) - float(self._LEAD_FAR_QUEUE_MIN_BASE_DELTA_MS)):
+      return False
+    if float(self._lead_vrel) > float(self._LEAD_FAR_QUEUE_MIN_CLOSING_VREL_MS):
+      return False
+
+    max_dist_m = min(float(self._LEAD_FAR_QUEUE_MAX_DIST_M), max(55.0, float(v_ego_ms) * 4.2))
+    if float(self._lead_drel) > float(max_dist_m):
+      return False
+
+    ttc_s = 999.0
+    if float(self._lead_vrel) < -0.1:
+      ttc_s = float(self._lead_drel) / max(-float(self._lead_vrel), 0.1)
+
+    return bool(
+      float(lead_speed_ms) <= float(self._LEAD_FAR_QUEUE_MAX_LEAD_SPEED_MS)
+      or float(ttc_s) <= float(self._LEAD_FAR_QUEUE_MAX_TTC_S)
+    )
+
+  def _apply_lead_nibble_hold(self, *, desired_ms: float, current_set_ms: float, v_ego_ms: float) -> tuple[float, bool]:
+    if (not self._lead_present) or float(desired_ms) <= 0.1 or float(current_set_ms) <= 0.1:
+      return float(desired_ms), False
+    if float(desired_ms) >= float(current_set_ms):
+      return float(desired_ms), False
+
+    drop_ms = float(current_set_ms) - float(desired_ms)
+    if float(drop_ms) > float(self._LEAD_NIBBLE_HOLD_MAX_DROP_MS):
+      return float(desired_ms), False
+
+    min_gap_m = max(float(self._LEAD_NIBBLE_HOLD_MIN_DREL_M), float(v_ego_ms) * 1.2)
+    if float(self._lead_drel) <= float(min_gap_m):
+      return float(desired_ms), False
+    if float(self._lead_vrel) <= float(self._LEAD_NIBBLE_HOLD_MIN_VREL_MS):
+      return float(desired_ms), False
+    if float(self._lp_a_target) <= float(self._LEAD_NIBBLE_HOLD_MAX_ATARGET_MS2):
+      return float(desired_ms), False
+
+    return float(current_set_ms), True
+
 
 
 
@@ -1059,6 +1099,23 @@ class LongController:
           if float(desired_ms) > (float(lead_hold_cap_ms) + (0.25 * CV.MPH_TO_MS)):
             desired_ms = float(lead_hold_cap_ms)
             src = f"{src}+lead_present_hold"
+
+        if self._lead_far_queue_approach_active(
+          base_target_ms=float(base_target_ms),
+          v_ego_ms=float(v_ego_ms),
+        ):
+          far_hold_ms = max(float(current_set_ms), float(v_ego_ms))
+          if float(desired_ms) > (float(far_hold_ms) + (0.25 * CV.MPH_TO_MS)):
+            desired_ms = float(far_hold_ms)
+            src = f"{src}+lead_far_queue_hold"
+
+        desired_ms, lead_nibble_held = self._apply_lead_nibble_hold(
+          desired_ms=float(desired_ms),
+          current_set_ms=float(current_set_ms),
+          v_ego_ms=float(v_ego_ms),
+        )
+        if lead_nibble_held:
+          src = f"{src}+lead_nibble_hold"
       elif self._lead_present and (self._lead_drel < 80.0) and (self._lead_vrel < -0.5):
         lead_speed_ms = max(0.0, float(v_ego_ms) + float(self._lead_vrel))
         desired_ms = min(float(base_target_ms), max(float(self.MIN_CRUISE_SPEED_MS), float(lead_speed_ms)))
@@ -1217,6 +1274,23 @@ class LongController:
           if float(desired_ms) > (float(lead_hold_cap_ms) + (0.25 * CV.MPH_TO_MS)):
             desired_ms = float(lead_hold_cap_ms)
             src = f"{src}+lead_present_hold"
+
+        if self._lead_far_queue_approach_active(
+          base_target_ms=float(resume_ceiling_ms),
+          v_ego_ms=float(v_ego_ms),
+        ):
+          far_hold_ms = max(float(current_set_ms), float(v_ego_ms))
+          if float(desired_ms) > (float(far_hold_ms) + (0.25 * CV.MPH_TO_MS)):
+            desired_ms = float(far_hold_ms)
+            src = f"{src}+lead_far_queue_hold"
+
+        desired_ms, lead_nibble_held = self._apply_lead_nibble_hold(
+          desired_ms=float(desired_ms),
+          current_set_ms=float(current_set_ms),
+          v_ego_ms=float(v_ego_ms),
+        )
+        if lead_nibble_held:
+          src = f"{src}+lead_nibble_hold"
       else:
         self._reset_curve_hold()
         if startup_invalid_clear:

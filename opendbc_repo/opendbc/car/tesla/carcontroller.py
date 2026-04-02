@@ -49,8 +49,8 @@ BTN_DOWN2 = 8
 BTN_UP1 = 16
 BTN_DOWN1 = 32
 
-ROADWORKS_CAP_PARAM = "XNORRoadworksSpeedCapKph"
-ROADWORKS_PRESET_PARAM = "XNORRoadworksSpeedCapPresetKph"
+ROADWORKS_CAP_FILE = "/data/xnor_roadworks_speed_cap_kph.txt"
+ROADWORKS_PRESET_FILE = "/data/xnor_roadworks_speed_cap_preset_kph.txt"
 ROADWORKS_DEFAULT_KPH = 50.0 * CV.MPH_TO_KPH
 
 
@@ -144,48 +144,52 @@ class CarController(CarControllerBase):
     return int(time.monotonic_ns() // 1_000_000)
 
 
-  def _roadworks_cap_current_kph(self) -> float | None:
+  def _read_roadworks_file_float(self, path: str) -> float | None:
     try:
-      raw = self.params.get(ROADWORKS_CAP_PARAM, encoding="utf-8")
-    except Exception:
+      with open(path, "r", encoding="utf-8") as f:
+        raw = str(f.read()).strip()
+    except OSError:
       return None
 
     if not raw:
       return None
 
     try:
-      kph = float(str(raw).strip())
+      value = float(raw)
     except Exception:
       return None
 
-    if not np.isfinite(kph) or float(kph) <= 0.1:
-      return None
-    return float(kph)
+    return float(value) if np.isfinite(value) and float(value) > 0.1 else None
+
+  def _write_roadworks_file_float(self, path: str, value: float) -> None:
+    tmp_path = f"{path}.tmp"
+    with open(tmp_path, "w", encoding="utf-8") as f:
+      f.write(f"{float(value):.3f}")
+    os.replace(tmp_path, path)
+
+  def _clear_roadworks_file(self, path: str) -> None:
+    try:
+      os.remove(path)
+    except OSError:
+      pass
+
+  def _roadworks_cap_current_kph(self) -> float | None:
+    return self._read_roadworks_file_float(ROADWORKS_CAP_FILE)
 
   def _roadworks_cap_preset_kph(self) -> float:
-    try:
-      raw = self.params.get(ROADWORKS_PRESET_PARAM, encoding="utf-8")
-    except Exception:
-      raw = None
-
-    if raw:
-      try:
-        kph = float(str(raw).strip())
-        if np.isfinite(kph) and float(kph) > 0.1:
-          return float(kph)
-      except Exception:
-        pass
-
+    preset = self._read_roadworks_file_float(ROADWORKS_PRESET_FILE)
+    if preset is not None:
+      return float(preset)
     return float(ROADWORKS_DEFAULT_KPH)
 
   def _toggle_roadworks_cap(self) -> None:
     current_kph = self._roadworks_cap_current_kph()
     if current_kph is None:
       preset_kph = self._roadworks_cap_preset_kph()
-      self.params.put(ROADWORKS_CAP_PARAM, f"{preset_kph:.3f}")
+      self._write_roadworks_file_float(ROADWORKS_CAP_FILE, float(preset_kph))
       cloudlog.info(f"[XNOR_RW_CAP] enabled cap_kph={preset_kph:.3f}")
     else:
-      self.params.remove(ROADWORKS_CAP_PARAM)
+      self._clear_roadworks_file(ROADWORKS_CAP_FILE)
       cloudlog.info(f"[XNOR_RW_CAP] cleared previous_cap_kph={current_kph:.3f}")
 
   def _maybe_handle_roadworks_triple_pull(self, CS) -> None:
