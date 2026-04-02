@@ -24,6 +24,7 @@ from dataclasses import dataclass
 from typing import Optional
 
 from cereal import messaging
+from openpilot.common.params import Params
 from openpilot.common.swaglog import cloudlog
 from opendbc.car.common.conversions import Conversions as CV
 from opendbc.car.tesla.values import CruiseButtons
@@ -43,6 +44,8 @@ class LongDecision:
 
 class LongController:
   MIN_CRUISE_SPEED_MS = 17.1 * CV.MPH_TO_MS
+  _ROADWORKS_CAP_PARAM = "XNORRoadworksSpeedCapKph"
+  _ROADWORKS_PRESET_PARAM = "XNORRoadworksSpeedCapPresetKph"
   _LP_FRESH_NS = 1_500_000_000
   _PLANNER_DRAG_MARGIN_MS = 0.25
   _PLANNER_BELOW_EGO_MARGIN_MS = 0.05
@@ -112,6 +115,7 @@ class LongController:
 
   def __init__(self) -> None:
     self.acc = ACCController()
+    self._params = Params()
     self._sm = messaging.SubMaster(["longitudinalPlan", "radarState", "mapdOut"])
 
     self._lp_target_last_ms: Optional[float] = None
@@ -767,6 +771,42 @@ class LongController:
       return float(speed_limit_target_ms), True, "carstate_speed_limit_target"
     return None, False, "none"
 
+  def _roadworks_cap_ms(self) -> Optional[float]:
+    try:
+      raw = self._params.get(self._ROADWORKS_CAP_PARAM, encoding="utf-8")
+    except Exception:
+      return None
+
+    if not raw:
+      return None
+
+    try:
+      kph = float(str(raw).strip())
+    except Exception:
+      return None
+
+    if (not math.isfinite(kph)) or kph <= 0.1:
+      return None
+
+    return float(kph) * CV.KPH_TO_MS
+
+
+  def _roadworks_preset_cap_kph(self) -> float:
+    try:
+      raw = self._params.get(self._ROADWORKS_PRESET_PARAM, encoding="utf-8")
+    except Exception:
+      raw = None
+
+    if raw:
+      try:
+        kph = float(str(raw).strip())
+        if math.isfinite(kph) and kph > 0.1:
+          return float(kph)
+      except Exception:
+        pass
+
+    return float(50.0 * CV.MPH_TO_KPH)
+
   def _lead_is_constraining(self, *, base_target_ms: float, v_ego_ms: float) -> bool:
     if (not self._lead_present) or float(self._lead_drel) <= 0.0:
       return False
@@ -929,9 +969,13 @@ class LongController:
     )
 
     speed_limit_target_ms, set_speed_limit_active, ceiling_src = self._resolve_speed_limit_target_ms(CS, speed_units=speed_units)
+    roadworks_cap_ms = self._roadworks_cap_ms()
 
     if set_speed_limit_active and speed_limit_target_ms is not None:
       base_target_ms = float(speed_limit_target_ms)
+      if roadworks_cap_ms is not None:
+        base_target_ms = min(float(base_target_ms), float(roadworks_cap_ms))
+        ceiling_src = f"{ceiling_src}+roadworks_cap"
       desired_ms = float(base_target_ms)
       src = f"speed_limit_target[{ceiling_src}]"
 
@@ -1023,8 +1067,12 @@ class LongController:
         self._reset_curve_hold()
     else:
       resume_ceiling_ms = self._resume_ceiling_ms(current_set_ms=float(current_set_ms), v_ego_ms=float(v_ego_ms))
+      if roadworks_cap_ms is not None:
+        resume_ceiling_ms = min(float(resume_ceiling_ms), float(roadworks_cap_ms))
       desired_ms = float(resume_ceiling_ms)
       src = "hold+ceiling"
+      if roadworks_cap_ms is not None:
+        src = f"{src}+roadworks_cap"
 
       if lp_fresh:
         suppress_planner_lead_owner = (

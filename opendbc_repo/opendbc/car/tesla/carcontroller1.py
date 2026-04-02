@@ -49,10 +49,6 @@ BTN_DOWN2 = 8
 BTN_UP1 = 16
 BTN_DOWN1 = 32
 
-ROADWORKS_CAP_PARAM = "XNORRoadworksSpeedCapKph"
-ROADWORKS_PRESET_PARAM = "XNORRoadworksSpeedCapPresetKph"
-ROADWORKS_DEFAULT_KPH = 50.0 * CV.MPH_TO_KPH
-
 
 class CarController(CarControllerBase):
   def __init__(self, dbc_names, CP, VM=None):
@@ -98,9 +94,6 @@ class CarController(CarControllerBase):
     self._virtual_turn_last_send_frame = -100000
     self._hud_prev_enabled = False
 
-    self._roadworks_main_pulls_ms: list[int] = []
-    self._roadworks_toggle_latch_until_ms = 0
-
     if CP.carFingerprint in LEGACY_CARS:
       if CP.carFingerprint in (CAR.TESLA_MODEL_S_HW1, CAR.TESLA_MODEL_X_HW1):
         CANBUS.powertrain = CANBUS.party
@@ -143,79 +136,10 @@ class CarController(CarControllerBase):
   def _now_ms() -> int:
     return int(time.monotonic_ns() // 1_000_000)
 
-
-  def _roadworks_cap_current_kph(self) -> float | None:
-    try:
-      raw = self.params.get(ROADWORKS_CAP_PARAM, encoding="utf-8")
-    except Exception:
-      return None
-
-    if not raw:
-      return None
-
-    try:
-      kph = float(str(raw).strip())
-    except Exception:
-      return None
-
-    if not np.isfinite(kph) or float(kph) <= 0.1:
-      return None
-    return float(kph)
-
-  def _roadworks_cap_preset_kph(self) -> float:
-    try:
-      raw = self.params.get(ROADWORKS_PRESET_PARAM, encoding="utf-8")
-    except Exception:
-      raw = None
-
-    if raw:
-      try:
-        kph = float(str(raw).strip())
-        if np.isfinite(kph) and float(kph) > 0.1:
-          return float(kph)
-      except Exception:
-        pass
-
-    return float(ROADWORKS_DEFAULT_KPH)
-
-  def _toggle_roadworks_cap(self) -> None:
-    current_kph = self._roadworks_cap_current_kph()
-    if current_kph is None:
-      preset_kph = self._roadworks_cap_preset_kph()
-      self.params.put(ROADWORKS_CAP_PARAM, f"{preset_kph:.3f}")
-      cloudlog.info(f"[XNOR_RW_CAP] enabled cap_kph={preset_kph:.3f}")
-    else:
-      self.params.remove(ROADWORKS_CAP_PARAM)
-      cloudlog.info(f"[XNOR_RW_CAP] cleared previous_cap_kph={current_kph:.3f}")
-
-  def _maybe_handle_roadworks_triple_pull(self, CS) -> None:
-    now_ms = int(self._now_ms())
-    if int(now_ms) < int(self._roadworks_toggle_latch_until_ms):
-      return
-
-    btn = int(getattr(CS, "cruise_buttons", BTN_IDLE) or BTN_IDLE)
-    prev_btn = int(getattr(self, "_prev_cruise_buttons", BTN_IDLE) or BTN_IDLE)
-    main_edge = (btn == BTN_MAIN) and (prev_btn != BTN_MAIN)
-    if not main_edge:
-      return
-
-    recent = [int(ts) for ts in self._roadworks_main_pulls_ms if (int(now_ms) - int(ts)) <= 1800]
-    recent.append(int(now_ms))
-    self._roadworks_main_pulls_ms = recent[-3:]
-
-    if len(self._roadworks_main_pulls_ms) >= 3:
-      span_ms = int(self._roadworks_main_pulls_ms[-1]) - int(self._roadworks_main_pulls_ms[-3])
-      if span_ms <= 1800:
-        self._toggle_roadworks_cap()
-        self._roadworks_main_pulls_ms = []
-        self._roadworks_toggle_latch_until_ms = int(now_ms) + 1800
-
   def _track_human_cruise_actions(self, CS) -> None:
     btn = int(getattr(CS, 'cruise_buttons', BTN_IDLE) or BTN_IDLE)
-    prev_btn = int(getattr(self, '_prev_cruise_buttons', BTN_IDLE) or BTN_IDLE)
-    self._maybe_handle_roadworks_triple_pull(CS)
     # Unity: throttle automation on any button other than MAIN/IDLE
-    if (btn not in (BTN_MAIN, BTN_IDLE)) and (btn != prev_btn):
+    if (btn not in (BTN_MAIN, BTN_IDLE)) and (btn != int(getattr(self, '_prev_cruise_buttons', BTN_IDLE))):
       self._human_cruise_action_time_ms = self._now_ms()
     self._prev_cruise_buttons = btn
 
