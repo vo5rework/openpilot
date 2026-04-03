@@ -79,8 +79,8 @@ class LongController:
   _CURVE_PLANNER_RELEASE_OVERRIDE_MS = 260
   _LEAD_HOLD_PERSIST_MS = 560
   _LEAD_HOLD_RELEASE_MARGIN_MS = 0.20 * CV.MPH_TO_MS
-  _LEAD_OPENING_VREL_MS = 0.02
-  _LEAD_OPENING_GAP_MIN_M = 14.0
+  _LEAD_OPENING_VREL_MS = 0.12
+  _LEAD_OPENING_GAP_MIN_M = 18.0
   _LEAD_OPENING_TIME_GAP_S = 1.15
   _LEAD_CONSTRAIN_CLOSING_VREL_MS = -0.15
   _LEAD_CONSTRAIN_GAP_MIN_M = 22.0
@@ -99,6 +99,7 @@ class LongController:
   _MAPD_ONLY_HIGHWAY_MAX_EXTRA_DROP_WITH_PLANNER_MS = 12.0 * CV.MPH_TO_MS
   _MAPD_ONLY_HIGHWAY_NEAR_STEER_DEG = 2.5
   _LEAD_CLEAR_MAPD_GRACE_MS = 900
+  _LEAD_CLEAR_OPENING_GRACE_MS = 220
   _CURVE_REENTRY_BLOCK_MS = 1800
   _CURVE_REENTRY_ALLOW_DROP_MS = 6.0 * CV.MPH_TO_MS
   _CURVE_REENTRY_ALLOW_STEER_DEG = 2.0
@@ -158,6 +159,9 @@ class LongController:
     self._lead_hold_until_ms: int = 0
     self._lead_recently_cleared_until_ms: int = 0
     self._lead_present_prev: bool = False
+    self._lead_last_drel: float = 0.0
+    self._lead_last_vrel: float = 0.0
+    self._lead_last_yrel: float = 0.0
     self._curve_recent_clear_until_ms: int = 0
 
   def _rate_log(self, msg: str) -> None:
@@ -570,6 +574,22 @@ class LongController:
 
 
 
+  def _lead_last_sample_was_opening_clear(self) -> bool:
+    if float(self._lead_last_drel) <= 0.0:
+      return False
+    if abs(float(self._lead_last_yrel)) >= float(self._LEAD_OFFLANE_YREL_M):
+      return True
+    planner_not_decel = float(self._lp_a_target) >= float(self._LEAD_OPENING_RELAX_ATARGET_MS2)
+    opening_gap_ok = float(self._lead_last_drel) >= max(float(self._LEAD_OPENING_GAP_MIN_M), 18.0)
+    opening_speed_ok = float(self._lead_last_vrel) >= float(self._LEAD_OPENING_VREL_MS)
+    return bool(
+      opening_speed_ok
+      and opening_gap_ok
+      and planner_not_decel
+      and str(self._lp_source or "") in ("cruise", "e2e", "")
+    )
+
+
   def _lead_context_active_now(self, *, now_ms: int) -> bool:
     if bool(self._lead_present) and float(self._lead_drel) > 0.0:
       return True
@@ -724,11 +744,17 @@ class LongController:
             self._lead_drel = d_rel
             self._lead_vrel = v_rel
             self._lead_yrel = y_rel
+            self._lead_last_drel = d_rel
+            self._lead_last_vrel = v_rel
+            self._lead_last_yrel = y_rel
     except Exception:
       pass
 
     if prev_lead_present and (not bool(self._lead_present)):
-      self._lead_recently_cleared_until_ms = int(now_ns // 1_000_000) + int(self._LEAD_CLEAR_MAPD_GRACE_MS)
+      clear_grace_ms = int(self._LEAD_CLEAR_MAPD_GRACE_MS)
+      if self._lead_last_sample_was_opening_clear():
+        clear_grace_ms = min(clear_grace_ms, int(self._LEAD_CLEAR_OPENING_GRACE_MS))
+      self._lead_recently_cleared_until_ms = int(now_ns // 1_000_000) + int(clear_grace_ms)
     self._lead_present_prev = bool(self._lead_present)
 
     try:
@@ -880,6 +906,12 @@ class LongController:
     materially_below_base = float(planner_ms) < (float(base_target_ms) - float(self._LP_QUEUE_FALLBACK_DROP_MS))
     materially_below_ego = float(planner_ms) < (float(v_ego_ms) - float(self._LP_QUEUE_FALLBACK_EGO_MARGIN_MS))
     planner_decel = float(self._lp_a_target) <= float(self._LP_QUEUE_FALLBACK_ATARGET_MS2)
+    opening_clear_recent = bool(
+      self._lead_last_sample_was_opening_clear()
+      and int(now_ms) <= int(self._lead_recently_cleared_until_ms)
+    )
+    if opening_clear_recent and str(self._lp_source or "") in ("cruise", "e2e"):
+      return False
     return bool(materially_below_base and materially_below_ego and planner_decel)
 
   def _planner_drag_reasons(self, *, now_ms: int, base_target_ms: float, planner_ms: float, current_set_ms: float, v_ego_ms: float) -> list[str]:
@@ -1265,6 +1297,18 @@ class LongController:
           else:
             desired_ms = float(current_set_ms if current_set_ms > 0.1 else resume_ceiling_ms)
             src = "hold+current_set+lead_present"
+
+        if self._lead_present and self._lead_is_constraining(
+          base_target_ms=float(resume_ceiling_ms),
+          v_ego_ms=float(v_ego_ms),
+        ):
+          constrain_target_ms = float(planner_last_ms)
+          if lp_fresh and self._lp_target_near_ms is not None:
+            constrain_target_ms = min(float(constrain_target_ms), float(self._lp_target_near_ms))
+          constrain_target_ms = min(float(constrain_target_ms), float(current_set_ms if current_set_ms > 0.1 else resume_ceiling_ms))
+          if float(constrain_target_ms) < float(desired_ms):
+            desired_ms = float(constrain_target_ms)
+            src = f"{src}+lead_constrain"
 
         if self._lead_present and (not self._lead_is_opening_clear(
           base_target_ms=float(resume_ceiling_ms),
