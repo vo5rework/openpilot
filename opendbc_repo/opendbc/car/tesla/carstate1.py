@@ -93,8 +93,6 @@ class CarState(CarStateBase):
     self.speed_units = "MPH"
     self.speed_limit_ms = 0.0
     self.speed_limit_ms_das = 0.0
-    # Unity behavior: keep the last valid base map limit until a new sign/map speed arrives.
-    self.baseMapSpeedLimitMPS = 0.0
     # Tesla UI speed-limit offset (if present on CAN)
     self.ui_speed_limit_offset_uom = 0.0
     self.ui_speed_limit_offset_units = ""  # "MPH" or "KPH"
@@ -415,12 +413,11 @@ class CarState(CarStateBase):
           rd_base_mps = float(rd.get("UI_baseMapSpeedLimitMPS", 0.0) or 0.0)
         except Exception:
           rd_base_mps = None
-
-        if rd_sign == 3:
+        base_map = 0.0
+        if int(rd.get("UI_roadSign", 0)) == 3:
           base_map = float(rd.get("UI_baseMapSpeedLimitMPS", 0.0) or 0.0)
-          self.baseMapSpeedLimitMPS = int(base_map * map_ms_to_uom + 0.99) / map_ms_to_uom
+          base_map = int(base_map * map_ms_to_uom + 0.99) / map_ms_to_uom
 
-        base_map = float(getattr(self, "baseMapSpeedLimitMPS", 0.0) or 0.0)
         if base_map > 0.0 and (speed_limit_type != 0x1F or base_map >= 5.56):
           speed_limit_ms = base_map
         else:
