@@ -121,6 +121,11 @@ class LongController:
   _WEAK_LEAD_OWNER_VREL_MS = -0.35
   _WEAK_LEAD_OWNER_ATARGET_MS2 = -0.35
   _WEAK_LEAD_OWNER_TIME_GAP_S = 2.2
+  _PLANNER_OWNER_RELEASE_PERSIST_MS = 240
+  _PLANNER_OWNER_RELEASE_LOW_SPEED_MAX_MS = 35.0 * CV.MPH_TO_MS
+  _PLANNER_OWNER_RELEASE_MIN_GAP_M = 9.0
+  _PLANNER_OWNER_RELEASE_VREL_MS = 0.10
+  _PLANNER_OWNER_RELEASE_ATARGET_MS2 = -0.35
 
   def __init__(self) -> None:
     self.acc = ACCController()
@@ -163,6 +168,7 @@ class LongController:
     self._lead_last_vrel: float = 0.0
     self._lead_last_yrel: float = 0.0
     self._curve_recent_clear_until_ms: int = 0
+    self._planner_owner_release_candidate_since_ms: int = 0
 
   def _rate_log(self, msg: str) -> None:
     now = _mono_ms()
@@ -962,6 +968,56 @@ class LongController:
       reasons.append("planner_low")
     return reasons
 
+  def _planner_owner_release_reason(self, *, now_ms: int, base_target_ms: float, planner_ms: float, v_ego_ms: float) -> str:
+    if float(planner_ms) <= 0.1:
+      self._planner_owner_release_candidate_since_ms = 0
+      return ""
+
+    lp_source = str(self._lp_source or "").lower()
+    if not lp_source.startswith("lead"):
+      self._planner_owner_release_candidate_since_ms = 0
+      return ""
+
+    if (not self._lead_present) or float(self._lead_drel) <= 0.0:
+      self._planner_owner_release_candidate_since_ms = 0
+      return ""
+
+    materially_below_base = float(planner_ms) < (float(base_target_ms) - float(self._PLANNER_DRAG_MARGIN_MS))
+    if not materially_below_base:
+      self._planner_owner_release_candidate_since_ms = 0
+      return ""
+
+    if self._lead_is_constraining(base_target_ms=float(base_target_ms), v_ego_ms=float(v_ego_ms)):
+      self._planner_owner_release_candidate_since_ms = 0
+      return ""
+
+    offlane_opening = abs(float(self._lead_yrel)) >= float(self._LEAD_OFFLANE_YREL_M)
+    low_speed_opening = bool(
+      float(v_ego_ms) <= float(self._PLANNER_OWNER_RELEASE_LOW_SPEED_MAX_MS)
+      and float(self._lead_drel) >= max(float(self._PLANNER_OWNER_RELEASE_MIN_GAP_M), float(v_ego_ms))
+      and float(self._lead_vrel) >= float(self._PLANNER_OWNER_RELEASE_VREL_MS)
+      and float(self._lp_a_target) >= float(self._PLANNER_OWNER_RELEASE_ATARGET_MS2)
+    )
+
+    reason = ""
+    if offlane_opening:
+      reason = "offlane"
+    elif low_speed_opening:
+      reason = "opening"
+
+    if not reason:
+      self._planner_owner_release_candidate_since_ms = 0
+      return ""
+
+    if int(self._planner_owner_release_candidate_since_ms) == 0:
+      self._planner_owner_release_candidate_since_ms = int(now_ms)
+      return ""
+
+    if (int(now_ms) - int(self._planner_owner_release_candidate_since_ms)) < int(self._PLANNER_OWNER_RELEASE_PERSIST_MS):
+      return ""
+
+    return reason
+
   def update(self, CS, *, enabled: bool, frame: int, now_ms: Optional[int] = None) -> LongDecision:
     now = _mono_ms() if now_ms is None else int(now_ms)
     now_ns = int(now) * 1_000_000
@@ -1052,7 +1108,13 @@ class LongController:
       src = f"speed_limit_target[{ceiling_src}]"
 
       if lp_fresh and self._lp_target_last_ms is not None:
-        suppress_planner_lead_owner = (
+        planner_owner_release_reason = self._planner_owner_release_reason(
+          now_ms=int(now),
+          base_target_ms=float(base_target_ms),
+          planner_ms=float(planner_last_ms),
+          v_ego_ms=float(v_ego_ms),
+        )
+        suppress_planner_lead_owner = bool(planner_owner_release_reason) or (
           self._lead_present
           and self._lead_is_opening_clear(
             base_target_ms=float(base_target_ms),
@@ -1060,6 +1122,8 @@ class LongController:
           )
           and str(self._lp_source or "") in ("cruise", "e2e")
         )
+        if suppress_planner_lead_owner:
+          self._reset_lead_hold()
         drag_reasons = [] if suppress_planner_lead_owner else self._planner_drag_reasons(
           now_ms=int(now),
           base_target_ms=float(base_target_ms),
@@ -1123,6 +1187,9 @@ class LongController:
           self._reset_curve_hold()
           self._reset_lead_hold()
 
+        if planner_owner_release_reason:
+          src = f"{src}+planner_owner_release[{planner_owner_release_reason}]"
+
         if self._lead_present and (not self._lead_is_opening_clear(
           base_target_ms=float(base_target_ms),
           v_ego_ms=float(v_ego_ms),
@@ -1164,7 +1231,13 @@ class LongController:
         src = f"{src}+roadworks_cap"
 
       if lp_fresh:
-        suppress_planner_lead_owner = (
+        planner_owner_release_reason = self._planner_owner_release_reason(
+          now_ms=int(now),
+          base_target_ms=float(resume_ceiling_ms),
+          planner_ms=float(planner_last_ms),
+          v_ego_ms=float(v_ego_ms),
+        )
+        suppress_planner_lead_owner = bool(planner_owner_release_reason) or (
           self._lead_present
           and self._lead_is_opening_clear(
             base_target_ms=float(resume_ceiling_ms),
@@ -1172,6 +1245,8 @@ class LongController:
           )
           and str(self._lp_source or "") in ("cruise", "e2e")
         )
+        if suppress_planner_lead_owner:
+          self._reset_lead_hold()
         drag_reasons = [] if suppress_planner_lead_owner else self._planner_drag_reasons(
           now_ms=int(now),
           base_target_ms=float(resume_ceiling_ms),
@@ -1297,6 +1372,9 @@ class LongController:
           else:
             desired_ms = float(current_set_ms if current_set_ms > 0.1 else resume_ceiling_ms)
             src = "hold+current_set+lead_present"
+
+        if planner_owner_release_reason:
+          src = f"{src}+planner_owner_release[{planner_owner_release_reason}]"
 
         if self._lead_present and self._lead_is_constraining(
           base_target_ms=float(resume_ceiling_ms),
