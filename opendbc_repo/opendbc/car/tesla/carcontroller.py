@@ -579,10 +579,10 @@ class CarController(CarControllerBase):
         steer_guard_deg = float(np.interp(
           float(getattr(CS.out, "vEgoRaw", CS.out.vEgo)),
           [0.0, 10.0, 20.0, 30.0],
-          [34.0, 42.0, 52.0, 62.0],
+          [36.0, 44.0, 56.0, 68.0],
         ))
-        # Keep a measured-angle guard, but widen it with speed so the car can
-        # build angle earlier into sharper corners instead of washing wide.
+        # Slightly relax the measured-angle guard at speed so the controller can
+        # build angle earlier in sharper bends without making lane placement loose.
         apply_angle = float(np.clip(
           apply_angle,
           float(CS.out.steeringAngleDeg) - steer_guard_deg,
