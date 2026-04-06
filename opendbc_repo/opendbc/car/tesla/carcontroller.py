@@ -78,8 +78,6 @@ class CarController(CarControllerBase):
     self.apply_angle_last = 0.0
     self._lat_active_prev = False
     self._steer_warmup_until_frame = -1
-    self._steer_guard_undershoot_frames = 0
-    self._steer_guard_undershoot_sign = 0
 
     self._speed_sync_last_frame = -100000
     # Unity-parity pacing for automated cruise stalk presses
@@ -433,76 +431,6 @@ class CarController(CarControllerBase):
       desired_angle_deg + max_delta,
     ))
 
-
-
-def _dynamic_measured_angle_guard(self, desired_angle_deg: float, commanded_angle_deg: float, measured_angle_deg: float, v_ego: float) -> tuple[float, float]:
-  desired_angle_deg = float(desired_angle_deg)
-  commanded_angle_deg = float(commanded_angle_deg)
-  measured_angle_deg = float(measured_angle_deg)
-  v_ego = float(v_ego)
-
-  base_guard_deg = float(np.interp(
-    v_ego,
-    [0.0, 10.0, 20.0, 30.0],
-    [24.0, 28.0, 34.0, 40.0],
-  ))
-
-  desired_error = desired_angle_deg - measured_angle_deg
-  commanded_error = commanded_angle_deg - measured_angle_deg
-  desired_sign = int(np.sign(desired_error))
-  same_direction = (
-    desired_sign != 0 and
-    int(np.sign(commanded_error)) == desired_sign and
-    abs(desired_angle_deg) >= 3.0 and
-    v_ego >= 6.0
-  )
-
-  engage_error_deg = float(np.interp(
-    v_ego,
-    [0.0, 10.0, 20.0, 30.0],
-    [6.0, 6.5, 7.5, 9.0],
-  ))
-
-  if same_direction and (abs(desired_error) >= engage_error_deg):
-    if self._steer_guard_undershoot_sign == desired_sign:
-      self._steer_guard_undershoot_frames = min(self._steer_guard_undershoot_frames + 1, 12)
-    else:
-      self._steer_guard_undershoot_sign = desired_sign
-      self._steer_guard_undershoot_frames = 1
-  else:
-    self._steer_guard_undershoot_frames = max(self._steer_guard_undershoot_frames - 2, 0)
-    if self._steer_guard_undershoot_frames == 0:
-      self._steer_guard_undershoot_sign = 0
-
-  widen_deg = 0.0
-  if self._steer_guard_undershoot_frames >= 3:
-    persist_scale = float(np.interp(
-      float(self._steer_guard_undershoot_frames),
-      [3.0, 6.0, 12.0],
-      [0.0, 0.5, 1.0],
-    ))
-    widen_cap_deg = float(np.interp(
-      v_ego,
-      [0.0, 10.0, 20.0, 30.0],
-      [0.0, 2.0, 4.0, 6.0],
-    ))
-    widen_request_deg = float(np.interp(
-      abs(desired_error),
-      [engage_error_deg, engage_error_deg + 4.0, engage_error_deg + 10.0],
-      [0.0, 1.5, widen_cap_deg],
-    ))
-    widen_deg = min(widen_cap_deg, widen_request_deg * persist_scale)
-
-  lower = measured_angle_deg - base_guard_deg
-  upper = measured_angle_deg + base_guard_deg
-
-  if self._steer_guard_undershoot_sign > 0:
-    upper += widen_deg
-  elif self._steer_guard_undershoot_sign < 0:
-    lower -= widen_deg
-
-  return float(lower), float(upper)
-
   def _body_controls_turn(self, CS) -> int:
     if not bool(getattr(CS, "enableALC", False)):
       return 0
@@ -633,8 +561,6 @@ def _dynamic_measured_angle_guard(self, desired_angle_deg: float, commanded_angl
     # Steering (50Hz)
     if self.frame % 2 == 0:
       if (not lat_active) or human_control or steer_inhibit or (int(self.frame) < int(self._steer_warmup_until_frame)):
-        self._steer_guard_undershoot_frames = 0
-        self._steer_guard_undershoot_sign = 0
         apply_angle = float(CS.out.steeringAngleDeg)
       else:
         desired_angle = self._lane_positioned_target_angle(
@@ -650,16 +576,17 @@ def _dynamic_measured_angle_guard(self, desired_angle_deg: float, commanded_angl
           lat_active,
           CarControllerParams.ANGLE_LIMITS,
         ))
-        guard_lower, guard_upper = self._dynamic_measured_angle_guard(
-          float(desired_angle),
-          float(apply_angle),
-          float(CS.out.steeringAngleDeg),
+        steer_guard_deg = float(np.interp(
           float(getattr(CS.out, "vEgoRaw", CS.out.vEgo)),
-        )
+          [0.0, 10.0, 20.0, 30.0],
+          [34.0, 42.0, 52.0, 62.0],
+        ))
+        # Keep a measured-angle guard, but widen it with speed so the car can
+        # build angle earlier into sharper corners instead of washing wide.
         apply_angle = float(np.clip(
           apply_angle,
-          guard_lower,
-          guard_upper,
+          float(CS.out.steeringAngleDeg) - steer_guard_deg,
+          float(CS.out.steeringAngleDeg) + steer_guard_deg,
         ))
 
       self.apply_angle_last = float(apply_angle)
