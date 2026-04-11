@@ -857,6 +857,44 @@ class LongController:
     )
 
 
+  def _apply_lead_nibble_hold(
+    self,
+    *,
+    desired_ms: float,
+    current_set_ms: float,
+    v_ego_ms: float,
+    base_target_ms: float,
+  ) -> tuple[float, bool]:
+    desired_ms = float(desired_ms)
+    current_set_ms = float(current_set_ms)
+    v_ego_ms = float(v_ego_ms)
+    base_target_ms = float(base_target_ms)
+
+    if not self._lead_follow_hold_needed(base_target_ms=base_target_ms, v_ego_ms=v_ego_ms):
+      return desired_ms, False
+    if (not self._lead_present) or float(self._lead_drel) <= 0.0:
+      return desired_ms, False
+    if abs(float(self._lead_yrel)) >= float(self._LEAD_OFFLANE_YREL_M):
+      return desired_ms, False
+    if self._lead_is_opening_clear(base_target_ms=base_target_ms, v_ego_ms=v_ego_ms):
+      return desired_ms, False
+    if float(self._lead_vrel) <= float(self._LEAD_NIBBLE_HOLD_MIN_VREL_MS):
+      return desired_ms, False
+    if float(self._lead_drel) < float(self._LEAD_NIBBLE_HOLD_MIN_DREL_M):
+      return desired_ms, False
+    if float(self._lp_a_target) <= float(self._LEAD_NIBBLE_HOLD_MAX_ATARGET_MS2):
+      return desired_ms, False
+
+    hold_ref_ms = min(base_target_ms, max(current_set_ms, v_ego_ms))
+    drop_ms = float(hold_ref_ms) - float(desired_ms)
+    if drop_ms <= 0.0:
+      return desired_ms, False
+    if drop_ms > float(self._LEAD_NIBBLE_HOLD_MAX_DROP_MS):
+      return desired_ms, False
+
+    return float(hold_ref_ms), True
+
+
 
   def _lp_queue_fallback_active(self, *, now_ms: int, base_target_ms: float, planner_ms: float, v_ego_ms: float) -> bool:
     if bool(self._lead_present):
