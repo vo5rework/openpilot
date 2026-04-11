@@ -2,12 +2,12 @@
 """
 Human-tuned stock cruise syncing for XNOR.
 
-This keeps the stable owner split and the no-lead curve behavior, but softens
-the lead-release side so recovery starts sooner once a lead is clearly opening:
+This keeps the stable owner split and the no-lead curve behavior, while
+making lead-follow recovery smoother and less sticky:
 
 - lead-following still stays on the planner tail while a lead is constraining
-- lead-hold persistence is shorter after the lead starts to clear
-- opening leads with a healthy gap stop owning the target earlier
+- opening / non-constraining leads stop capping the target too aggressively
+- small follow-speed oscillations no longer latch extra far-queue protection
 - no-lead curve control remains planner-first, with mapd only helping release
 
 XNOR architecture adaptations retained:
@@ -45,11 +45,6 @@ class LongDecision:
 class LongController:
   MIN_CRUISE_SPEED_MS = 17.1 * CV.MPH_TO_MS
   _ROADWORKS_CAP_FILE = "/data/xnor_roadworks_speed_cap_kph.txt"
-  _LEAD_FAR_QUEUE_MAX_DIST_M = 140.0
-  _LEAD_FAR_QUEUE_MIN_CLOSING_VREL_MS = -2.2
-  _LEAD_FAR_QUEUE_MAX_TTC_S = 7.0
-  _LEAD_FAR_QUEUE_MAX_LEAD_SPEED_MS = 12.0 * CV.MPH_TO_MS
-  _LEAD_FAR_QUEUE_MIN_BASE_DELTA_MS = 2.0 * CV.MPH_TO_MS
   _LEAD_NIBBLE_HOLD_MAX_DROP_MS = 2.4 * CV.MPH_TO_MS
   _LEAD_NIBBLE_HOLD_MIN_DREL_M = 32.0
   _LEAD_NIBBLE_HOLD_MIN_VREL_MS = -1.35
@@ -121,11 +116,6 @@ class LongController:
   _WEAK_LEAD_OWNER_VREL_MS = -0.35
   _WEAK_LEAD_OWNER_ATARGET_MS2 = -0.35
   _WEAK_LEAD_OWNER_TIME_GAP_S = 2.2
-  _PLANNER_OWNER_RELEASE_PERSIST_MS = 240
-  _PLANNER_OWNER_RELEASE_LOW_SPEED_MAX_MS = 35.0 * CV.MPH_TO_MS
-  _PLANNER_OWNER_RELEASE_MIN_GAP_M = 9.0
-  _PLANNER_OWNER_RELEASE_VREL_MS = 0.10
-  _PLANNER_OWNER_RELEASE_ATARGET_MS2 = -0.35
 
   def __init__(self) -> None:
     self.acc = ACCController()
@@ -168,7 +158,6 @@ class LongController:
     self._lead_last_vrel: float = 0.0
     self._lead_last_yrel: float = 0.0
     self._curve_recent_clear_until_ms: int = 0
-    self._planner_owner_release_candidate_since_ms: int = 0
 
   def _rate_log(self, msg: str) -> None:
     now = _mono_ms()
@@ -847,53 +836,25 @@ class LongController:
     non_opening_near = near_lead and float(self._lead_vrel) <= float(self._LEAD_OPENING_VREL_MS)
     return bool(lead_slower_than_base and (closing or non_opening_near))
 
-  def _lead_far_queue_approach_active(self, *, base_target_ms: float, v_ego_ms: float) -> bool:
+
+  def _lead_follow_hold_needed(self, *, base_target_ms: float, v_ego_ms: float) -> bool:
     if (not self._lead_present) or float(self._lead_drel) <= 0.0:
       return False
     if abs(float(self._lead_yrel)) >= float(self._LEAD_OFFLANE_YREL_M):
       return False
     if self._lead_is_opening_clear(base_target_ms=float(base_target_ms), v_ego_ms=float(v_ego_ms)):
       return False
+    if self._lead_is_constraining(base_target_ms=float(base_target_ms), v_ego_ms=float(v_ego_ms)):
+      return True
 
-    lead_speed_ms = max(0.0, float(v_ego_ms) + float(self._lead_vrel))
-    if lead_speed_ms >= (float(base_target_ms) - float(self._LEAD_FAR_QUEUE_MIN_BASE_DELTA_MS)):
-      return False
-    if float(self._lead_vrel) > float(self._LEAD_FAR_QUEUE_MIN_CLOSING_VREL_MS):
-      return False
-
-    max_dist_m = min(float(self._LEAD_FAR_QUEUE_MAX_DIST_M), max(55.0, float(v_ego_ms) * 4.2))
-    if float(self._lead_drel) > float(max_dist_m):
-      return False
-
-    ttc_s = 999.0
-    if float(self._lead_vrel) < -0.1:
-      ttc_s = float(self._lead_drel) / max(-float(self._lead_vrel), 0.1)
-
-    return bool(
-      float(lead_speed_ms) <= float(self._LEAD_FAR_QUEUE_MAX_LEAD_SPEED_MS)
-      or float(ttc_s) <= float(self._LEAD_FAR_QUEUE_MAX_TTC_S)
+    close_gap_limit_m = min(
+      34.0,
+      max(16.0, float(v_ego_ms) * 1.15),
     )
-
-  def _apply_lead_nibble_hold(self, *, desired_ms: float, current_set_ms: float, v_ego_ms: float) -> tuple[float, bool]:
-    if (not self._lead_present) or float(desired_ms) <= 0.1 or float(current_set_ms) <= 0.1:
-      return float(desired_ms), False
-    if float(desired_ms) >= float(current_set_ms):
-      return float(desired_ms), False
-
-    drop_ms = float(current_set_ms) - float(desired_ms)
-    if float(drop_ms) > float(self._LEAD_NIBBLE_HOLD_MAX_DROP_MS):
-      return float(desired_ms), False
-
-    min_gap_m = max(float(self._LEAD_NIBBLE_HOLD_MIN_DREL_M), float(v_ego_ms) * 1.2)
-    if float(self._lead_drel) <= float(min_gap_m):
-      return float(desired_ms), False
-    if float(self._lead_vrel) <= float(self._LEAD_NIBBLE_HOLD_MIN_VREL_MS):
-      return float(desired_ms), False
-    if float(self._lp_a_target) <= float(self._LEAD_NIBBLE_HOLD_MAX_ATARGET_MS2):
-      return float(desired_ms), False
-
-    return float(current_set_ms), True
-
+    return bool(
+      float(self._lead_drel) < float(close_gap_limit_m)
+      and float(self._lead_vrel) <= 0.10
+    )
 
 
 
@@ -967,56 +928,6 @@ class LongController:
     if materially_below_clear and (lead_constraining or queue_fallback_active):
       reasons.append("planner_low")
     return reasons
-
-  def _planner_owner_release_reason(self, *, now_ms: int, base_target_ms: float, planner_ms: float, v_ego_ms: float) -> str:
-    if float(planner_ms) <= 0.1:
-      self._planner_owner_release_candidate_since_ms = 0
-      return ""
-
-    lp_source = str(self._lp_source or "").lower()
-    if not lp_source.startswith("lead"):
-      self._planner_owner_release_candidate_since_ms = 0
-      return ""
-
-    if (not self._lead_present) or float(self._lead_drel) <= 0.0:
-      self._planner_owner_release_candidate_since_ms = 0
-      return ""
-
-    materially_below_base = float(planner_ms) < (float(base_target_ms) - float(self._PLANNER_DRAG_MARGIN_MS))
-    if not materially_below_base:
-      self._planner_owner_release_candidate_since_ms = 0
-      return ""
-
-    if self._lead_is_constraining(base_target_ms=float(base_target_ms), v_ego_ms=float(v_ego_ms)):
-      self._planner_owner_release_candidate_since_ms = 0
-      return ""
-
-    offlane_opening = abs(float(self._lead_yrel)) >= float(self._LEAD_OFFLANE_YREL_M)
-    low_speed_opening = bool(
-      float(v_ego_ms) <= float(self._PLANNER_OWNER_RELEASE_LOW_SPEED_MAX_MS)
-      and float(self._lead_drel) >= max(float(self._PLANNER_OWNER_RELEASE_MIN_GAP_M), float(v_ego_ms))
-      and float(self._lead_vrel) >= float(self._PLANNER_OWNER_RELEASE_VREL_MS)
-      and float(self._lp_a_target) >= float(self._PLANNER_OWNER_RELEASE_ATARGET_MS2)
-    )
-
-    reason = ""
-    if offlane_opening:
-      reason = "offlane"
-    elif low_speed_opening:
-      reason = "opening"
-
-    if not reason:
-      self._planner_owner_release_candidate_since_ms = 0
-      return ""
-
-    if int(self._planner_owner_release_candidate_since_ms) == 0:
-      self._planner_owner_release_candidate_since_ms = int(now_ms)
-      return ""
-
-    if (int(now_ms) - int(self._planner_owner_release_candidate_since_ms)) < int(self._PLANNER_OWNER_RELEASE_PERSIST_MS):
-      return ""
-
-    return reason
 
   def update(self, CS, *, enabled: bool, frame: int, now_ms: Optional[int] = None) -> LongDecision:
     now = _mono_ms() if now_ms is None else int(now_ms)
@@ -1108,13 +1019,7 @@ class LongController:
       src = f"speed_limit_target[{ceiling_src}]"
 
       if lp_fresh and self._lp_target_last_ms is not None:
-        planner_owner_release_reason = self._planner_owner_release_reason(
-          now_ms=int(now),
-          base_target_ms=float(base_target_ms),
-          planner_ms=float(planner_last_ms),
-          v_ego_ms=float(v_ego_ms),
-        )
-        suppress_planner_lead_owner = bool(planner_owner_release_reason) or (
+        suppress_planner_lead_owner = (
           self._lead_present
           and self._lead_is_opening_clear(
             base_target_ms=float(base_target_ms),
@@ -1122,8 +1027,6 @@ class LongController:
           )
           and str(self._lp_source or "") in ("cruise", "e2e")
         )
-        if suppress_planner_lead_owner:
-          self._reset_lead_hold()
         drag_reasons = [] if suppress_planner_lead_owner else self._planner_drag_reasons(
           now_ms=int(now),
           base_target_ms=float(base_target_ms),
@@ -1187,31 +1090,21 @@ class LongController:
           self._reset_curve_hold()
           self._reset_lead_hold()
 
-        if planner_owner_release_reason:
-          src = f"{src}+planner_owner_release[{planner_owner_release_reason}]"
-
-        if self._lead_present and (not self._lead_is_opening_clear(
+        if self._lead_follow_hold_needed(
           base_target_ms=float(base_target_ms),
           v_ego_ms=float(v_ego_ms),
-        )):
+        ):
           lead_hold_cap_ms = max(float(current_set_ms), float(v_ego_ms))
           if float(desired_ms) > (float(lead_hold_cap_ms) + (0.25 * CV.MPH_TO_MS)):
             desired_ms = float(lead_hold_cap_ms)
             src = f"{src}+lead_present_hold"
 
-        if self._lead_far_queue_approach_active(
-          base_target_ms=float(base_target_ms),
-          v_ego_ms=float(v_ego_ms),
-        ):
-          far_hold_ms = max(float(current_set_ms), float(v_ego_ms))
-          if float(desired_ms) > (float(far_hold_ms) + (0.25 * CV.MPH_TO_MS)):
-            desired_ms = float(far_hold_ms)
-            src = f"{src}+lead_far_queue_hold"
 
         desired_ms, lead_nibble_held = self._apply_lead_nibble_hold(
           desired_ms=float(desired_ms),
           current_set_ms=float(current_set_ms),
           v_ego_ms=float(v_ego_ms),
+          base_target_ms=float(base_target_ms),
         )
         if lead_nibble_held:
           src = f"{src}+lead_nibble_hold"
@@ -1231,13 +1124,7 @@ class LongController:
         src = f"{src}+roadworks_cap"
 
       if lp_fresh:
-        planner_owner_release_reason = self._planner_owner_release_reason(
-          now_ms=int(now),
-          base_target_ms=float(resume_ceiling_ms),
-          planner_ms=float(planner_last_ms),
-          v_ego_ms=float(v_ego_ms),
-        )
-        suppress_planner_lead_owner = bool(planner_owner_release_reason) or (
+        suppress_planner_lead_owner = (
           self._lead_present
           and self._lead_is_opening_clear(
             base_target_ms=float(resume_ceiling_ms),
@@ -1245,8 +1132,6 @@ class LongController:
           )
           and str(self._lp_source or "") in ("cruise", "e2e")
         )
-        if suppress_planner_lead_owner:
-          self._reset_lead_hold()
         drag_reasons = [] if suppress_planner_lead_owner else self._planner_drag_reasons(
           now_ms=int(now),
           base_target_ms=float(resume_ceiling_ms),
@@ -1373,9 +1258,6 @@ class LongController:
             desired_ms = float(current_set_ms if current_set_ms > 0.1 else resume_ceiling_ms)
             src = "hold+current_set+lead_present"
 
-        if planner_owner_release_reason:
-          src = f"{src}+planner_owner_release[{planner_owner_release_reason}]"
-
         if self._lead_present and self._lead_is_constraining(
           base_target_ms=float(resume_ceiling_ms),
           v_ego_ms=float(v_ego_ms),
@@ -1388,28 +1270,21 @@ class LongController:
             desired_ms = float(constrain_target_ms)
             src = f"{src}+lead_constrain"
 
-        if self._lead_present and (not self._lead_is_opening_clear(
+        if self._lead_follow_hold_needed(
           base_target_ms=float(resume_ceiling_ms),
           v_ego_ms=float(v_ego_ms),
-        )):
+        ):
           lead_hold_cap_ms = max(float(current_set_ms), float(v_ego_ms))
           if float(desired_ms) > (float(lead_hold_cap_ms) + (0.25 * CV.MPH_TO_MS)):
             desired_ms = float(lead_hold_cap_ms)
             src = f"{src}+lead_present_hold"
 
-        if self._lead_far_queue_approach_active(
-          base_target_ms=float(resume_ceiling_ms),
-          v_ego_ms=float(v_ego_ms),
-        ):
-          far_hold_ms = max(float(current_set_ms), float(v_ego_ms))
-          if float(desired_ms) > (float(far_hold_ms) + (0.25 * CV.MPH_TO_MS)):
-            desired_ms = float(far_hold_ms)
-            src = f"{src}+lead_far_queue_hold"
 
         desired_ms, lead_nibble_held = self._apply_lead_nibble_hold(
           desired_ms=float(desired_ms),
           current_set_ms=float(current_set_ms),
           v_ego_ms=float(v_ego_ms),
+          base_target_ms=float(base_target_ms),
         )
         if lead_nibble_held:
           src = f"{src}+lead_nibble_hold"

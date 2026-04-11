@@ -9,9 +9,9 @@ This keeps the Unity-style owner split:
 - A manual stalk-down latches a temporary lower hold until the driver manually raises again.
 
 The acceleration side is tuned to feel more natural:
-- larger clear-road jumps begin with one or two 5-step RES pulses
-- recovery then tapers into 1-step RES pulses for a smoother finish
-- cadence stays slower just after a lead clears so recovery does not feel jerky
+- clear-road jumps may still begin with 5-step RES pulses
+- active lead-following sticks to 1-step RES pulses for smoother spacing
+- cadence stays calmer while a lead is still present to reduce hunting
 """
 
 from __future__ import annotations
@@ -312,13 +312,6 @@ class ACCController:
 
     if bool(self._last_lead_status) and not lead_present:
       self._lead_cleared_time_ms = int(now_ms)
-    elif lead_present:
-      # Treat a clearly opening, now-healthy lead as effectively cleared for the
-      # resume cadence logic so recovery can begin smoothly without feeling sticky.
-      opening_gap = float(lead.v_rel) > 0.5
-      healthy_gap = float(lead.d_rel) > 35.0
-      if opening_gap and healthy_gap:
-        self._lead_cleared_time_ms = int(now_ms)
 
     self._last_lead_status = lead_present
 
@@ -339,6 +332,9 @@ class ACCController:
     available_speed_kph: float,
     lead: LeadInfo,
   ) -> int:
+    if bool(lead.status):
+      return int(self._AUTO_COOLDOWN_ACCEL_BASE_MS)
+
     if self._lead_blocks_fast_accel(lead=lead):
       return int(self._AUTO_COOLDOWN_ACCEL_SLOW_MS)
 
@@ -383,7 +379,8 @@ class ACCController:
     single_available_threshold_kph = max(0.35 * float(half_kph), 0.3)
     full_available_threshold_kph = max(0.60 * float(full_kph), 2.0)
     recent_lead_clear = (int(now_ms) - int(self._lead_cleared_time_ms)) <= int(self._ACCEL_AFTER_LEAD_CLEAR_SETTLE_MS)
-    burst_blocked = self._lead_blocks_fast_accel(lead=lead)
+    active_lead_follow = bool(lead.status)
+    burst_blocked = active_lead_follow or self._lead_blocks_fast_accel(lead=lead)
 
     if burst_blocked or recent_lead_clear:
       self._reset_accel_burst()
@@ -415,9 +412,10 @@ class ACCController:
       lead=lead,
     )
     accel_ready = self._no_automated_action_for(now_ms=now_ms, milliseconds=accel_cooldown_ms)
+    lead_single_threshold_kph = max(float(single_threshold_kph), 0.7)
     if (
       accel_ready
-      and float(speed_offset_kph) >= float(single_threshold_kph)
+      and float(speed_offset_kph) >= (float(lead_single_threshold_kph) if active_lead_follow else float(single_threshold_kph))
       and float(available_speed_kph) >= float(single_available_threshold_kph)
     ):
       return int(CruiseButtons.RES_ACCEL)
