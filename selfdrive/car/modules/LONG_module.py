@@ -1443,7 +1443,7 @@ class LongController:
           desired_ms=float(desired_ms),
           current_set_ms=float(current_set_ms),
           v_ego_ms=float(v_ego_ms),
-          base_target_ms=float(base_target_ms),
+          base_target_ms=float(resume_ceiling_ms),
         )
         if lead_nibble_held:
           src = f"{src}+lead_nibble_hold"
