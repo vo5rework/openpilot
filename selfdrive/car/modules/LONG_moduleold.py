@@ -101,15 +101,6 @@ class LongController:
   _PLANNER_ONLY_REENTRY_BLOCK_DROP_MS = 3.0 * CV.MPH_TO_MS
   _PLANNER_ONLY_REENTRY_ALLOW_STEER_DEG = 3.0
   _PLANNER_CURVE_ENTRY_MARGIN_MS = 1.0 * CV.MPH_TO_MS
-  _CURVE_LIMIT_GUARD_ENTRY_STEER_DEG = 6.0
-  _CURVE_LIMIT_GUARD_FULL_STEER_DEG = 10.0
-  _CURVE_LIMIT_GUARD_MIN_SPEED_MS = 32.0 * CV.MPH_TO_MS
-  _CURVE_LIMIT_GUARD_ENTRY_PERSIST_MS = 240
-  _CURVE_LIMIT_GUARD_RELEASE_PERSIST_MS = 420
-  _CURVE_LIMIT_GUARD_ACTIVATION_DROP_MS = 2.0 * CV.MPH_TO_MS
-  _CURVE_LIMIT_GUARD_VEGO_MARGIN_MS = 0.6 * CV.MPH_TO_MS
-  _CURVE_LIMIT_GUARD_MIN_DROP_MS = 1.0 * CV.MPH_TO_MS
-  _CURVE_LIMIT_GUARD_MAX_DROP_MS = 3.5 * CV.MPH_TO_MS
   _MAPD_LOW_SPEED_ENTRY_SPEED_MS = 45.0 * CV.MPH_TO_MS
   _MAPD_LOW_SPEED_SHARP_DROP_MS = 3.0 * CV.MPH_TO_MS
   _MAPD_LOW_SPEED_PLANNER_HINT_DROP_MS = 0.4 * CV.MPH_TO_MS
@@ -167,9 +158,6 @@ class LongController:
     self._lead_last_vrel: float = 0.0
     self._lead_last_yrel: float = 0.0
     self._curve_recent_clear_until_ms: int = 0
-    self._curve_limit_guard_candidate_since_ms: int = 0
-    self._curve_limit_guard_release_candidate_since_ms: int = 0
-    self._curve_limit_guard_active: bool = False
 
   def _rate_log(self, msg: str) -> None:
     now = _mono_ms()
@@ -712,84 +700,6 @@ class LongController:
 
     return float(desired_ms), "curve_hold"
 
-
-  @staticmethod
-  def _interp_clipped(x: float, xp: list[float], fp: list[float]) -> float:
-    if not xp or not fp or len(xp) != len(fp):
-      return float(x)
-    if x <= xp[0]:
-      return float(fp[0])
-    if x >= xp[-1]:
-      return float(fp[-1])
-    for i in range(1, len(xp)):
-      if x <= xp[i]:
-        x0 = float(xp[i - 1])
-        x1 = float(xp[i])
-        y0 = float(fp[i - 1])
-        y1 = float(fp[i])
-        if x1 <= x0:
-          return float(y1)
-        ratio = (float(x) - x0) / (x1 - x0)
-        return float(y0 + ratio * (y1 - y0))
-    return float(fp[-1])
-
-  def _apply_curve_limit_guard(
-    self,
-    *,
-    now_ms: int,
-    current_angle_deg: float,
-    curve_target_ms: float,
-    reference_ms: float,
-    v_ego_ms: float,
-    no_lead: bool,
-  ) -> tuple[float, bool]:
-    eligible = (
-      bool(no_lead)
-      and float(v_ego_ms) >= float(self._CURVE_LIMIT_GUARD_MIN_SPEED_MS)
-      and float(current_angle_deg) >= float(self._CURVE_LIMIT_GUARD_ENTRY_STEER_DEG)
-      and float(curve_target_ms) < (float(reference_ms) - float(self._CURVE_LIMIT_GUARD_ACTIVATION_DROP_MS))
-      and float(v_ego_ms) > (float(curve_target_ms) + float(self._CURVE_LIMIT_GUARD_VEGO_MARGIN_MS))
-    )
-
-    if eligible:
-      self._curve_limit_guard_release_candidate_since_ms = 0
-      if not self._curve_limit_guard_active:
-        if int(self._curve_limit_guard_candidate_since_ms) <= 0:
-          self._curve_limit_guard_candidate_since_ms = int(now_ms)
-        elif (int(now_ms) - int(self._curve_limit_guard_candidate_since_ms)) >= int(self._CURVE_LIMIT_GUARD_ENTRY_PERSIST_MS):
-          self._curve_limit_guard_active = True
-      else:
-        self._curve_limit_guard_candidate_since_ms = int(now_ms)
-    else:
-      self._curve_limit_guard_candidate_since_ms = 0
-      if self._curve_limit_guard_active:
-        if int(self._curve_limit_guard_release_candidate_since_ms) <= 0:
-          self._curve_limit_guard_release_candidate_since_ms = int(now_ms)
-        elif (int(now_ms) - int(self._curve_limit_guard_release_candidate_since_ms)) >= int(self._CURVE_LIMIT_GUARD_RELEASE_PERSIST_MS):
-          self._curve_limit_guard_active = False
-          self._curve_limit_guard_release_candidate_since_ms = 0
-      else:
-        self._curve_limit_guard_release_candidate_since_ms = 0
-
-    if not self._curve_limit_guard_active:
-      return float(curve_target_ms), False
-
-    extra_drop_ms = self._interp_clipped(
-      float(current_angle_deg),
-      [
-        float(self._CURVE_LIMIT_GUARD_ENTRY_STEER_DEG),
-        8.0,
-        float(self._CURVE_LIMIT_GUARD_FULL_STEER_DEG),
-      ],
-      [
-        float(self._CURVE_LIMIT_GUARD_MIN_DROP_MS),
-        2.0 * CV.MPH_TO_MS,
-        float(self._CURVE_LIMIT_GUARD_MAX_DROP_MS),
-      ],
-    )
-    guarded_target_ms = max(float(self.MIN_CRUISE_SPEED_MS), float(curve_target_ms) - float(extra_drop_ms))
-    return float(guarded_target_ms), True
-
   def _poll_plan_and_lead(self, *, now_ns: int) -> None:
     prev_lead_present = bool(self._lead_present_prev)
     try:
@@ -1072,12 +982,6 @@ class LongController:
       self._last_lp_seen_ns = 0
       self._reset_curve_hold()
       self._reset_lead_hold()
-      self._curve_limit_guard_active = False
-      self._curve_limit_guard_candidate_since_ms = 0
-      self._curve_limit_guard_release_candidate_since_ms = 0
-      self._curve_limit_guard_active = False
-      self._curve_limit_guard_candidate_since_ms = 0
-      self._curve_limit_guard_release_candidate_since_ms = 0
       return LongDecision(None, "gated: not enabled/adaptive")
 
     stock_state = str(getattr(CS, "stock_cruise_state", "") or "")
@@ -1085,9 +989,6 @@ class LongController:
       self._last_active = False
       self._reset_curve_hold()
       self._reset_lead_hold()
-      self._curve_limit_guard_active = False
-      self._curve_limit_guard_candidate_since_ms = 0
-      self._curve_limit_guard_release_candidate_since_ms = 0
       return LongDecision(None, f"gated: stock_state={stock_state or 'UNKNOWN'}")
 
     if not self._last_active:
@@ -1218,17 +1119,6 @@ class LongController:
                 raw_target_ms=float(mapd_target_ms),
                 reference_ms=float(reference_ms),
               )
-              current_angle_deg = abs(float(getattr(cs_out, "steeringAngleDeg", 0.0) or 0.0))
-              curve_target_ms, curve_limit_guard = self._apply_curve_limit_guard(
-                now_ms=int(now),
-                current_angle_deg=float(current_angle_deg),
-                curve_target_ms=float(curve_target_ms),
-                reference_ms=float(reference_ms),
-                v_ego_ms=float(v_ego_ms),
-                no_lead=True,
-              )
-              if curve_limit_guard:
-                curve_state = f"{curve_state}+curve_limit_guard"
               if float(curve_target_ms) < float(base_target_ms):
                 desired_ms = min(float(base_target_ms), float(curve_target_ms))
                 src = f"{src}+{curve_state}[mapd]"
@@ -1388,17 +1278,6 @@ class LongController:
             curve_target_ms = float(resume_ceiling_ms)
             curve_state = "curve_clear(snap)"
 
-          curve_target_ms, curve_limit_guard = self._apply_curve_limit_guard(
-            now_ms=int(now),
-            current_angle_deg=float(current_angle_deg),
-            curve_target_ms=float(curve_target_ms),
-            reference_ms=float(resume_ceiling_ms),
-            v_ego_ms=float(v_ego_ms),
-            no_lead=True,
-          )
-          if curve_limit_guard:
-            curve_state = f"{curve_state}+curve_limit_guard"
-
           desired_ms = min(float(resume_ceiling_ms), float(curve_target_ms))
           src = f"lp_near[{curve_state}]"
         else:
@@ -1462,10 +1341,6 @@ class LongController:
         src = f"{src}+stale_lead"
 
     no_lead_curve_context = (not self._lead_present) and (not self._lp_has_lead)
-    if not no_lead_curve_context:
-      self._curve_limit_guard_active = False
-      self._curve_limit_guard_candidate_since_ms = 0
-      self._curve_limit_guard_release_candidate_since_ms = 0
     if self._should_hold_min_cruise_for_curve(
       now_ns=now_ns,
       desired_ms=float(desired_ms),
