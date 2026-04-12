@@ -71,9 +71,6 @@ class ACCController:
   _MANUAL_CONFIRM_WINDOW_MS = 1500
   _MANUAL_PENDING_TIMEOUT_MS = 1800
   _MANUAL_LATCH_SUPPRESS_AFTER_AUTO_DECEL_MS = 2600
-  _LEAD_FOLLOW_SOFT_DEADBAND_MPH = 1.0
-  _LEAD_FOLLOW_PERSIST_BAND_MPH = 2.0
-  _LEAD_FOLLOW_PERSIST_MS = 900
 
 
   def __init__(self) -> None:
@@ -104,8 +101,6 @@ class ACCController:
     self._manual_raise_pending_time_ms = 0
     self._clear_road_ceiling_kph = 0.0
     self._last_current_set_speed_kph = 0.0
-    self._lead_follow_offset_sign = 0
-    self._lead_follow_offset_since_ms = 0
 
     self._radar_sm = messaging.SubMaster(["radarState"])
 
@@ -427,46 +422,6 @@ class ACCController:
 
     return None
 
-
-  def _reset_lead_follow_deadband(self) -> None:
-    self._lead_follow_offset_sign = 0
-    self._lead_follow_offset_since_ms = 0
-
-  def _lead_follow_effective_speed_offset_kph(
-    self,
-    *,
-    now_ms: int,
-    speed_units: str,
-    speed_offset_kph: float,
-    lead: LeadInfo,
-  ) -> float:
-    if not bool(lead.status):
-      self._reset_lead_follow_deadband()
-      return float(speed_offset_kph)
-
-    half_kph, _ = _cc_units_kph(speed_units)
-    soft_deadband_kph = max(float(self._LEAD_FOLLOW_SOFT_DEADBAND_MPH) * CV.MPH_TO_KPH, 0.95 * float(half_kph))
-    persist_band_kph = max(float(self._LEAD_FOLLOW_PERSIST_BAND_MPH) * CV.MPH_TO_KPH, 1.8 * float(half_kph))
-
-    offset_kph = float(speed_offset_kph)
-    abs_offset_kph = abs(offset_kph)
-    sign = 1 if offset_kph > 0.0 else (-1 if offset_kph < 0.0 else 0)
-
-    if sign == 0 or abs_offset_kph < soft_deadband_kph:
-      self._reset_lead_follow_deadband()
-      return 0.0
-
-    if sign != int(self._lead_follow_offset_sign):
-      self._lead_follow_offset_sign = int(sign)
-      self._lead_follow_offset_since_ms = int(now_ms)
-
-    if abs_offset_kph < persist_band_kph:
-      age_ms = int(now_ms) - int(self._lead_follow_offset_since_ms)
-      if age_ms < int(self._LEAD_FOLLOW_PERSIST_MS):
-        return 0.0
-
-    return offset_kph
-
   def _fast_decel_required(self, *, v_ego_ms: float, lead: LeadInfo) -> bool:
     if not lead.status or lead.d_rel <= 0.0:
       return False
@@ -734,13 +689,7 @@ class ACCController:
     if self._manual_lower_hold_active and not self._manual_hold_restore_requested:
       effective_target_kph = min(float(effective_target_kph), float(self.acc_speed_kph))
 
-    raw_speed_offset_kph = float(effective_target_kph) - float(current_kph)
-    speed_offset_kph = self._lead_follow_effective_speed_offset_kph(
-      now_ms=now_ms,
-      speed_units=speed_units,
-      speed_offset_kph=float(raw_speed_offset_kph),
-      lead=lead,
-    )
+    speed_offset_kph = float(effective_target_kph) - float(current_kph)
     desired_headroom_kph = max(float(self.acc_speed_kph), float(effective_target_kph)) - float(current_kph)
     available_speed_kph = max(0.0, float(desired_headroom_kph))
 
