@@ -110,6 +110,8 @@ class LongController:
   _CURVE_LIMIT_GUARD_VEGO_MARGIN_MS = 0.15 * CV.MPH_TO_MS
   _CURVE_LIMIT_GUARD_MIN_DROP_MS = 1.5 * CV.MPH_TO_MS
   _CURVE_LIMIT_GUARD_MAX_DROP_MS = 5.5 * CV.MPH_TO_MS
+  _CONTROLS_STATE_FRESH_NS = 500_000_000
+  _CURVE_LIMIT_GUARD_FALLBACK_STEER_DEG = 7.5
   _MAPD_LOW_SPEED_ENTRY_SPEED_MS = 45.0 * CV.MPH_TO_MS
   _MAPD_LOW_SPEED_SHARP_DROP_MS = 3.0 * CV.MPH_TO_MS
   _MAPD_LOW_SPEED_PLANNER_HINT_DROP_MS = 0.4 * CV.MPH_TO_MS
@@ -128,7 +130,7 @@ class LongController:
 
   def __init__(self) -> None:
     self.acc = ACCController()
-    self._sm = messaging.SubMaster(["longitudinalPlan", "radarState", "mapdOut"])
+    self._sm = messaging.SubMaster(["longitudinalPlan", "radarState", "mapdOut", "controlsState"])
 
     self._lp_target_last_ms: Optional[float] = None
     self._lp_target_near_ms: Optional[float] = None
@@ -170,6 +172,10 @@ class LongController:
     self._curve_limit_guard_candidate_since_ms: int = 0
     self._curve_limit_guard_release_candidate_since_ms: int = 0
     self._curve_limit_guard_active: bool = False
+    self._controls_state_last_ns: int = 0
+    self._lat_limit_saturated: bool = False
+    self._lat_limit_severity: float = 0.0
+    self._lat_limit_source: str = ""
 
   def _rate_log(self, msg: str) -> None:
     now = _mono_ms()
@@ -177,6 +183,52 @@ class LongController:
       return
     self._last_info_log_ms = int(now)
     cloudlog.info(msg)
+
+
+  @staticmethod
+  def _safe_finite_float(value: object, default: float = 0.0) -> float:
+    try:
+      out = float(value if value is not None else default)
+    except Exception:
+      return float(default)
+    if not math.isfinite(out):
+      return float(default)
+    return float(out)
+
+  def _controls_state_is_fresh(self, *, now_ns: int) -> bool:
+    try:
+      controls_mono_ns = int(self._sm.logMonoTime.get("controlsState", 0) or 0)
+    except Exception:
+      controls_mono_ns = 0
+    if controls_mono_ns <= 0:
+      return False
+    self._controls_state_last_ns = int(controls_mono_ns)
+    try:
+      controls_valid = bool(self._sm.valid.get("controlsState", False))
+    except Exception:
+      controls_valid = False
+    if not controls_valid:
+      return False
+    age_ns = int(now_ns) - int(controls_mono_ns)
+    return 0 <= age_ns < int(self._CONTROLS_STATE_FRESH_NS)
+
+  def _refresh_lateral_limit_state(self, *, now_ns: int) -> None:
+    self._lat_limit_saturated = False
+    self._lat_limit_severity = 0.0
+    self._lat_limit_source = ""
+    if not self._controls_state_is_fresh(now_ns=int(now_ns)):
+      return
+    try:
+      controls_state = self._sm["controlsState"]
+    except Exception:
+      return
+    try:
+      lat_saturated, lat_severity, lat_source = self._extract_lateral_limit_signal(controls_state)
+    except Exception:
+      return
+    self._lat_limit_saturated = bool(lat_saturated)
+    self._lat_limit_severity = max(0.0, self._safe_finite_float(lat_severity, 0.0))
+    self._lat_limit_source = str(lat_source or "")
 
   @staticmethod
   def _extract_plan_speed_last(lp) -> Optional[float]:
@@ -733,6 +785,73 @@ class LongController:
         return float(y0 + ratio * (y1 - y0))
     return float(fp[-1])
 
+  def _extract_lateral_limit_signal(self, controls_state) -> tuple[bool, float, str]:
+    try:
+      lateral = getattr(controls_state, "lateralControlState", None)
+    except Exception:
+      lateral = None
+    if lateral is None:
+      return False, 0.0, ""
+
+    try:
+      active_name = str(lateral.which() or "")
+    except Exception:
+      active_name = ""
+
+    def _maybe_state(name: str):
+      try:
+        state = getattr(lateral, name)
+      except Exception:
+        return None
+      if state is None:
+        return None
+      try:
+        active = bool(getattr(state, "active", False))
+      except Exception:
+        active = False
+      try:
+        saturated = bool(getattr(state, "saturated", False))
+      except Exception:
+        saturated = False
+      active_match = bool(active_name and (active_name == name))
+      if not (active_match or active or saturated):
+        return None
+      return state
+
+    state = _maybe_state("torqueState")
+    if state is not None:
+      desired_lat_accel = self._safe_finite_float(getattr(state, "desiredLateralAccel", 0.0), 0.0)
+      actual_lat_accel = self._safe_finite_float(getattr(state, "actualLateralAccel", 0.0), 0.0)
+      severity = max(0.0, abs(desired_lat_accel) - abs(actual_lat_accel))
+      try:
+        saturated = bool(getattr(state, "saturated", False))
+      except Exception:
+        saturated = False
+      return saturated, float(severity), "torque"
+
+    for name in ("angleState", "pidState"):
+      state = _maybe_state(name)
+      if state is None:
+        continue
+      desired_angle = self._safe_finite_float(getattr(state, "steeringAngleDesiredDeg", 0.0), 0.0)
+      actual_angle = self._safe_finite_float(getattr(state, "steeringAngleDeg", 0.0), 0.0)
+      severity = abs(desired_angle - actual_angle)
+      try:
+        saturated = bool(getattr(state, "saturated", False))
+      except Exception:
+        saturated = False
+      return saturated, float(severity), name.replace("State", "")
+
+    state = _maybe_state("debugState")
+    if state is not None:
+      try:
+        saturated = bool(getattr(state, "saturated", False))
+      except Exception:
+        saturated = False
+      return saturated, 1.0, "debug"
+
+    return False, 0.0, ""
+
   def _apply_curve_limit_guard(
     self,
     *,
@@ -742,13 +861,23 @@ class LongController:
     reference_ms: float,
     v_ego_ms: float,
     no_lead: bool,
-  ) -> tuple[float, bool]:
+  ) -> tuple[float, bool, str]:
+    curve_target_ms = self._safe_finite_float(curve_target_ms, 0.0)
+    reference_ms = self._safe_finite_float(reference_ms, curve_target_ms)
+    v_ego_ms = self._safe_finite_float(v_ego_ms, 0.0)
+    current_angle_deg = abs(self._safe_finite_float(current_angle_deg, 0.0))
+    try:
+      controls_fresh = self._controls_state_is_fresh(now_ns=int(now_ms) * 1_000_000)
+    except Exception:
+      controls_fresh = False
+    real_limit_trigger = bool(controls_fresh and bool(self._lat_limit_saturated))
+    fallback_trigger = bool((not controls_fresh) and current_angle_deg >= float(self._CURVE_LIMIT_GUARD_FALLBACK_STEER_DEG))
     eligible = (
       bool(no_lead)
-      and float(v_ego_ms) >= float(self._CURVE_LIMIT_GUARD_MIN_SPEED_MS)
-      and float(current_angle_deg) >= float(self._CURVE_LIMIT_GUARD_ENTRY_STEER_DEG)
-      and float(curve_target_ms) < (float(reference_ms) - float(self._CURVE_LIMIT_GUARD_ACTIVATION_DROP_MS))
-      and float(v_ego_ms) > (float(curve_target_ms) + float(self._CURVE_LIMIT_GUARD_VEGO_MARGIN_MS))
+      and v_ego_ms >= float(self._CURVE_LIMIT_GUARD_MIN_SPEED_MS)
+      and curve_target_ms < (reference_ms - float(self._CURVE_LIMIT_GUARD_ACTIVATION_DROP_MS))
+      and v_ego_ms > (curve_target_ms + float(self._CURVE_LIMIT_GUARD_VEGO_MARGIN_MS))
+      and (real_limit_trigger or fallback_trigger)
     )
 
     if eligible:
@@ -772,23 +901,53 @@ class LongController:
         self._curve_limit_guard_release_candidate_since_ms = 0
 
     if not self._curve_limit_guard_active:
-      return float(curve_target_ms), False
+      return float(curve_target_ms), False, ""
 
-    extra_drop_ms = self._interp_clipped(
-      float(current_angle_deg),
-      [
-        float(self._CURVE_LIMIT_GUARD_ENTRY_STEER_DEG),
-        7.0,
-        float(self._CURVE_LIMIT_GUARD_FULL_STEER_DEG),
-      ],
-      [
-        float(self._CURVE_LIMIT_GUARD_MIN_DROP_MS),
-        3.2 * CV.MPH_TO_MS,
-        float(self._CURVE_LIMIT_GUARD_MAX_DROP_MS),
-      ],
-    )
+    guard_reason = "steer_proxy"
+    if real_limit_trigger:
+      guard_reason = f"lat_sat[{self._lat_limit_source or 'unknown'}]"
+      severity = float(self._lat_limit_severity)
+      if str(self._lat_limit_source or "") == "torque":
+        extra_drop_ms = self._interp_clipped(
+          float(severity),
+          [0.10, 0.35, 0.70, 1.20],
+          [
+            float(self._CURVE_LIMIT_GUARD_MIN_DROP_MS),
+            3.0 * CV.MPH_TO_MS,
+            4.5 * CV.MPH_TO_MS,
+            float(self._CURVE_LIMIT_GUARD_MAX_DROP_MS),
+          ],
+        )
+      elif str(self._lat_limit_source or "") in ("angle", "pid"):
+        extra_drop_ms = self._interp_clipped(
+          float(severity),
+          [0.8, 2.0, 4.0, 6.0],
+          [
+            float(self._CURVE_LIMIT_GUARD_MIN_DROP_MS),
+            3.0 * CV.MPH_TO_MS,
+            4.5 * CV.MPH_TO_MS,
+            float(self._CURVE_LIMIT_GUARD_MAX_DROP_MS),
+          ],
+        )
+      else:
+        extra_drop_ms = max(float(self._CURVE_LIMIT_GUARD_MIN_DROP_MS), 3.0 * CV.MPH_TO_MS)
+    else:
+      extra_drop_ms = self._interp_clipped(
+        float(current_angle_deg),
+        [
+          float(self._CURVE_LIMIT_GUARD_FALLBACK_STEER_DEG),
+          9.0,
+          12.0,
+        ],
+        [
+          float(self._CURVE_LIMIT_GUARD_MIN_DROP_MS),
+          4.0 * CV.MPH_TO_MS,
+          float(self._CURVE_LIMIT_GUARD_MAX_DROP_MS),
+        ],
+      )
+
     guarded_target_ms = max(float(self.MIN_CRUISE_SPEED_MS), float(curve_target_ms) - float(extra_drop_ms))
-    return float(guarded_target_ms), True
+    return float(guarded_target_ms), True, str(guard_reason)
 
   def _poll_plan_and_lead(self, *, now_ns: int) -> None:
     prev_lead_present = bool(self._lead_present_prev)
@@ -834,6 +993,13 @@ class LongController:
             self._lead_last_yrel = y_rel
     except Exception:
       pass
+
+    try:
+      self._refresh_lateral_limit_state(now_ns=int(now_ns))
+    except Exception:
+      self._lat_limit_saturated = False
+      self._lat_limit_severity = 0.0
+      self._lat_limit_source = ""
 
     if prev_lead_present and (not bool(self._lead_present)):
       clear_grace_ms = int(self._LEAD_CLEAR_MAPD_GRACE_MS)
@@ -1219,7 +1385,7 @@ class LongController:
                 reference_ms=float(reference_ms),
               )
               current_angle_deg = abs(float(getattr(cs_out, "steeringAngleDeg", 0.0) or 0.0))
-              curve_target_ms, curve_limit_guard = self._apply_curve_limit_guard(
+              curve_target_ms, curve_limit_guard, curve_limit_guard_reason = self._apply_curve_limit_guard(
                 now_ms=int(now),
                 current_angle_deg=float(current_angle_deg),
                 curve_target_ms=float(curve_target_ms),
@@ -1228,7 +1394,10 @@ class LongController:
                 no_lead=True,
               )
               if curve_limit_guard:
-                curve_state = f"{curve_state}+curve_limit_guard"
+                guard_suffix = "curve_limit_guard"
+                if curve_limit_guard_reason:
+                  guard_suffix = f"{guard_suffix}[{curve_limit_guard_reason}]"
+                curve_state = f"{curve_state}+{guard_suffix}"
               if float(curve_target_ms) < float(base_target_ms):
                 desired_ms = min(float(base_target_ms), float(curve_target_ms))
                 src = f"{src}+{curve_state}[mapd]"
@@ -1388,7 +1557,7 @@ class LongController:
             curve_target_ms = float(resume_ceiling_ms)
             curve_state = "curve_clear(snap)"
 
-          curve_target_ms, curve_limit_guard = self._apply_curve_limit_guard(
+          curve_target_ms, curve_limit_guard, curve_limit_guard_reason = self._apply_curve_limit_guard(
             now_ms=int(now),
             current_angle_deg=float(current_angle_deg),
             curve_target_ms=float(curve_target_ms),
@@ -1397,7 +1566,10 @@ class LongController:
             no_lead=True,
           )
           if curve_limit_guard:
-            curve_state = f"{curve_state}+curve_limit_guard"
+            guard_suffix = "curve_limit_guard"
+            if curve_limit_guard_reason:
+              guard_suffix = f"{guard_suffix}[{curve_limit_guard_reason}]"
+            curve_state = f"{curve_state}+{guard_suffix}"
 
           desired_ms = min(float(resume_ceiling_ms), float(curve_target_ms))
           src = f"lp_near[{curve_state}]"
